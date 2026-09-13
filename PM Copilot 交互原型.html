@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PM Copilot · 交互原型 v0.5</title>
+<!--
+  PM Copilot 交互原型（对应 design.md v0.5）
+  假设与理由（Junior Designer 备注）：
+  1. 视觉 = 模拟 macOS 原生 App（系统蓝、13px 系统字体、半透明侧栏）——文档定死「只用系统原生控件」，原型必须像原生
+  2. 示例数据全部来自 design.md 的「我的健身App」案例（目标收敛句/约束/否决项/d_001 决策/Eval 场景），不编造无关内容
+  3. 可点的关键路径（对应 Eval）：
+     · 侧栏切项目「我的健身App ↔ WidgetToDo」→ 右栏检索 trace 的 scope 标签同步变（F16 / E12）
+     · 工作区顶部五阶段切换器 → ①对话流 ②调研工具调用 ③PRD 预览 ④原型 WKWebView ⑤评审打分
+     · 点「这条记下来」→ 相似卡片合并弹窗（E10）
+     · 顶栏版本下拉切到 v1.0 🔒 → 全界面只读 + 黄条（E13/E14）
+     · 右栏上下文检查器：token 构成条 + 检索 trace + 「已过滤 41 条」+ 未命中 skill（E11/E12 的可观测证明）
+  4. 单文件 inline React（file:// 双击即开，无外部 jsx）
+-->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; overflow:hidden; }
+  body {
+    font-family:-apple-system,"SF Pro Text","PingFang SC","Helvetica Neue",sans-serif;
+    background:#1b1d22 radial-gradient(1200px 700px at 70% -10%, #2c3140 0%, #1b1d22 55%);
+    display:flex; align-items:center; justify-content:center;
+  }
+  #stage { transform-origin:center center; }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:rgba(0,0,0,0.2); border-radius:4px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  .fadein { animation:fadein .18s ease both; }
+  @keyframes fadein { from{opacity:0; transform:translateY(3px);} to{opacity:1; transform:none;} }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.45;} }
+  .rec-dot { animation:pulse 1.4s infinite; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+/* ========== 设计令牌（模拟 macOS 原生） ========== */
+const T = {
+  blue:   '#0068DA',  // 系统蓝
+  green:  '#34A853',
+  gray:   '#8E8E93',
+  red:    '#FF3B30',
+  amber:  '#E8A000',
+  purple: '#AF52DE',
+  ink:    '#1D1D1F',
+  sub:    '#6E6E73',
+  line:   'rgba(0,0,0,0.09)',
+  side:   'rgba(246,246,248,0.92)',
+  cardBg: '#FFFFFF',
+  hover:  'rgba(0,0,0,0.045)',
+};
+const F = { sys:'-apple-system,"SF Pro Text","PingFang SC",sans-serif', mono:'"SF Mono",ui-monospace,Menlo,monospace' };
+
+/* ========== 数据：两个项目（切换即切 scope，F16/E12） ========== */
+const PROJECTS = {
+  fitness: {
+    name:'我的健身App', tag:'v1.1 · 进行中', goal:'面向健身小白的训练打卡应用，解决「坚持不下去」的问题',
+    constraints:['不做专业增肌人群','iOS 优先','首版不做社交排位'],
+    rejections:['社区功能——竞品已验证留存提升有限'],
+    versions:['v1.1','v1.0'],
+    stages:{1:'done',2:'done',3:'run',4:'todo',5:'todo'},
+    traceQuery:'健身小白 · 留存策略 · 打卡动机',
+    traceHits:[
+      {id:'kp_001', name:'目标用户偏好：坚持反馈 > 数据精度', sim:0.87, scope:'我的健身App'},
+      {id:'kp_003', name:'打卡类产品动机模型（外部研究）', sim:0.81, scope:'全局'},
+    ],
+    filtered:'已过滤 41 条 · 其中跨项目 39 条（scope 隔离 · E12）',
+    skillHit:'苏格拉底式追问教练',
+    memories:[
+      {scope:'version', v:'v1.1', text:'打卡提醒依赖推送权限，需在首次启动引导中申请', type:'约束'},
+      {scope:'version', v:'v1.1', text:'周报自动生成按周一生成上周汇总', type:'结论'},
+      {scope:'project', text:'目标用户锁定健身小白，不做专业增肌人群', type:'约束'},
+      {scope:'project', text:'社区功能要做（早期讨论）', type:'结论', dead:true, coveredBy:'d_002 · 不做社区功能——留存提升有限'},
+      {scope:'global',  text:'PRD 引用调研事实必须标注出处文件路径', type:'约束'},
+    ],
+  },
+  widget: {
+    name:'WidgetToDo', tag:'v0.3 · 进行中', goal:'桌面小组件形态的极简待办，主打零成本添加任务',
+    constraints:['不做项目管理/甘特图','仅 macOS'],
+    rejections:['协作功能——单机单用户定位'],
+    versions:['v0.3'],
+    stages:{1:'done',2:'run',3:'todo',4:'todo',5:'todo'},
+    traceQuery:'小组件 · 待办 · 快速捕获',
+    traceHits:[
+      {id:'kp_011', name:'小组件交互受系统尺寸约束（研究笔记）', sim:0.84, scope:'WidgetToDo'},
+    ],
+    filtered:'已过滤 41 条 · 其中跨项目 41 条（scope 隔离 · E12）',
+    skillHit:'KANO 模型',
+    memories:[
+      {scope:'project', text:'小组件点击即完成任务，不进 App', type:'结论'},
+      {scope:'global',  text:'PRD 引用调研事实必须标注出处文件路径', type:'约束'},
+    ],
+  },
+};
+
+const STAGES = [
+  {n:1, key:'clarify',  label:'① 澄清',  full:'需求澄清 Clarifier'},
+  {n:2, key:'research', label:'② 调研',  full:'竞品调研 Researcher'},
+  {n:3, key:'prd',      label:'③ PRD',   full:'PRD 撰写 Writer'},
+  {n:4, key:'proto',    label:'④ 原型',  full:'原型生成 Prototyper'},
+  {n:5, key:'review',   label:'⑤ 评审',  full:'毒舌评审 Reviewer'},
+];
+
+const SKILLS = [
+  {name:'苏格拉底式追问教练', when:'需求澄清阶段，用户输入模糊时引导暴露盲区', tags:['clarify','方法论'], hit:23, hot:true},
+  {name:'KANO 模型', when:'需求优先级排序、区分基本型/期望型/兴奋型', tags:['prioritization'], hit:12},
+  {name:'RICE 排序', when:'功能需求优先级量化对比', tags:['prioritization'], hit:9},
+  {name:'用户故事地图', when:'梳理核心场景与用户旅程', tags:['story'], hit:6},
+  {name:'PRD 模板（v3）', when:'③ 环输出格式 · 走规范路由（不进向量索引）', tags:['规范路由'], hit:31, routed:true},
+  {name:'漏项雷达 · 六视角', when:'⑤ 评审自检：完整性/一致性/可行性等六维', tags:['review'], hit:18},
+];
+
+const CARDS = [
+  {id:'kp_001', name:'目标用户偏好', text:'健身小白更在意「坚持反馈」而非「数据精度」。', src:'v1.1/03-discussions/01-clarify-notes.md#D1', merged:true, rel:['打卡动机模型']},
+  {id:'kp_002', name:'竞品 Keep 定位', text:'大而全健身平台，社区留存提升 15%（出处）。', src:'v1.1/02-analysis/competitors-overview.md'},
+  {id:'kp_003', name:'打卡动机模型', text:'外部动机（奖励/社交）启动快，内部动机（记录感）留存久。', src:'全局 · 手动记下来', rel:['目标用户偏好']},
+];
+
+const DECISIONS = [
+  {id:'d_001', v:'v1.1', decision:'目标用户锁定健身小白', why:'专业人群已有 Keep 等成熟方案，差异化空间在小白的坚持反馈',
+   rejected:[{option:'覆盖全人群', reason:'首版资源撑不起双场景'}], conf:0.8, verify:true, time:'09-09 14:30'},
+  {id:'d_002', v:'v1.1', decision:'不做社区功能', why:'竞品已验证社区对留存的提升有限，与「坚持反馈」主线无关',
+   rejected:[{option:'做轻社区（好友排行）', reason:'仍需内容审核与关系链冷启动'}], conf:0.75, verify:false, time:'09-09 15:02'},
+  {id:'d_003', v:'v1.0', decision:'iOS 优先，Android 后置', why:'目标用户设备占比与团队精力', rejected:[{option:'双端同步', reason:'首版双端 QA 成本翻倍'}], conf:0.9, verify:false, time:'08-21 10:11'},
+];
+
+const MCP_TOOLS = [
+  {name:'analyze_requirement', in:'idea: string', out:'clarification: object', desc:'单独调用澄清能力'},
+  {name:'generate_prd', in:'project, version', out:'task_id → get_task', desc:'跑②③④⑤（须先完成①）'},
+  {name:'generate_prototype', in:'project, version', out:'task_id → get_task', desc:'从 PRD 生成单文件 HTML 原型'},
+  {name:'review_doc', in:'doc: string', out:'review: object', desc:'独立评审任意文档'},
+  {name:'get_task', in:'task_id', out:'status / result', desc:'异步任务查询'},
+];
+
+const MCP_LOGS = [
+  {t:'14:32:05', client:'Claude Desktop', tool:'generate_prd', arg:'我的健身App / v1.1', status:'done', ms:8412},
+  {t:'14:20:41', client:'Cursor', tool:'analyze_requirement', arg:'"桌面小组件待办"', status:'done', ms:2210},
+  {t:'13:58:17', client:'Claude Desktop', tool:'get_task', arg:'task_9f2k', status:'done', ms:38},
+];
+
+/* ========== 通用小组件 ========== */
+const Dot = ({st}) => (
+  <span style={{
+    display:'inline-block', width:7, height:7, borderRadius:'50%', flexShrink:0,
+    background: st==='done'?T.green : st==='run'?T.blue : '#C7C7CC',
+    boxShadow: st==='run' ? `0 0 0 3px rgba(0,104,218,0.18)` : 'none',
+  }}/>
+);
+const Tag = ({children, c=T.sub, bg='rgba(0,0,0,0.05)'}) => (
+  <span style={{fontSize:10.5, padding:'1px 6px', borderRadius:4, color:c, background:bg, whiteSpace:'nowrap', fontFamily:F.sys}}>{children}</span>
+);
+const ScopeTag = ({s}) => {
+  const map = {'我的健身App':T.blue, 'WidgetToDo':T.purple, '全局':T.gray, 'v1.1':T.green, 'v1.0':T.gray};
+  const c = map[s] || T.gray;
+  return <span style={{fontSize:10, padding:'1px 6px', borderRadius:4, color:'#fff', background:c, fontFamily:F.mono, whiteSpace:'nowrap'}}>{s}</span>;
+};
+const Btn = ({children, onClick, kind='ghost', disabled, style}) => {
+  const base = {fontSize:12, padding:'4px 12px', borderRadius:6, cursor:disabled?'not-allowed':'pointer', fontFamily:F.sys,
+    transition:'all .12s', border:`0.5px solid ${T.line}`, opacity:disabled?0.45:1, ...style};
+  const kinds = {
+    primary:{background:T.blue, color:'#fff', border:'none'},
+    ghost:{background:'#fff', color:T.ink},
+    danger:{background:'#fff', color:T.red, borderColor:'rgba(255,59,48,0.35)'},
+  };
+  return <button style={{...base, ...kinds[kind]}} onClick={disabled?undefined:onClick}>{children}</button>;
+};
+const SectionTitle = ({children, right}) => (
+  <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:8}}>
+    <div style={{fontSize:12, fontWeight:600, color:T.ink}}>{children}</div>
+    {right}
+  </div>
+);
+const Card = ({children, style}) => (
+  <div style={{background:T.cardBg, border:`0.5px solid ${T.line}`, borderRadius:10, padding:14, ...style}}>{children}</div>
+);
+
+/* ========== 侧栏 ========== */
+function Sidebar({pKey, nav, setNav, setProject, project}) {
+  const NAVS = [
+    {id:'home', label:'项目主页'},
+    {id:'workspace', label:'工作区', star:true},
+    {id:'memory', label:'记忆抽屉'},
+    {id:'skills', label:'技能库', star:true},
+    {id:'cards', label:'卡片库'},
+    {id:'versions', label:'版本回看'},
+    {id:'decisions', label:'决策日志'},
+    {id:'mcp', label:'MCP 状态'},
+    {id:'settings', label:'设置'},
+  ];
+  return (
+    <div style={{width:212, flexShrink:0, background:T.side, borderRight:`0.5px solid ${T.line}`, display:'flex', flexDirection:'column'}}>
+      {/* 项目切换（切换即切 scope） */}
+      <div style={{padding:'12px 12px 8px'}}>
+        <div style={{fontSize:10.5, color:T.sub, marginBottom:6, letterSpacing:'.04em'}}>项目（切换即切 scope）</div>
+        {Object.entries(PROJECTS).map(([k,p]) => (
+          <div key={k} onClick={()=>setProject(k)}
+            style={{display:'flex', alignItems:'center', gap:8, padding:'6px 9px', borderRadius:7, marginBottom:2, cursor:'pointer',
+              background: k===pKey ? T.blue : 'transparent', color: k===pKey ? '#fff' : T.ink, transition:'all .12s'}}>
+            <span style={{fontSize:14, width:16, textAlign:'center', opacity:.9}}>{k==='fitness'?'🏃':'🧩'}</span>
+            <div style={{flex:1, minWidth:0}}>
+              <div style={{fontSize:12.5, fontWeight:500, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{p.name}</div>
+            </div>
+            {k==='fitness' && <span style={{fontSize:9.5, fontFamily:F.mono, opacity:.75}}>v1.1</span>}
+          </div>
+        ))}
+      </div>
+      <div style={{height:.5, background:T.line, margin:'2px 12px 8px'}}/>
+      {/* 导航 */}
+      <div style={{flex:1, overflowY:'auto', padding:'0 8px'}}>
+        {NAVS.map(n => (
+          <div key={n.id} onClick={()=>setNav(n.id)}
+            style={{display:'flex', alignItems:'center', gap:8, padding:'5.5px 9px', borderRadius:7, marginBottom:1, cursor:'pointer', fontSize:12.5,
+              background: nav===n.id ? 'rgba(0,104,218,0.10)' : 'transparent',
+              color: nav===n.id ? T.blue : T.ink, fontWeight: nav===n.id ? 600 : 400, transition:'all .1s'}}>
+            <span style={{fontSize:13}}>{{home:'🏠',workspace:'💬',memory:'🧠',skills:'📚',cards:'🗂',versions:'📦',decisions:'📜',mcp:'🔌',settings:'⚙️'}[n.id]}</span>
+            <span>{n.label}</span>
+            {n.star && <span style={{fontSize:9, color:T.amber, marginLeft:'auto'}}>★</span>}
+          </div>
+        ))}
+      </div>
+      {/* 底部：上下文检查器入口提示 */}
+      <div style={{padding:10, fontSize:10.5, color:T.sub, borderTop:`0.5px solid ${T.line}`, lineHeight:1.5}}>
+        右栏为 <b style={{color:T.ink}}>上下文检查器 ★★</b><br/>演示胜负手 · E11/E12 可当场证明
+      </div>
+    </div>
+  );
+}
+
+/* ========== 工作区：五个阶段 ========== */
+function ToolRow({icon, title, detail, ok=true}) {
+  const [open,setOpen] = React.useState(false);
+  return (
+    <div style={{margin:'6px 0'}}>
+      <div onClick={()=>setOpen(!open)} style={{display:'flex', alignItems:'center', gap:8, padding:'7px 10px', borderRadius:8,
+        background:'rgba(0,0,0,0.03)', cursor:'pointer', border:`0.5px solid ${T.line}`, fontSize:11.5, fontFamily:F.mono}}>
+        <span style={{fontSize:10, color:open?T.ink:T.sub, transition:'transform .15s', transform:open?'rotate(90deg)':'none'}}>▶</span>
+        <span style={{width:14, textAlign:'center'}}>{icon}</span>
+        <span style={{color:T.ink}}>{title}</span>
+        <span style={{marginLeft:'auto', fontSize:10, color: ok?T.green:T.amber}}>{ok?'✓ verified':'…'}</span>
+      </div>
+      {open && <div className="fadein" style={{marginLeft:24, marginTop:4, padding:'8px 10px', borderLeft:`2px solid ${T.line}`, fontSize:11, color:T.sub, fontFamily:F.mono, lineHeight:1.7, whiteSpace:'pre-wrap'}}>{detail}</div>}
+    </div>
+  );
+}
+
+function StageView({stage, project, setModal}) {
+  const p = PROJECTS[project];
+  const s = STAGES[stage-1];
+
+  /* ① 澄清：对话流 */
+  if (stage===1) return (
+    <div className="fadein" style={{display:'flex', flexDirection:'column', height:'100%'}}>
+      <div style={{flex:1, overflowY:'auto', padding:'18px 26px'}}>
+        <div style={{maxWidth:640, margin:'0 auto'}}>
+          {/* 用户消息 */}
+          <div style={{display:'flex', justifyContent:'flex-end', marginBottom:14}}>
+            <div style={{background:T.blue, color:'#fff', padding:'9px 14px', borderRadius:16, borderBottomRightRadius:5, fontSize:13, maxWidth:'75%', lineHeight:1.55}}>
+              想做个健身打卡的 App，帮我理理需求
+            </div>
+          </div>
+          {/* skill 命中章 */}
+          <div style={{display:'flex', gap:6, marginBottom:8, flexWrap:'wrap'}}>
+            <Tag c={T.purple} bg='rgba(175,82,222,0.10)'>🎯 命中技能：{p.skillHit}</Tag>
+            <Tag>已注入记忆 {p.memories.filter(m=>!m.dead).length} 条 · 按右栏 trace</Tag>
+          </div>
+          {/* AI 回复 */}
+          <div style={{display:'flex', gap:10, marginBottom:14}}>
+            <div style={{width:26, height:26, borderRadius:'50%', background:'linear-gradient(135deg,#5e8bff,#9b6bff)', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:11, fontWeight:600}}>C</div>
+            <div style={{background:'#fff', border:`0.5px solid ${T.line}`, padding:'10px 14px', borderRadius:16, borderTopLeftRadius:5, fontSize:13, maxWidth:'82%', lineHeight:1.65, color:T.ink}}>
+              先对齐一个关键问题：如果用户<b>连续 3 天没打卡</b>，你希望产品做什么？<br/>
+              <span style={{color:T.sub, fontSize:12}}>——这个答案决定留存策略是「提醒拉回」还是「清零重来」，也会影响提醒权限的申请时机。</span>
+            </div>
+          </div>
+          {/* 记忆写入（工具行） */}
+          <ToolRow icon="🧠" title="memory.write · 约束「不做专业增肌人群」" detail={'{ "scope": "project", "type": "constraint",\n  "content": "不做专业增肌人群",\n  "verify": "回读一致 ✓ (write-then-verify)" }'}/>
+          <ToolRow icon="🔍" title="retrieve · query「健身小白 · 留存策略」" detail={`命中 2 条（见右栏 trace）\nkp_001 目标用户偏好  sim=0.87  [scope: ${p.name}]\nkp_003 打卡动机模型  sim=0.81  [scope: 全局]\n${p.filtered}`}/>
+          {/* 第二轮 */}
+          <div style={{display:'flex', justifyContent:'flex-end', marginBottom:14}}>
+            <div style={{background:T.blue, color:'#fff', padding:'9px 14px', borderRadius:16, borderBottomRightRadius:5, fontSize:13, maxWidth:'75%', lineHeight:1.55}}>
+              温和提醒 + 补签机会，别让用户有挫败感
+            </div>
+          </div>
+          <div style={{display:'flex', gap:10, marginBottom:14}}>
+            <div style={{width:26, height:26, borderRadius:'50%', background:'linear-gradient(135deg,#5e8bff,#9b6bff)', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:11, fontWeight:600}}>C</div>
+            <div style={{background:'#fff', border:`0.5px solid ${T.line}`, padding:'10px 14px', borderRadius:16, borderTopLeftRadius:5, fontSize:13, maxWidth:'82%', lineHeight:1.65, color:T.ink}}>
+              记下了，本轮新决策：<b>中断恢复策略 = 温和提醒 + 每周 1 次补签</b>（已写入记忆层）。<br/>
+              <span style={{color:T.sub, fontSize:12}}>下一个盲区：核心价值主张——用户打卡 30 天后，你给他看什么？</span>
+            </div>
+          </div>
+          <div style={{textAlign:'center', fontSize:11, color:T.sub, margin:'6px 0'}}>— 澄清 3/5 轮 · 已知信息 6 · 盲区 2 · 本轮新决策 1 —</div>
+        </div>
+      </div>
+      {/* 底部输入条 */}
+      <div style={{padding:'10px 18px 14px', borderTop:`0.5px solid ${T.line}`, background:'rgba(255,255,255,0.6)'}}>
+        <div style={{maxWidth:640, margin:'0 auto', display:'flex', gap:8}}>
+          <div style={{flex:1, background:'#fff', border:`0.5px solid ${T.line}`, borderRadius:9, padding:'8px 12px', fontSize:12.5, color:T.sub}}>
+            回复 Clarifier…（每轮只问一个最关键的问题）
+          </div>
+          <Btn onClick={()=>setModal('card-merge')}>✚ 这条记下来</Btn>
+          <Btn kind="primary">发送</Btn>
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ② 调研：工具调用 + 分析包 */
+  if (stage===2) return (
+    <div className="fadein" style={{padding:'18px 26px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:680, margin:'0 auto'}}>
+        <Card style={{marginBottom:14, background:'rgba(0,104,218,0.04)'}}>
+          <SectionTitle right={<Tag c={T.blue} bg='rgba(0,104,218,0.10)'>唯一配联网工具的 Agent</Tag>}>
+            ② 竞品调研 Researcher · 市场分析师
+          </SectionTitle>
+          <div style={{fontSize:12, color:T.sub, lineHeight:1.6}}>基于澄清要点找 3-5 个直接竞品 · 所有事实必须带出处 URL · 找不到标「未找到」而非编造</div>
+        </Card>
+        <ToolRow icon="🌐" title={'web_search("健身打卡 App 竞品 留存")'} detail={'结果 5 条：\nkeep.cn — Keep：自律给我自由（官网）\nboohee.com — 薄荷健康：饮食记录+打卡\njoyrun.com — 悦动圈：跑步社交打卡\n… (出处 URL 均已存档 02-analysis/sources.json)'}/>
+        <ToolRow icon="📄" title="web_fetch(keep.cn/features) → 提取社区与打卡功能" detail={'提取要点：\n· 社区动态 + 打卡晒图，留存贡献约 15%（官方 PR 稿）\n· 差异点：内容生态重，新手路径长\n出处: https://keep.cn/... (已写入分析包)'}/>
+        <div style={{margin:'14px 0 8px', fontSize:12, fontWeight:600}}>竞品分析包 · 02-analysis/competitors-overview.md</div>
+        {[
+          {n:'Keep', pos:'大而全健身平台', d:'社区 + 课程内容生态', b:'新手 7 天路径的文案设计', s:'web: keep.cn'},
+          {n:'薄荷健康', pos:'饮食记录工具', d:'轻打卡 + 数据报表', b:'「连续打卡」视觉激励', s:'web: boohee.com'},
+          {n:'悦动圈', pos:'跑步社交', d:'红包激励打卡', b:'外部奖励启动快但留存依赖持续补贴', s:'web: joyrun.com'},
+        ].map(c=>(
+          <Card key={c.n} style={{marginBottom:8}}>
+            <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:4}}>
+              <span style={{fontSize:13, fontWeight:600}}>{c.n}</span>
+              <Tag>{c.pos}</Tag>
+              <Tag c={T.blue} bg='rgba(0,104,218,0.08)'>{c.s}</Tag>
+            </div>
+            <div style={{fontSize:12, color:T.sub, lineHeight:1.6}}>核心功能：{c.d} ｜ 可借鉴：{c.b}</div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+
+  /* ③ PRD：文档预览 */
+  if (stage===3) return (
+    <div className="fadein" style={{padding:'18px 26px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:680, margin:'0 auto'}}>
+        <Card style={{marginBottom:14, background:'rgba(52,168,83,0.05)'}}>
+          <SectionTitle right={<Tag c={T.green} bg='rgba(52,168,83,0.10)'>E3 · 100% 命中当前版</Tag>}>
+            规范路由 → templates/prd.md（确定性检索 · 不走向量）
+          </SectionTitle>
+          <div style={{fontSize:12, color:T.sub, lineHeight:1.6}}>过期规范比没有规范更危险——模板固定路径取最新版，0 次召回历史版本</div>
+        </Card>
+        <Card>
+          <div style={{fontSize:17, fontWeight:700, marginBottom:2}}>「我的健身App」PRD v1.1</div>
+          <div style={{fontSize:11, color:T.sub, marginBottom:12, fontFamily:F.mono}}>01-requirements/prd-v1.md · write-then-verify ✓</div>
+          {[
+            {h:'背景与目标', t:'目标收敛句：面向健身小白的训练打卡应用，解决「坚持不下去」的问题。北极星指标：周打卡率。'},
+            {h:'用户画像与场景', t:'健身小白 ×「三天热度」场景：中断后想恢复，但看到断签记录直接放弃。'},
+            {h:'功能需求（RICE 排序 · 命中 RICE 技能）', t:'P0 打卡 + 温和中断恢复（补签/周 1 次）｜P1 周报自动生成｜P2 好友排行（不做，见 d_002）'},
+            {h:'数据指标', t:'周打卡率、中断恢复率、7 日留存（引用调研：Keep 社区留存 +15%，出处 02-analysis/competitors-overview.md）'},
+            {h:'边界与风险', t:'不做专业增肌人群（约束）· 推送权限申请时机影响提醒触达'},
+          ].map(sec=>(
+            <div key={sec.h} style={{marginBottom:12}}>
+              <div style={{fontSize:12.5, fontWeight:600, color:T.blue, marginBottom:3}}>{sec.h}</div>
+              <div style={{fontSize:12.5, color:T.ink, lineHeight:1.7}}>{sec.t}</div>
+            </div>
+          ))}
+          <div style={{fontSize:11, color:T.sub, borderTop:`0.5px solid ${T.line}`, paddingTop:8, display:'flex', gap:8, flexWrap:'wrap'}}>
+            <Tag>引用出处 3 处（可点击跳原文）</Tag>
+            <Tag c={T.purple} bg='rgba(175,82,222,0.08)'>命中方法论：RICE 排序</Tag>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
+  /* ④ 原型：WKWebView */
+  if (stage===4) return (
+    <div className="fadein" style={{padding:'18px 26px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:720, margin:'0 auto'}}>
+        <Card style={{marginBottom:14, background:'rgba(175,82,222,0.05)'}}>
+          <SectionTitle right={<Tag c={T.purple} bg='rgba(175,82,222,0.10)'>E15 · 断网可渲染</Tag>}>
+            ④ 原型生成 Prototyper · 单文件 HTML + WKWebView
+          </SectionTitle>
+          <div style={{fontSize:12, color:T.sub, lineHeight:1.6}}>零外部依赖（无 CDN / 无网络请求）· 灰盒线框风 · 覆盖 PRD P0 流程 3 屏</div>
+        </Card>
+        {/* WKWebView 模拟窗 */}
+        <div style={{background:'#fff', border:`0.5px solid ${T.line}`, borderRadius:12, overflow:'hidden', boxShadow:'0 8px 30px rgba(0,0,0,0.08)'}}>
+          <div style={{background:'rgba(0,0,0,0.04)', padding:'6px 12px', fontSize:10.5, color:T.sub, fontFamily:F.mono, display:'flex', alignItems:'center', gap:6}}>
+            <span style={{width:8,height:8,borderRadius:'50%',background:'#ff5f57'}}></span>
+            <span style={{width:8,height:8,borderRadius:'50%',background:'#febc2e'}}></span>
+            <span style={{width:8,height:8,borderRadius:'50%',background:'#28c840'}}></span>
+            <span style={{marginLeft:8}}>WKWebView · prototype-v1.html（本地文件 · file://）</span>
+            <span style={{marginLeft:'auto', color:T.green}}>● 离线渲染正常</span>
+          </div>
+          {/* 三屏线框 */}
+          <div style={{display:'flex', gap:14, padding:20, background:'#fafafa', justifyContent:'center'}}>
+            {[
+              {t:'① 今日打卡', els:['▫ 头像 · 连续 14 天','▪▪▪ 今日训练卡（开始按钮）','▫▫ 温和提醒文案区','▪▪▪▪ 底部 Tab：打卡/周报/我的']},
+              {t:'② 中断恢复', els:['▫ 「断签不可怕」标题','▪▪▪ 补签机会卡（周 1 次）','▫▫ 一键恢复训练','▪▪▪ 进度保留说明']},
+              {t:'③ 周报', els:['▫ 上周汇总 3 次打卡','▪▪▪ 坚持反馈曲线图','▫▫ 分享按钮（V2）']},
+            ].map(w=>(
+              <div key={w.t} style={{width:170, background:'#fff', border:`1px solid ${T.line}`, borderRadius:18, padding:14, boxShadow:'0 2px 8px rgba(0,0,0,0.04)'}}>
+                <div style={{fontSize:11, fontWeight:600, marginBottom:8, textAlign:'center', color:T.ink}}>{w.t}</div>
+                {w.els.map((e,i)=>(
+                  <div key={i} style={{height: e.startsWith('▪')?34:22, background: e.startsWith('▪')?'#d8dce3':'#eceef1', borderRadius:6, marginBottom:6}}/>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{display:'flex', gap:8, marginTop:14, justifyContent:'center'}}>
+          <Btn>↻ 重新生成（PRD 变更后标记过期）</Btn>
+          <Btn>在浏览器打开</Btn>
+          <Btn kind="primary">进入 ⑤ 评审 →</Btn>
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ⑤ 评审：门禁 */
+  const scores = [
+    {k:'需求完整性', v:7}, {k:'方案合理性', v:6}, {k:'用户价值', v:7},
+    {k:'技术可行性', v:8}, {k:'文档质量', v:5, bad:true}, {k:'原型一致性', v:7},
+  ];
+  const avg = (scores.reduce((a,b)=>a+b.v,0)/scores.length);
+  return (
+    <div className="fadein" style={{padding:'18px 26px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:640, margin:'0 auto'}}>
+        <Card style={{marginBottom:14, background: avg>=6?'rgba(52,168,83,0.05)':'rgba(232,160,0,0.06)'}}>
+          <SectionTitle right={<Tag c={avg>=6?T.green:T.amber} bg='rgba(0,0,0,0.05)'>评审独立 · 未注入 ③④ 生成上下文</Tag>}>
+            ⑤ 毒舌评审 Reviewer · 找出问题比夸奖更有价值
+          </SectionTitle>
+          <div style={{display:'flex', alignItems:'baseline', gap:8, marginBottom:10}}>
+            <span style={{fontSize:30, fontWeight:700, color: avg>=6?T.green:T.amber}}>{avg.toFixed(1)}</span>
+            <span style={{fontSize:12, color:T.sub}}>六维均值 · 门禁 ≥6 通过 · 打回 {avg<6?'1':'0'}/2 次</span>
+          </div>
+          {scores.map(s=>(
+            <div key={s.k} style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
+              <span style={{fontSize:11.5, width:80, color:s.bad?T.red:T.ink}}>{s.k}</span>
+              <div style={{flex:1, height:6, borderRadius:3, background:'rgba(0,0,0,0.06)', overflow:'hidden'}}>
+                <div style={{width:`${s.v*10}%`, height:'100%', background:s.bad?T.red:(s.v>=7?T.green:T.amber)}}/>
+              </div>
+              <span style={{fontSize:11, fontFamily:F.mono, width:18, color:s.bad?T.red:T.sub}}>{s.v}</span>
+            </div>
+          ))}
+        </Card>
+        <Card style={{marginBottom:14, border:'1px solid rgba(255,59,48,0.3)'}}>
+          <div style={{fontSize:12, fontWeight:600, color:T.red, marginBottom:6}}>扣分点 #1 · 责任层：prd（文档质量 5/10）</div>
+          <div style={{fontSize:12, color:T.ink, lineHeight:1.7}}>
+            非功能需求只有一句话，缺「提醒触达率」的验收标准；数据指标没写埋点口径。<br/>
+            <span style={{color:T.sub}}>修改建议：非功能需求按「指标 + 阈值 + 验收方式」三列补齐。</span>
+          </div>
+        </Card>
+        <div style={{display:'flex', gap:8, justifyContent:'center'}}>
+          <Btn kind="danger">↩ 定向打回 ③ PRD（附评审意见 · 只重跑该阶段）</Btn>
+          <Btn kind="primary" disabled={avg<6}>通过 → 封板（可选）</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ========== 主视图路由 ========== */
+function MainView({nav, stage, setStage, project, setModal, readOnly}) {
+  const p = PROJECTS[project];
+  if (nav==='workspace') {
+    return (
+      <div style={{display:'flex', flexDirection:'column', height:'100%'}}>
+        {/* 阶段切换器：允许回跳 */}
+        <div style={{padding:'10px 16px', borderBottom:`0.5px solid ${T.line}`, display:'flex', alignItems:'center', gap:6, background:'rgba(255,255,255,0.7)'}}>
+          {STAGES.map((s,i)=>(
+            <React.Fragment key={s.n}>
+              {i>0 && <span style={{color:'#C7C7CC', fontSize:11}}>›</span>}
+              <div onClick={()=>setStage(s.n)} style={{display:'flex', alignItems:'center', gap:6, padding:'5px 11px', borderRadius:8, cursor:'pointer',
+                background: stage===s.n?'rgba(0,104,218,0.10)':'transparent', border: stage===s.n?'0.5px solid rgba(0,104,218,0.3)':'0.5px solid transparent', transition:'all .12s'}}>
+                <Dot st={p.stages[s.n]}/>
+                <span style={{fontSize:12, fontWeight:stage===s.n?600:400, color:stage===s.n?T.blue:T.ink}}>{s.label}</span>
+              </div>
+            </React.Fragment>
+          ))}
+          <span style={{marginLeft:'auto', fontSize:10.5, color:T.sub}}>顺序是建议不是硬约束 · 允许回跳</span>
+        </div>
+        <div style={{flex:1, minHeight:0}}>
+          <StageView stage={stage} project={project} setModal={readOnly?undefined:setModal}/>
+        </div>
+      </div>
+    );
+  }
+  if (nav==='home') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:680, margin:'0 auto'}}>
+        <Card style={{marginBottom:12, background:'linear-gradient(135deg,rgba(0,104,218,0.05),rgba(175,82,222,0.05))'}}>
+          <div style={{fontSize:10.5, color:T.sub, marginBottom:4}}>目标收敛句（可编辑）</div>
+          <div style={{fontSize:16, fontWeight:650, lineHeight:1.5}}>{p.goal}</div>
+        </Card>
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12}}>
+          <Card>
+            <SectionTitle>长期约束</SectionTitle>
+            {p.constraints.map(c=><div key={c} style={{fontSize:12, color:T.ink, padding:'4px 0', display:'flex', gap:6}}><span style={{color:T.blue}}>⊘</span>{c}</div>)}
+          </Card>
+          <Card>
+            <SectionTitle>否决项</SectionTitle>
+            {p.rejections.map(c=><div key={c} style={{fontSize:12, color:T.red, padding:'4px 0', display:'flex', gap:6}}><span>✕</span>{c}</div>)}
+          </Card>
+        </div>
+        <Card>
+          <SectionTitle right={<span style={{fontSize:11, color:T.sub}}>五阶段状态</span>}>版本时间线</SectionTitle>
+          <div style={{display:'flex', alignItems:'center', gap:4, marginBottom:10}}>
+            {STAGES.map((s,i)=>(
+              <React.Fragment key={s.n}>
+                {i>0 && <div style={{flex:1, height:1.5, background:p.stages[s.n]==='done'?T.green:'rgba(0,0,0,0.08)'}}/>}
+                <div style={{display:'flex', flexDirection:'column', alignItems:'center', gap:4}}>
+                  <Dot st={p.stages[s.n]}/>
+                  <span style={{fontSize:10, color:T.sub}}>{s.label}</span>
+                </div>
+              </React.Fragment>
+            ))}
+          </div>
+          <div style={{fontSize:11.5, color:T.sub, fontFamily:F.mono}}>v1.0 🔒 released 08-30 · v1.1 in-progress · 继承约束与否决项，不继承讨论</div>
+        </Card>
+      </div>
+    </div>
+  );
+  if (nav==='memory') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:620, margin:'0 auto'}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:4}}>记忆抽屉</div>
+        <div style={{fontSize:11.5, color:T.sub, marginBottom:14}}>按 scope 分组着色 · 新结论覆盖旧结论，不并存 · 失效条目不注入</div>
+        {[['version','版本级 · v1.1',T.green],['project','项目级',T.blue],['global','全局',T.gray]].map(([scope,label,c])=>(
+          <div key={scope} style={{marginBottom:16}}>
+            <div style={{display:'flex', alignItems:'center', gap:6, marginBottom:6}}>
+              <span style={{width:8,height:8,borderRadius:2,background:c}}/>
+              <span style={{fontSize:11.5, fontWeight:600, color}}>{label}</span>
+            </div>
+            {p.memories.filter(m=>m.scope===scope).map((m,i)=>(
+              <Card key={i} style={{marginBottom:6, opacity:m.dead?0.55:1, borderLeft:m.dead?undefined:`2.5px solid ${c}`}}>
+                <div style={{display:'flex', alignItems:'center', gap:6, marginBottom:3}}>
+                  <Tag>{m.type}</Tag>
+                  {m.dead && <Tag c={T.red} bg='rgba(255,59,48,0.08)'>已失效 · 被覆盖</Tag>}
+                </div>
+                <div style={{fontSize:12.5, lineHeight:1.6, textDecoration:m.dead?'line-through':'none', color:m.dead?T.sub:T.ink}}>{m.text}</div>
+                {m.dead && <div style={{fontSize:11, color:T.blue, marginTop:4, cursor:'pointer'}}>↳ 被谁覆盖：{m.coveredBy}（点击跳决策日志）</div>}
+              </Card>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+  if (nav==='skills') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:640, margin:'0 auto'}}>
+        <div style={{display:'flex', alignItems:'center', gap:10, marginBottom:4}}>
+          <div style={{fontSize:15, fontWeight:700}}>技能库</div>
+          <div style={{flex:1, background:'#fff', border:`0.5px solid ${T.line}`, borderRadius:7, padding:'4px 10px', fontSize:12, color:T.sub}}>🔍 搜索 name / when_to_use / tags…</div>
+        </div>
+        <div style={{fontSize:11.5, color:T.sub, marginBottom:14}}>元数据常驻 · 命中后才加载正文（渐进式披露 · E11）· 共 30 条，当前注入 1 条</div>
+        {SKILLS.map(s=>(
+          <Card key={s.name} style={{marginBottom:8, borderColor:s.hot?'rgba(175,82,222,0.35)':undefined}}>
+            <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:4}}>
+              <span style={{fontSize:13, fontWeight:600}}>{s.name}</span>
+              {s.hot && <Tag c={T.purple} bg='rgba(175,82,222,0.10)'>最近命中</Tag>}
+              {s.routed && <Tag c={T.green} bg='rgba(52,168,83,0.10)'>规范路由</Tag>}
+              <span style={{marginLeft:'auto', fontSize:10.5, color:T.sub, fontFamily:F.mono}}>命中 {s.hit} 次</span>
+            </div>
+            <div style={{fontSize:12, color:T.sub, marginBottom:8, lineHeight:1.5}}>when_to_use：{s.when}</div>
+            <div style={{display:'flex', gap:6, alignItems:'center'}}>
+              <Btn kind="primary">用这个</Btn>
+              <Btn>学这个</Btn>
+              <div style={{marginLeft:'auto', display:'flex', gap:4}}>{s.tags.map(t=><Tag key={t}>#{t}</Tag>)}</div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+  if (nav==='cards') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:620, margin:'0 auto'}}>
+        <div style={{display:'flex', alignItems:'center', gap:10, marginBottom:4}}>
+          <div style={{fontSize:15, fontWeight:700}}>卡片库</div>
+          <Btn onClick={()=>setModal('card-merge')}>✚ 新建卡片（触发相似合并）</Btn>
+        </div>
+        <div style={{fontSize:11.5, color:T.sub, marginBottom:14}}>schema 约束抽取 · 相似度 &gt;0.92 合并而非新建（E10）· 每张卡可跳回出处</div>
+        {CARDS.map(c=>(
+          <Card key={c.id} style={{marginBottom:8}}>
+            <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:4}}>
+              <span style={{fontSize:12.5, fontFamily:F.mono, color:T.blue}}>{c.id}</span>
+              <span style={{fontSize:13, fontWeight:600}}>{c.name}</span>
+              {c.merged && <Tag c={T.amber} bg='rgba(232,160,0,0.10)'>已合并 2 张相似卡</Tag>}
+            </div>
+            <div style={{fontSize:12.5, color:T.ink, lineHeight:1.6, marginBottom:6}}>{c.text}</div>
+            <div style={{display:'flex', gap:6, alignItems:'center', flexWrap:'wrap'}}>
+              <span style={{fontSize:11, color:T.blue, cursor:'pointer', borderBottom:'1px dashed rgba(0,104,218,0.55)'}}>↩ 出处：{c.src}</span>
+              {(c.rel||[]).map(r=><Tag key={r} c={T.purple} bg='rgba(175,82,222,0.08)'>🔗 {r}</Tag>)}
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+  if (nav==='versions') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:680, margin:'0 auto'}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:4}}>版本回看</div>
+        <div style={{fontSize:11.5, color:T.sub, marginBottom:14}}>封版后只读 · 与封版快照逐字一致（E13）· 同名产物并排 diff</div>
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:14}}>
+          {['v1.1','v1.0'].map(v=>(
+            <Card key={v} style={{borderColor: readOnly&&v==='v1.0'?'rgba(232,160,0,0.4)':undefined}}>
+              <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
+                <span style={{fontSize:14, fontWeight:700, fontFamily:F.mono}}>{v}</span>
+                {v==='v1.0' && <Tag c={T.gray} bg='rgba(0,0,0,0.05)'>🔒 已封版 · 只读</Tag>}
+                {v==='v1.1' && <Tag c={T.blue} bg='rgba(0,104,218,0.08)'>● 进行中</Tag>}
+              </div>
+              <div style={{fontSize:11.5, color:T.sub, lineHeight:1.6}}>{v==='v1.0'?'scope：打卡核心流 · released 08-30 · gitTag v1.0':'scope：周报自动生成 · 继承 v1.0 约束与否决项，不继承讨论'}</div>
+            </Card>
+          ))}
+        </div>
+        <Card>
+          <SectionTitle right={<Tag>git diff · prd-v1.md</Tag>}>v1.0 → v1.1 同名产物 diff</SectionTitle>
+          <div style={{fontSize:11.5, fontFamily:F.mono, lineHeight:1.9}}>
+            <div style={{background:'rgba(52,168,83,0.10)', padding:'1px 8px', borderRadius:4, color:'#1e6b34'}}>+ 新增：周报自动生成（每周一生成上周汇总）</div>
+            <div style={{background:'rgba(52,168,83,0.10)', padding:'1px 8px', borderRadius:4, color:'#1e6b34'}}>+ 新增：中断恢复策略 = 温和提醒 + 每周 1 次补签</div>
+            <div style={{background:'rgba(255,59,48,0.08)', padding:'1px 8px', borderRadius:4, color:'#8b1a12'}}>- 移除：好友排行（决策 d_002：留存提升有限）</div>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+  if (nav==='decisions') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:640, margin:'0 auto'}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:4}}>决策日志</div>
+        <div style={{fontSize:11.5, color:T.sub, marginBottom:14}}>append-only · 不可删除 · 5 字段齐全（E14）·「待验证」未闭环高亮</div>
+        {DECISIONS.map(d=>(
+          <Card key={d.id} style={{marginBottom:10, borderLeft:d.verify?'3px solid '+T.amber:'3px solid '+T.line}}>
+            <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
+              <span style={{fontSize:12, fontFamily:F.mono, color:T.blue}}>{d.id}</span>
+              <Tag>{d.v}</Tag>
+              <span style={{fontSize:13, fontWeight:600}}>{d.decision}</span>
+              {d.verify && <Tag c={T.amber} bg='rgba(232,160,0,0.12)'>⏳ 待验证</Tag>}
+              <span style={{marginLeft:'auto', fontSize:10.5, color:T.sub, fontFamily:F.mono}}>{d.time}</span>
+            </div>
+            <div style={{fontSize:12, color:T.ink, lineHeight:1.7}}>
+              <div><b style={{color:T.sub}}>WHY</b>　{d.why}</div>
+              <div><b style={{color:T.sub}}>排除</b>　{d.rejected.map(r=>`${r.option}（${r.reason}）`).join('；')}</div>
+              <div style={{display:'flex', gap:12, marginTop:2}}>
+                <span><b style={{color:T.sub}}>置信度</b>　{d.conf}</span>
+              </div>
+            </div>
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+  if (nav==='mcp') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:660, margin:'0 auto'}}>
+        <Card style={{marginBottom:12}}>
+          <div style={{display:'flex', alignItems:'center', gap:10}}>
+            <div style={{width:38, height:22, borderRadius:11, background:T.green, position:'relative', cursor:'pointer'}}>
+              <div style={{position:'absolute', right:2, top:2, width:18, height:18, borderRadius:'50%', background:'#fff'}}/>
+            </div>
+            <div>
+              <div style={{fontSize:14, fontWeight:700}}>MCP Server · 运行中</div>
+              <div style={{fontSize:11, color:T.sub}}>传输：stdio（本地进程）· modelcontextprotocol/swift-sdk</div>
+            </div>
+            <Btn style={{marginLeft:'auto'}} kind="primary">⧉ 复制 Claude Desktop 配置</Btn>
+          </div>
+        </Card>
+        <Card style={{marginBottom:12}}>
+          <SectionTitle right={<Tag c={T.blue} bg='rgba(0,104,218,0.08)'>E7</Tag>}>已暴露工具（5）</SectionTitle>
+          {MCP_TOOLS.map(t=>(
+            <div key={t.name} style={{display:'flex', gap:10, padding:'6px 0', borderBottom:`0.5px solid ${T.line}`, alignItems:'baseline'}}>
+              <span style={{fontSize:12, fontFamily:F.mono, color:T.blue, width:165}}>{t.name}</span>
+              <span style={{fontSize:11, color:T.sub, width:130, fontFamily:F.mono}}>{t.in} → {t.out}</span>
+              <span style={{fontSize:11, color:T.sub}}>{t.desc}</span>
+            </div>
+          ))}
+        </Card>
+        <Card>
+          <SectionTitle>最近调用</SectionTitle>
+          {MCP_LOGS.map((l,i)=>(
+            <div key={i} style={{display:'flex', gap:10, padding:'5px 0', fontSize:11.5, fontFamily:F.mono, alignItems:'center'}}>
+              <span style={{color:T.sub}}>{l.t}</span>
+              <span style={{color:T.purple, width:110}}>{l.client}</span>
+              <span style={{color:T.blue}}>{l.tool}</span>
+              <span style={{color:T.ink}}>{l.arg}</span>
+              <span style={{marginLeft:'auto', color:T.green}}>✓ {l.ms}ms</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+  if (nav==='settings') return (
+    <div className="fadein" style={{padding:'22px 28px', overflowY:'auto', height:'100%'}}>
+      <div style={{maxWidth:600, margin:'0 auto'}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:14}}>设置</div>
+        <Card style={{marginBottom:12}}>
+          <SectionTitle right={<Tag c={T.green} bg='rgba(52,168,83,0.10)'>Keychain ✓ 不进 git</Tag>}>模型（每阶段可配 · BYOK）</SectionTitle>
+          <div style={{fontSize:11.5, fontFamily:F.mono, lineHeight:2, color:T.ink}}>
+            classify　deepseek-chat（小模型路由·降本）<br/>
+            clarify　deepseek-chat<br/>
+            research　glm-4.6<br/>
+            prd / prototype　claude-sonnet-4<br/>
+            review　gpt-4o
+          </div>
+        </Card>
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12}}>
+          <Card>
+            <SectionTitle>成本统计</SectionTitle>
+            <div style={{fontSize:22, fontWeight:700}}>¥0.42</div>
+            <div style={{fontSize:11, color:T.sub}}>本次流水线 · 本月 ¥38.60 · token 上限 32k/次</div>
+          </Card>
+          <Card>
+            <SectionTitle>数据目录</SectionTitle>
+            <div style={{fontSize:12, fontFamily:F.mono, marginBottom:8}}>~/PMAgent</div>
+            <Btn>↻ 重建索引（索引可丢弃重建）</Btn>
+          </Card>
+        </div>
+        <Card>
+          <SectionTitle>API Key</SectionTitle>
+          <div style={{fontSize:12, fontFamily:F.mono, color:T.sub}}>sk-••••••••••••••••••••　（存于 Keychain · 已验证）</div>
+        </Card>
+      </div>
+    </div>
+  );
+  return null;
+}
+
+/* ========== 右栏：上下文检查器 ★★ ========== */
+function Inspector({project, stage}) {
+  const p = PROJECTS[project];
+  const [showMissed, setShowMissed] = React.useState(false);
+  const tokens = [
+    {k:'系统规则', v:1.2, c:T.gray}, {k:'记忆', v:0.8, c:T.blue},
+    {k:'Skill 正文', v:1.5, c:T.purple}, {k:'检索', v:2.1, c:T.green},
+    {k:'对话历史', v:4.4, c:T.amber},
+  ];
+  const total = tokens.reduce((a,b)=>a+b.v,0);
+  return (
+    <div style={{width:296, flexShrink:0, borderLeft:`0.5px solid ${T.line}`, background:'rgba(252,252,253,0.9)', overflowY:'auto', padding:'14px 14px 20px'}}>
+      <div style={{display:'flex', alignItems:'center', gap:6, marginBottom:2}}>
+        <span style={{fontSize:12.5, fontWeight:700}}>上下文检查器</span>
+        <span style={{fontSize:9, color:T.amber}}>★★</span>
+        <span className="rec-dot" style={{marginLeft:'auto', fontSize:9.5, color:T.red, fontFamily:F.mono}}>● LIVE</span>
+      </div>
+      <div style={{fontSize:10.5, color:T.sub, marginBottom:14}}>本次请求 · {STAGES[stage-1].label} · 第 3 轮 · 项目 [{p.name}]</div>
+
+      {/* token 构成条 */}
+      <SectionTitle right={<span style={{fontSize:10, color:T.sub, fontFamily:F.mono}}>{total.toFixed(1)}k / 32k</span>}>Token 构成</SectionTitle>
+      <div style={{display:'flex', height:14, borderRadius:4, overflow:'hidden', marginBottom:8}}>
+        {tokens.map(t=><div key={t.k} style={{width:`${t.v/total*100}%`, background:t.c}}/>)}
+      </div>
+      <div style={{display:'flex', flexWrap:'wrap', gap:5, marginBottom:18}}>
+        {tokens.map(t=>(
+          <span key={t.k} style={{display:'flex', alignItems:'center', gap:4, fontSize:10.5, color:T.sub}}>
+            <span style={{width:7,height:7,borderRadius:2,background:t.c}}/>{t.k} {t.v}k
+          </span>
+        ))}
+      </div>
+
+      {/* 检索 trace */}
+      <SectionTitle right={<Tag c={T.blue} bg='rgba(0,104,218,0.08)'>scope 强制过滤</Tag>}>检索 Trace</SectionTitle>
+      <div style={{fontSize:10.5, fontFamily:F.mono, color:T.sub, marginBottom:6, background:'rgba(0,0,0,0.03)', padding:'5px 8px', borderRadius:6}}>
+        query: {p.traceQuery}
+      </div>
+      {p.traceHits.map(h=>(
+        <div key={h.id} style={{display:'flex', alignItems:'center', gap:6, padding:'5px 8px', border:`0.5px solid ${T.line}`, borderRadius:7, marginBottom:5, background:'#fff'}}>
+          <span style={{fontSize:10.5, fontFamily:F.mono, color:T.blue}}>{h.id}</span>
+          <span style={{fontSize:11, flex:1, minWidth:0, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{h.name}</span>
+          <span style={{fontSize:9.5, fontFamily:F.mono, color:T.gray}}>{h.sim}</span>
+          <ScopeTag s={h.scope}/>
+        </div>
+      ))}
+      <div style={{fontSize:10.5, color:T.amber, background:'rgba(232,160,0,0.08)', padding:'5px 8px', borderRadius:6, marginBottom:18, fontFamily:F.mono}}>
+        ⛔ {p.filtered}
+      </div>
+
+      {/* skill 命中 / 未命中 */}
+      <SectionTitle right={<Tag c={T.purple} bg='rgba(175,82,222,0.08)'>E11</Tag>}>Skill 注入（1 / 30）</SectionTitle>
+      <div style={{padding:'6px 8px', border:`0.5px solid rgba(175,82,222,0.3)`, borderRadius:7, background:'rgba(175,82,222,0.05)', marginBottom:6}}>
+        <div style={{fontSize:11.5, fontWeight:600, color:T.purple}}>✓ {p.skillHit}</div>
+        <div style={{fontSize:10, color:T.sub, fontFamily:F.mono}}>正文 1.5k tokens · 仅此 1 条正文入上下文</div>
+      </div>
+      <div onClick={()=>setShowMissed(!showMissed)} style={{fontSize:10.5, color:T.sub, cursor:'pointer', padding:'4px 8px'}}>
+        ▸ {showMissed?'收起':'展开'}未命中 29 条（证明未被注入）
+      </div>
+      {showMissed && (
+        <div className="fadein" style={{marginTop:4}}>
+          {SKILLS.filter(s=>s.name!==p.skillHit).slice(0,4).map(s=>(
+            <div key={s.name} style={{fontSize:10.5, color:T.sub, padding:'4px 8px', opacity:0.6}}>
+              ✕ {s.name} · <span style={{fontFamily:F.mono}}>when_to_use 仅元数据常驻（~30 tok）</span>
+            </div>
+          ))}
+          <div style={{fontSize:10.5, color:T.sub, padding:'4px 8px', opacity:0.6}}>… 其余 25 条同上，正文 0 token 注入</div>
+        </div>
+      )}
+
+      {/* write-then-verify 日志 */}
+      <div style={{marginTop:18}}>
+        <SectionTitle>落盘校验（write-then-verify）</SectionTitle>
+        <div style={{fontSize:10.5, fontFamily:F.mono, color:T.sub, lineHeight:1.9}}>
+          <div>✓ decisions.jsonl#d_002 · 回读一致</div>
+          <div>✓ knowledge/kp_001 · 回读一致</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ========== 弹窗：相似卡片合并（E10） ========== */
+function MergeModal({onClose, project}) {
+  const p = PROJECTS[project];
+  return (
+    <div onClick={onClose} style={{position:'absolute', inset:0, background:'rgba(0,0,0,0.25)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:50, backdropFilter:'blur(2px)'}}>
+      <div onClick={e=>e.stopPropagation()} className="fadein" style={{width:440, background:'#fff', borderRadius:14, boxShadow:'0 24px 70px rgba(0,0,0,0.3)', overflow:'hidden'}}>
+        <div style={{padding:'16px 18px 12px'}}>
+          <div style={{fontSize:14, fontWeight:700, marginBottom:2}}>「这条记下来」→ 相似卡片检测</div>
+          <div style={{fontSize:11.5, color:T.sub}}>发现 1 张相似度 &gt;0.92 的已有卡片 · 合并而非新建（E10）</div>
+        </div>
+        <div style={{padding:'0 18px'}}>
+          <div style={{border:`0.5px solid ${T.line}`, borderRadius:9, padding:10, marginBottom:8, background:'rgba(255,255,255,0.8)'}}>
+            <div style={{display:'flex', gap:6, alignItems:'center', marginBottom:4}}>
+              <Tag c={T.amber} bg='rgba(232,160,0,0.10)'>已有 kp_001</Tag>
+              <span style={{fontSize:12.5, fontWeight:600}}>目标用户偏好</span>
+            </div>
+            <div style={{fontSize:11.5, color:T.sub, lineHeight:1.6}}>健身小白更在意「坚持反馈」而非「数据精度」。</div>
+          </div>
+          <div style={{textAlign:'center', fontSize:11, color:T.sub, margin:'2px 0'}}>↓ 相似度 0.94 · 建议合并 ↓</div>
+          <div style={{border:`1.5px solid ${T.blue}`, borderRadius:9, padding:10, marginBottom:8, background:'rgba(0,104,218,0.03)'}}>
+            <div style={{display:'flex', gap:6, alignItems:'center', marginBottom:4}}>
+              <Tag c={T.blue} bg='rgba(0,104,218,0.10)'>新卡（草拟）</Tag>
+              <span style={{fontSize:12.5, fontWeight:600}}>目标用户偏好</span>
+            </div>
+            <div style={{fontSize:11.5, color:T.ink, lineHeight:1.6}}>中断后想恢复，但看到断签记录直接放弃——坚持反馈要优先于连续性记录。</div>
+          </div>
+        </div>
+        <div style={{padding:'12px 18px 16px', display:'flex', gap:8, justifyContent:'flex-end'}}>
+          <Btn onClick={onClose}>取消</Btn>
+          <Btn onClick={onClose}>另建独立卡</Btn>
+          <Btn kind="primary" onClick={onClose}>合并进 kp_001</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ========== 应用外壳 ========== */
+function App() {
+  const [project, setProject] = React.useState('fitness');
+  const [nav, setNav] = React.useState('workspace');
+  const [stage, setStage] = React.useState(1);
+  const [version, setVersion] = React.useState('v1.1');
+  const [modal, setModal] = React.useState(null);
+  const [guide, setGuide] = React.useState(false);
+  const readOnly = version==='v1.0';
+  const p = PROJECTS[project];
+
+  // 缩放适配视口
+  React.useEffect(()=>{
+    const fit = ()=>{
+      const s = Math.min(window.innerWidth/1440, window.innerHeight/880, 1);
+      document.getElementById('stage').style.transform = `scale(${s})`;
+    };
+    fit(); window.addEventListener('resize', fit);
+    return ()=>window.removeEventListener('resize', fit);
+  },[]);
+
+  return (
+    <div id="stage" style={{width:1440, height:880}}>
+      {/* macOS 窗口 */}
+      <div style={{width:'100%', height:'100%', background:'#fff', borderRadius:11, overflow:'hidden',
+        boxShadow:'0 40px 100px rgba(0,0,0,0.45), 0 0 0 0.5px rgba(0,0,0,0.3)', display:'flex', flexDirection:'column', position:'relative'}}>
+        {/* 标题栏 */}
+        <div style={{height:40, flexShrink:0, background:'linear-gradient(to bottom,#f6f6f6,#ececec)', borderBottom:`0.5px solid ${T.line}`, display:'flex', alignItems:'center', padding:'0 14px', position:'relative'}}>
+          <div style={{display:'flex', gap:8}}>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#ff5f57',border:'0.5px solid rgba(0,0,0,0.15)'}}/>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#febc2e',border:'0.5px solid rgba(0,0,0,0.15)'}}/>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#28c840',border:'0.5px solid rgba(0,0,0,0.15)'}}/>
+          </div>
+          <div style={{position:'absolute', left:0, right:0, textAlign:'center', fontSize:13, fontWeight:500, color:'#444', pointerEvents:'none'}}>
+            PM Copilot — {p.name}
+          </div>
+          {/* 版本下拉（E13/E14 演示入口） */}
+          <div style={{marginLeft:'auto', display:'flex', gap:8, alignItems:'center', position:'relative', zIndex:10}}>
+            <select value={version} onChange={e=>setVersion(e.target.value)}
+              style={{fontSize:11.5, padding:'3px 8px', borderRadius:6, border:`0.5px solid ${T.line}`, background:'#fff', fontFamily:F.mono, color:readOnly?T.amber:T.ink, cursor:'pointer'}}>
+              {p.versions.map(v=><option key={v} value={v}>{v}{v==='v1.0'?' 🔒':''}</option>)}
+            </select>
+            <Btn onClick={()=>setGuide(!guide)}>？演示要点</Btn>
+          </div>
+        </div>
+
+        {/* 只读黄条 */}
+        {readOnly && (
+          <div className="fadein" style={{background:'rgba(232,160,0,0.12)', borderBottom:`0.5px solid rgba(232,160,0,0.3)`, padding:'6px 16px', fontSize:12, color:'#8a6200', display:'flex', alignItems:'center', gap:8}}>
+            🔒 正在查看已封版 v1.0 · 全界面只读 · 与封版快照逐字一致（E13）· 切回 v1.1 可继续编辑
+          </div>
+        )}
+
+        {/* 三栏主体 */}
+        <div style={{flex:1, minHeight:0, display:'flex'}}>
+          <Sidebar pKey={project} nav={nav} setNav={setNav} setProject={(k)=>{setProject(k); setVersion(PROJECTS[k].versions[0]);}} project={project}/>
+          <div style={{flex:1, minWidth:0, position:'relative', background:'#fbfbfd'}}>
+            <MainView nav={nav} stage={stage} setStage={setStage} project={project} setModal={setModal} readOnly={readOnly}/>
+          </div>
+          <Inspector project={project} stage={stage}/>
+        </div>
+
+        {modal==='card-merge' && <MergeModal onClose={()=>setModal(null)} project={project}/>}
+
+        {/* 演示要点浮层 */}
+        {guide && (
+          <div className="fadein" style={{position:'absolute', top:52, right:16, width:300, background:'rgba(28,28,32,0.94)', borderRadius:12, padding:'16px 18px', color:'#eee', zIndex:60, boxShadow:'0 16px 50px rgba(0,0,0,0.4)', fontSize:11.5, lineHeight:1.9, backdropFilter:'blur(8px)'}}>
+            <div style={{fontWeight:700, marginBottom:4, fontSize:12.5}}>可点的关键路径（对应 Eval）</div>
+            <div>· 侧栏切 <b>项目</b> → 右栏 trace 的 scope 标签同步变（E12）</div>
+            <div>· 工作区顶部<b>五阶段切换器</b>任意跳 → 每环内容形态不同</div>
+            <div>· ① 环点<b>「这条记下来」</b> → 相似卡片合并弹窗（E10）</div>
+            <div>· 顶栏版本切 <b>v1.0 🔒</b> → 只读 + 黄条（E13/E14）</div>
+            <div>· ② 环点<b>工具调用条</b>展开 → 出处 URL（E4/E5）</div>
+            <div>· 右栏<b>展开未命中 29 条</b> → 证明正文未注入（E11）</div>
+            <div style={{marginTop:6, paddingTop:6, borderTop:'0.5px solid rgba(255,255,255,0.15)', color:'#aaa'}}>S12 检查器 = 「某东西没发生」的可观测证明</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

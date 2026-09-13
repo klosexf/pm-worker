@@ -1,0 +1,2214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PM Copilot · Agent 工作台 v3</title>
+<!--
+  PM Copilot 交互原型 v3 —— TRAE Code 式深色 Agent 工作台（对应 design.md v0.5）
+  参考样式：TRAE Code 桌面端
+  · 左栏：模式胶囊(PM/数据/复盘) + 功能导航 + 任务列表(项目树·阶段子任务·状态点) + 底部账户区
+  · 中央空态：品牌标题「PM with Copilot」+ 大圆角输入框(+附件/自动流水线/模型选择/紫色语音钮)
+    + 展开行(本地·项目绑定) + 快捷场景胶囊
+  · 发送/点任务 → 对话态：Agent Loop 对话流(计划卡→澄清→记忆覆盖→要点表→调研工具行→
+    PRD打回→复审通过→封板)，右上「上下文」滑出检查器抽屉(E11/E12)
+  · 配色：#0D0D0F 极深背景 / #161618 侧栏 / #8B5CF6 品牌紫 / 克制的状态色
+  映射：自动审批→自动流水线 · 模型选择→BYOK · 任务树→项目/版本容器 · 场景标签→五阶段入口
+-->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; overflow:hidden; }
+  body {
+    font-family:-apple-system,"SF Pro Text","PingFang SC","Helvetica Neue",sans-serif;
+    background:#050507;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #stage { transform-origin:center center; }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.12); border-radius:4px; }
+  ::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,0.2); }
+  ::-webkit-scrollbar-track { background:transparent; }
+  .fadein { animation:fadein .25s ease both; }
+  @keyframes fadein { from{opacity:0; transform:translateY(5px);} to{opacity:1; transform:none;} }
+  @keyframes slidein { from{opacity:0; transform:translateX(14px);} to{opacity:1; transform:none;} }
+  .slidein { animation:slidein .22s ease both; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+  .run-dot { animation:pulse 1.5s infinite; }
+  textarea { resize:none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+/* ================= 深色设计令牌（TRAE Code 式开发者美学） ================= */
+const T = {
+  bg:      '#0D0D0F',   // 主内容区：极深黑
+  side:    '#161618',   // 侧栏
+  sideHi:  '#1E1E22',   // 侧栏激活/hover
+  card:    '#1B1B1F',   // 卡片
+  cardHi:  '#222228',   // 卡片 hover
+  inputBg: '#17171B',   // 大输入框
+  line:    'rgba(255,255,255,0.07)',
+  lineHi:  'rgba(255,255,255,0.13)',
+  ink:     '#E8E8EC',
+  sub:     '#9A9AA3',
+  faint:   '#62626B',
+  purple:  '#8B5CF6',
+  purpleD: '#7C3AED',
+  blue:    '#5EA8FF',
+  green:   '#4ADE80',
+  red:     '#F87171',
+  amber:   '#FBBF24',
+  userBubble:'#26262E',
+};
+const F = { mono:'"SF Mono",ui-monospace,Menlo,monospace' };
+
+/* ================= 数据 ================= */
+
+const STAGES = {
+  clarify:  {n:'①', name:'需求澄清', agent:'Clarifier',  c:T.blue},
+  research: {n:'②', name:'竞品调研', agent:'Researcher', c:T.purple},
+  prd:      {n:'③', name:'PRD 撰写', agent:'Writer',     c:T.green},
+  proto:    {n:'④', name:'原型生成', agent:'Prototyper', c:T.amber},
+  review:   {n:'⑤', name:'毒舌评审', agent:'Reviewer',   c:T.red},
+};
+
+const PROJECTS = {
+  fitness: {
+    name:'我的健身App', dir:'我的健身App', emoji:'🏃',
+    versions:['v1.1','v1.0'],
+    scope:'我的健身App',
+    goal:'面向健身小白的训练打卡应用，解决「坚持不下去」的问题',
+    ctx:{
+      query:'健身小白 · 留存策略 · 打卡动机',
+      tokens:[
+        {k:'规则', v:1.2, c:'#6B7280'},
+        {k:'记忆', v:0.8, c:T.blue},
+        {k:'技能', v:1.5, c:T.purple},
+        {k:'检索', v:2.1, c:T.green},
+        {k:'历史', v:4.4, c:T.amber},
+      ],
+      hits:[
+        {id:'kp_001', name:'目标用户偏好：坚持反馈 > 数据精度', sim:0.87, scope:'我的健身App'},
+        {id:'kp_003', name:'打卡类产品动机模型', sim:0.81, scope:'全局'},
+      ],
+      filtered:'已过滤 41 条 · 跨项目 39 条（scope 隔离 · E12）',
+      skill:'苏格拉底式追问教练',
+      memories:[
+        {t:'中断恢复策略 = 温和提醒 + 每周 1 次补签', s:'v1.1', kind:'结论'},
+        {t:'中断后清零重来', s:'v1.0', kind:'旧结论', dead:true, by:'d_004'},
+        {t:'目标用户锁定健身小白，不做专业增肌人群', s:'项目', kind:'约束'},
+        {t:'社区功能不做——竞品验证留存提升有限', s:'项目', kind:'否决项'},
+      ],
+      verify:['decisions.jsonl · d_004','knowledge/kp_012'],
+    },
+  },
+  widget: {
+    name:'WidgetToDo', dir:'WidgetToDo', emoji:'🧩',
+    versions:['v0.3'],
+    scope:'WidgetToDo',
+    goal:'桌面小组件形态的极简待办，主打零成本添加任务',
+    ctx:{
+      query:'小组件 · 待办 · 快速捕获',
+      tokens:[
+        {k:'规则', v:1.2, c:'#6B7280'},
+        {k:'记忆', v:0.4, c:T.blue},
+        {k:'技能', v:1.4, c:T.purple},
+        {k:'检索', v:0.8, c:T.green},
+        {k:'历史', v:1.9, c:T.amber},
+      ],
+      hits:[
+        {id:'kp_011', name:'小组件交互受系统尺寸约束', sim:0.84, scope:'WidgetToDo'},
+      ],
+      filtered:'已过滤 41 条 · 跨项目 41 条（scope 隔离 · E12）',
+      skill:'KANO 模型',
+      memories:[
+        {t:'小组件点击即完成任务，不进 App', s:'项目', kind:'结论'},
+        {t:'不做项目管理/甘特图', s:'项目', kind:'否决项'},
+      ],
+      verify:['decisions.jsonl · d_001'],
+    },
+  },
+  default: {   // 「默认」项目（系统预建 · 兜底容器，见 design.md §5.1.1）
+    name:'默认', dir:'默认', emoji:'🗂',
+    versions:['默认无版本号'],
+    scope:'默认',
+    goal:'未归档想法与快速会话的兜底容器 · 确认项目后可迁移',
+    ctx:{
+      query:'—', tokens:[{k:'规则', v:0.6, c:'#6B7280'}], total:0.6,
+      hits:[], filtered:'无跨项目检索 · 未选择项目',
+      skill:'—', memories:[], verify:[],
+    },
+  },
+};
+
+/* ---- 任务树（左栏 · 三级嵌套：项目 → 版本 → 会话，参考 VS Code 资源管理器） ----
+   · 第一层：项目（不可变实体，跨版本存续）
+   · 第二层：版本（v1.1 / v1.0…）+ 每项目固定一个「默认无版本号」目录（unversioned/）
+   · 第三层：会话 —— 每个节点是一个会话窗口，点击即打开该会话；
+     流水线阶段状态不占用导航层级（展示在项目主页的五阶段状态点上）
+   · DEFAULT_PROJECT：「默认」项目 —— 仅当用户未选择任何项目时显示在顶部（初始展示项） ---- */
+const DEFAULT_PROJECT = {
+  key:'default', label:'默认', emoji:'🗂', dft:true, versions:[
+    {v:'默认无版本号', noversion:true, open:true, sessions:[
+      {id:'def-1', title:'快速开始 · 一句话想法', time:'今天', st:'done', msgs:[
+        {t:'user', text:'突然想到一个点子：宠物喂药提醒器'},
+        {t:'chat', stage:'clarify', time:'10:02', text:'有意思。先问一个最关键的：提醒的执行者是谁——主人、还是设备本身？这决定产品是工具还是硬件。'},
+        {t:'sys', icon:'💾', text:'一句话想法已暂存到 默认/unversioned/ · 未建项目不丢数据', link:'查看文件'},
+      ]},
+      {id:'def-2', title:'MCP 兜底会话（未指定 project）', time:'—', st:'todo'},
+    ]},
+  ],
+};
+
+const TASK_TREE = [
+  {key:'fitness', label:'我的健身App', open:true, versions:[
+    {v:'v1.1', open:true, sessions:[
+      {id:'fit-run', title:'五阶段流水线 · 全程', time:'09-08', st:'done', main:true},
+      {id:'fit-qa', title:'补签规则追问', time:'昨天', st:'done', msgs:[
+        {t:'user', text:'连续 3 天没打卡，除了温和提醒，能不能再加点仪式感？'},
+        {t:'chat', stage:'clarify', time:'14:32', text:'可以，两条路线：a) 连续达标徽章（成就驱动）b) 补签卡（损失规避）。结合你「别让用户有挫败感」的约束，建议 b 为主、a 为辅。'},
+        {t:'sys', icon:'💾', text:'决策已写入记忆：补签卡 = 每周 1 张（d_005）', link:'查看决策日志'},
+      ]},
+      {id:'fit-new', title:'新会话', time:'—', st:'todo'},
+    ]},
+    {v:'v1.0', locked:true, open:false, sessions:[
+      {id:'fit-v10', title:'v1.0 · 历史会话（已封存）', time:'08-12', st:'done', msgs:[
+        {t:'user', text:'v1.0 收尾：把中断恢复策略定下来'},
+        {t:'chat', stage:'clarify', time:'16:40', text:'v1.0 采用「清零重来」策略——当时的目标是强化打卡的严肃性。这条结论在 v1.1 已被 d_004 覆盖，本会话为封存快照，只读。'},
+      ]},
+    ]},
+    {v:'默认无版本号', noversion:true, open:false, sessions:[
+      {id:'fit-u1', title:'随手聊 · 周报自动生成想法', time:'09-05', st:'done', msgs:[
+        {t:'user', text:'要是每周一自动给我生成上周坚持报告就好了'},
+        {t:'chat', stage:'clarify', time:'09:15', text:'记下了。这条会进 v1.1 的 scope 候选——目前它还在「默认无版本号」里，确认版本后我会自动归档到 v1.1。'},
+      ]},
+    ]},
+  ]},
+  {key:'widget', label:'WidgetToDo', open:true, versions:[
+    {v:'v0.3', open:true, sessions:[
+      {id:'wid-run', title:'小组件需求澄清', time:'今天', st:'run', main:true},
+    ]},
+    {v:'默认无版本号', noversion:true, open:false, sessions:[]},
+  ]},
+];
+
+/* 会话查找：按 sid 遍历全部树（含「默认」项目与运行时新建会话） */
+const ALL_TREES = [DEFAULT_PROJECT, ...TASK_TREE];
+const EXTRA_SESSIONS = [];   // 运行时「新建会话」落点：{pKey, ver, session}
+let _sidSeq = 0;
+function findSession(sid){
+  const ex = EXTRA_SESSIONS.find(e=>e.session.id===sid);
+  if (ex) return ex.session;
+  for (const p of ALL_TREES) for (const vn of (p.versions||[])) for (const s of (vn.sessions||[]))
+    if (s.id===sid) return s;
+  return null;
+}
+/* 某项目/版本下的会话列表 = 预置 + 运行时新建（原型演示） */
+const sessionsOf = (pKey, ver) =>
+  ((ALL_TREES.find(p=>p.key===pKey)?.versions.find(v=>v.v===ver)?.sessions)||[])
+    .concat(EXTRA_SESSIONS.filter(e=>e.pKey===pKey && e.ver===ver).map(e=>e.session));
+
+/* ---- 产物文件树（design.md §5.1 真实目录 · 唯一事实源） ---- */
+const FILES = {
+  fitness: {count:14, tree:[
+    {dir:'~/PMAgent/Projects/我的健身App', open:true, children:[
+      {f:'project.json', type:'json', meta:'目标收敛句 · 约束 ×2 · 否决项 ×1'},
+      {dir:'v1.1 ● 进行中', open:true, children:[
+        {dir:'01-requirements', open:true, children:[
+          {f:'clarification.md', type:'md', meta:'澄清要点表'},
+          {f:'prd-v1.md', type:'md', meta:'打回前 · 快照 a91f3c', old:true},
+          {f:'prd-v2.md', type:'md', meta:'当前 · 快照 b02e7d', star:true},
+        ]},
+        {dir:'02-analysis', open:true, children:[
+          {f:'competitors-overview.md', type:'md', meta:'3 竞品 · 出处 ×9'},
+        ]},
+        {dir:'03-discussions', open:true, children:[
+          {f:'01-clarify-notes.md', type:'md', meta:'澄清纪要'},
+          {f:'02-research-notes.md', type:'md', meta:'调研纪要'},
+        ]},
+        {dir:'04-prototypes', open:true, children:[
+          {f:'prototype-v1.html', type:'html', meta:'WKWebView · 断网可渲染', star:true},
+        ]},
+        {dir:'05-reports', open:true, children:[
+          {f:'review-v1.md', type:'md', meta:'六维 5.8 · 未过门禁', old:true},
+          {f:'review-v2.md', type:'md', meta:'六维 6.4 · 复审通过', star:true},
+        ]},
+        {f:'decisions.jsonl', type:'json', meta:'append-only · 4 条', badge:'+2'},
+        {f:'discussions.jsonl', type:'json', meta:'讨论原始记录'},
+        {f:'version.json', type:'json', meta:'in-progress'},
+      ]},
+      {dir:'v1.0 🔒 已封版', children:[]},
+      {dir:'unversioned 默认无版本号', open:false, children:[
+        {f:'imported-screens.md', type:'md', meta:'拖入素材 · 未指定版本'},
+        {f:'chat-log-0912.md', type:'md', meta:'临时讨论记录 · 未归版本'},
+      ]},
+      {dir:'knowledge', open:true, children:[
+        {f:'2026-09-08-目标用户偏好.md', type:'md', meta:'kp_001 · 置信 0.9'},
+      ]},
+    ]},
+  ]},
+  widget: {count:4, tree:[
+    {dir:'~/PMAgent/Projects/WidgetToDo', open:true, children:[
+      {f:'project.json', type:'json', meta:'目标收敛句 · 否决项 ×1'},
+      {dir:'unversioned 默认无版本号', open:false, children:[]},
+      {dir:'v0.3 ● 进行中', open:true, children:[
+        {dir:'01-requirements', open:true, children:[
+          {f:'clarification.md', type:'md', meta:'澄清要点表'},
+        ]},
+        {dir:'02-analysis', children:[]},
+        {f:'decisions.jsonl', type:'json', meta:'append-only · 1 条', badge:'+1'},
+      ]},
+      {dir:'knowledge', children:[]},
+    ]},
+  ]},
+};
+
+/* ---- 阶段产物（design.md §4：每阶段完成 = 产物落盘 + 纪要 + 知识点抽取 + 决策写入） ---- */
+const STAGE_ARTIFACTS = {
+  fitness: [
+    {s:'clarify', files:[
+      {f:'clarification.md', meta:'要点表 · Schema 校验通过', ok:true},
+      {f:'01-clarify-notes.md', dir:'03-discussions/', meta:'结构化纪要', ok:true},
+    ], extract:'知识点抽取 ×1 → kp_001', decisions:2},
+    {s:'research', files:[
+      {f:'competitors-overview.md', meta:'3 竞品 · 出处 ×9', ok:true},
+      {f:'02-research-notes.md', dir:'03-discussions/', meta:'结构化纪要', ok:true},
+    ], extract:'知识点抽取 ×2 → kp_003/kp_012', decisions:1},
+    {s:'prd', files:[
+      {f:'prd-v1.md', meta:'快照 a91f3c · 被评审打回', old:true},
+      {f:'prd-v2.md', meta:'当前版本 · 快照 b02e7d', ok:true, star:true},
+    ], extract:'—', decisions:0, note:'打回 1 次 · 定向重跑（责任层：prd）'},
+    {s:'proto', files:[
+      {f:'prototype-v1.html', meta:'单文件 · 断网可渲染', ok:true, star:true},
+    ], extract:'—', decisions:0},
+    {s:'review', files:[
+      {f:'05-reports/review-v1.md', meta:'六维 5.8 · 未过门禁', old:true},
+      {f:'05-reports/review-v2.md', meta:'六维 6.4 · 复审通过', ok:true},
+    ], extract:'—', decisions:0, note:'独立评审（未注入 ③④ 上下文）'},
+  ],
+  widget: [
+    {s:'clarify', files:[
+      {f:'clarification.md', meta:'要点表 · Schema 校验通过', ok:true},
+    ], extract:'知识点抽取 ×0', decisions:1},
+    {s:'research', files:[], extract:'—', decisions:0, running:true, note:'web_search 执行中…'},
+    {s:'prd', files:[], extract:'—', decisions:0},
+    {s:'proto', files:[], extract:'—', decisions:0},
+    {s:'review', files:[], extract:'—', decisions:0},
+  ],
+};
+
+/* ---- 交接产物（design.md §7：封板交接 + MCP 开放通道 + V2 导出） ---- */
+const HANDOFF = {
+  fitness: {
+    sealable:true,
+    release:[ // release-notes.md 封板时自动生成（§6 版本状态机）
+      {op:'+', text:'周报自动生成（每周一）'},
+      {op:'+', text:'中断恢复 = 温和提醒 + 每周 1 次补签（d_004）'},
+      {op:'−', text:'好友排行（d_002 · 竞品验证留存提升有限）'},
+    ],
+    immutable:[ // 封板后不可变（§5.1 01-requirements/）
+      {f:'prd-v2.md', meta:'PRD 终稿 · 快照 b02e7d'},
+      {f:'prototype-v1.html', meta:'原型 · WKWebView / 浏览器均可独立打开'},
+      {f:'decisions.jsonl', meta:'决策日志快照 · append-only · 4 条'},
+    ],
+    mcp:{running:true, calls:3, tools:[
+      {n:'analyze_requirement', d:'单独调用澄清能力'},
+      {n:'generate_prd', d:'跑②③④⑤ · 异步 task_id'},
+      {n:'generate_prototype', d:'从 PRD 单独生成原型'},
+      {n:'review_doc', d:'独立评审任意文档'},
+      {n:'get_task', d:'异步任务查询'},
+    ]},
+  },
+  widget: {
+    sealable:false,
+    release:[],
+    immutable:[],
+    mcp:{running:true, calls:0, tools:[
+      {n:'analyze_requirement', d:'单独调用澄清能力'},
+      {n:'generate_prd', d:'跑②③④⑤ · 异步 task_id'},
+      {n:'generate_prototype', d:'从 PRD 单独生成原型'},
+      {n:'review_doc', d:'独立评审任意文档'},
+      {n:'get_task', d:'异步任务查询'},
+    ]},
+  },
+};
+
+/* ---- 大纲（选中文件的章节结构，仿 VS Code Outline） ---- */
+const OUTLINES = {
+  'prd-v2.md': ['背景与目标','用户画像与场景','功能需求 · RICE 排序','非功能需求（指标+阈值+验收）','数据指标（埋点口径）','边界与风险'],
+  'prd-v1.md': ['背景与目标','用户画像与场景','功能需求 · RICE 排序','非功能需求 ⚠️ 仅一句话','数据指标 ⚠️ 无埋点口径','边界与风险'],
+  'competitors-overview.md': ['Keep — 社区生态成熟','每日瑜伽 — 返现激励','小白健身操 — 低门槛','结论：差异化机会在「坚持反馈」','附录：出处 ×9'],
+  'prototype-v1.html': ['① 今日打卡','② 任务详情','③ 打卡动画','④ 坚持报告','⑤ 成就墙'],
+  'clarification.md': ['target_user · 目标用户','core_scenario · 核心场景','core_value · 核心价值','constraints · 约束','open_questions · 开放问题'],
+  'decisions.jsonl': ['d_001 目标用户锁定健身小白','d_002 不做社区功能','d_003 iOS 优先','d_004 中断恢复策略（覆盖 d_003 前 API）'],
+  'project.json': ['goal · 目标收敛句','constraints · 约束 ×2','rejections · 否决项 ×1','versions · 版本继承规则'],
+  '2026-09-08-目标用户偏好.md': ['研究来源（3 篇）','结论：坚持反馈 > 数据精度','置信度 0.9 · 被 2 个 PRD 引用'],
+};
+
+/* ---- 时间线（快照历史，仿 VS Code Timeline） ---- */
+const TIMELINES = {
+  fitness: [
+    {h:'b02e7d', m:'PRD v2 修订 · 非功能需求补齐', t:'15:26'},
+    {h:'c33f01', m:'复审通过 · 六维 6.4', t:'15:34'},
+    {h:'e07b92', m:'原型 prototype-v1.html 生成', t:'15:10'},
+    {h:'a91f3c', m:'PRD v1 落盘（后被评审打回）', t:'15:02'},
+    {h:'4d81aa', m:'竞品调研包落盘 · 出处 ×9', t:'14:36'},
+    {h:'v1.0', m:'git tag · 封版冻结', t:'上一版本', tag:true},
+  ],
+  widget: [
+    {h:'7f2a1c', m:'澄清要点表落盘', t:'15:43'},
+    {h:'d_001', m:'决策：小组件点击即完成', t:'15:38'},
+  ],
+};
+
+/* ---- 对话流：fitness 完整 run ---- */
+const RUN_FITNESS = [
+  {t:'user', text:'想做健身打卡 App，帮我理清需求，一路做到能评审的 PRD 和可点原型'},
+  {t:'plan'},
+  {t:'sys', icon:'📥', text:'Context Builder：记忆 4 · 知识卡 2 · 技能 1/30 · PRD 模板（确定性路由）', link:'查看上下文'},
+  {t:'chat', stage:'clarify', time:'14:02', text:'先对齐一个关键问题：如果用户连续 3 天没打卡，你希望产品做什么？这个答案决定留存策略是「提醒拉回」还是「清零重来」。'},
+  {t:'user', text:'温和提醒 + 补签机会，别让用户有挫败感'},
+  {t:'sys', icon:'💾', text:'决策已写入记忆：中断恢复 = 温和提醒 + 每周 1 次补签（覆盖旧结论「清零重来」· d_004）'},
+  {t:'chat', stage:'clarify', time:'14:11', text:'记下了。下一个盲区：核心价值——用户坚持 30 天后，你给他看什么？'},
+  {t:'user', text:'一份坚持报告，突出成就感和身体变化'},
+  {t:'table'},
+  {t:'sys', icon:'▶', text:'要点表已确认 · 一键流水线 ② → ⑤ 启动（可中断 / 单阶段重试 / 运行态持久化）'},
+  {t:'research'},
+  {t:'artifact', kind:'research'},
+  {t:'artifact', kind:'prd', ver:1},
+  {t:'artifact', kind:'proto'},
+  {t:'review', pass:false},
+  {t:'chat', stage:'prd', time:'15:26', text:'收到评审意见，定向重跑 ③：非功能需求按「指标 + 阈值 + 验收方式」补齐，埋点口径写入数据指标。原型不受影响（责任层：prd）。'},
+  {t:'artifact', kind:'prd', ver:2},
+  {t:'review', pass:true},
+  {t:'done'},
+];
+
+/* ---- 对话流：widget（执行中）---- */
+const RUN_WIDGET = [
+  {t:'user', text:'做个桌面小组件待办，要零成本添加任务'},
+  {t:'plan'},
+  {t:'sys', icon:'📥', text:'Context Builder：记忆 2 · 知识卡 1 · 技能 1/30', link:'查看上下文'},
+  {t:'chat', stage:'clarify', time:'15:41', text:'关键问题：任务完成后在哪划掉——小组件上直接点，还是必须进 App？'},
+  {t:'user', text:'小组件上直接点，别逼我打开 App'},
+  {t:'sys', icon:'💾', text:'决策已写入记忆：小组件点击即完成任务（d_001）'},
+  {t:'table'},
+  {t:'sys', icon:'▶', text:'要点表已确认 · 流水线 ② → ⑤ 启动'},
+  {t:'research', running:true},
+];
+
+const SCENES = [
+  ['💡','产品想法澄清'],
+  ['🔍','竞品调研'],
+  ['📄','PRD 生成'],
+  ['🎨','原型生成'],
+  ['🔪','毒舌评审'],
+];
+
+/* ================= 基础组件 ================= */
+
+function Tag({children, c=T.sub, bg='rgba(255,255,255,0.06)', mono}) {
+  return <span style={{fontSize:9.5, color:c, background:bg, borderRadius:4, padding:'1.5px 6px',
+    fontFamily:mono?F.mono:undefined, whiteSpace:'nowrap', fontWeight:500}}>{children}</span>;
+}
+
+function Btn({children, onClick, kind='plain', disabled, small}) {
+  const base = {fontSize:11.5, padding:small?'3px 10px':'5px 14px', borderRadius:7, cursor:disabled?'default':'pointer',
+    fontWeight:500, transition:'all .12s', border:'0.5px solid '+T.lineHi, background:T.cardHi, color:T.ink, whiteSpace:'nowrap'};
+  if (kind==='primary') { base.background=T.purpleD; base.color='#fff'; base.borderColor='transparent'; }
+  if (kind==='danger')  { base.color=T.red; base.borderColor='rgba(248,113,113,0.35)'; }
+  if (kind==='ghost')   { base.borderColor='transparent'; base.background='transparent'; base.color=T.sub; }
+  if (disabled) base.opacity=0.35;
+  return <button style={base} onClick={disabled?undefined:onClick}>{children}</button>;
+}
+
+function Avatar({stage, size=24}) {
+  const m = STAGES[stage];
+  return (
+    <div style={{width:size, height:size, borderRadius:'50%', background:m.c+'1F', color:m.c,
+      display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, fontWeight:700, flexShrink:0}}>
+      {m.n}
+    </div>
+  );
+}
+
+/* ---- 第三层：会话行（每个节点 = 一个会话窗口，点击打开） ---- */
+function SessionRow({s, curTask, view, onPick}) {
+  const active = view==='chat' && curTask && curTask.sid===s.id;
+  return (
+    <div onClick={onPick} title={s.title+' · 点击打开会话窗口'}
+      style={{display:'flex', alignItems:'center', gap:7, padding:'3px 8px 3px 34px',
+        fontSize:11.5, color:s.st==='done'?T.sub:T.faint, cursor:'pointer', borderRadius:6,
+        background:active?'rgba(139,92,246,0.14)':'transparent'}}
+      onMouseEnter={e=>{ if(!active) e.currentTarget.style.background='rgba(255,255,255,0.04)'; }}
+      onMouseLeave={e=>{ if(!active) e.currentTarget.style.background='transparent'; }}>
+      <span style={{fontSize:10, color:s.st==='done'?T.green:(s.st==='run'?T.purple:T.faint),
+        flexShrink:0}}>{s.st==='done'?'●':(s.st==='run'?'◐':'○')}</span>
+      <span style={{overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis',
+        color:active?T.ink:undefined, fontWeight:active?600:400}}>{s.title}</span>
+      {s.st==='run' && <span className="run-dot" style={{width:5, height:5, borderRadius:'50%', background:T.purple, flexShrink:0}}/>}
+      <span style={{fontSize:9, color:T.faint, marginLeft:'auto', flexShrink:0}}>{s.time}</span>
+    </div>
+  );
+}
+
+/* ================= 左栏（TRAE 式） ================= */
+function Sidebar({view, curTask, setCurTask, setView, skillCount, cardCount}) {
+  const pick = (key, version, sid) => { setCurTask({key, version, sid}); setView('chat'); };
+  /* 三级树展开状态：proj[项目key] / ver[项目key+版本号]（「默认」项目 key='default'） */
+  const [expanded, setExpanded] = React.useState(()=>({
+    proj:{default:true, ...Object.fromEntries(TASK_TREE.map(p=>[p.key, p.open!==false]))},
+    ver:Object.fromEntries(ALL_TREES.flatMap(p=>p.versions.map(v=>[p.key+'/'+v.v, v.open===true]))),
+  }));
+  const toggleProj = k => setExpanded(s=>({...s, proj:{...s.proj, [k]:!s.proj[k]}}));
+  const toggleVer = id => setExpanded(s=>({...s, ver:{...s.ver, [id]:!s.ver[id]}}));
+  /* 新建会话：在当前项目/版本下创建并跳转；未选择项目 → 「默认」；封版版本 → 该项目首个活跃版本 */
+  const newSession = () => {
+    let pk = 'default', ver = '默认无版本号';
+    if (view==='chat' && curTask) {
+      const proj = TASK_TREE.find(p=>p.key===curTask.key);
+      if (proj) {
+        pk = curTask.key;
+        const vn = proj.versions.find(v=>v.v===curTask.version);
+        ver = (vn && !vn.locked) ? curTask.version
+          : (proj.versions.find(v=>!v.locked) || proj.versions[0]).v;
+      }
+    }
+    const sid = 'new-'+(++_sidSeq);
+    EXTRA_SESSIONS.push({pKey:pk, ver, session:{id:sid, title:'新会话', time:'刚刚', st:'todo', msgs:[]}});
+    setExpanded(s=>({...s, proj:{...s.proj, [pk]:true}, ver:{...s.ver, [pk+'/'+ver]:true}}));
+    pick(pk, ver, sid);
+  };
+  return (
+    <div style={{width:282, flexShrink:0, background:T.side, borderRight:'0.5px solid '+T.line,
+      display:'flex', flexDirection:'column'}}>
+      {/* 搜索 */}
+      <div style={{padding:'10px 12px 6px'}}>
+        <div style={{background:T.inputBg, border:'0.5px solid '+T.line, borderRadius:7, padding:'4.5px 9px',
+          fontSize:11.5, color:T.faint, display:'flex', gap:6, alignItems:'center'}}>
+          <span style={{fontSize:11}}>🔍</span> 搜索项目、技能、知识…
+        </div>
+      </div>
+      {/* 模式胶囊：PM / 数据 V2 / 复盘 V2 */}
+      <div style={{padding:'4px 12px 10px'}}>
+        <div style={{display:'flex', background:'rgba(255,255,255,0.05)', borderRadius:8, padding:2}}>
+          {[['PM',true],['数据',false],['复盘',false]].map(([m,on],i)=>(
+            <div key={m} style={{flex:1, textAlign:'center', fontSize:11.5, fontWeight:on?600:400,
+              padding:'4px 0', borderRadius:6, cursor:on?'default':'pointer',
+              background:on?T.cardHi:'transparent', color:on?T.ink:T.faint,
+              boxShadow:on?'inset 0 0 0 1px '+T.lineHi:'none'}}>
+              {m}{!on && <span style={{fontSize:8.5, marginLeft:3}}>V2</span>}
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* 功能导航 */}
+      {[
+        ['⊕','新建任务','⌘⃰N', ()=>setView('home'), false],
+        ['🧩','技能库', skillCount!==undefined?String(skillCount):'30', ()=>setView('skills'), true],
+        ['🗂','知识库', cardCount!==undefined?String(cardCount):'18', ()=>setView('knowledge'), true],
+        ['📜','决策日志','5', undefined, false],
+        ['🔌','MCP Server','stdio', undefined, false],
+      ].map(([ic,label,badge,onClick,clickable])=>{
+        const act = (view==='skills' && label==='技能库') || (view==='knowledge' && label==='知识库');
+        return (
+        <div key={label} onClick={onClick} style={{display:'flex', alignItems:'center', gap:9,
+          padding:'5.5px 22px', fontSize:12.5, color:act?T.ink:T.sub, cursor:'pointer',
+          background:act?T.sideHi:'transparent', borderRadius:6, margin:'0 8px',
+          transition:'background .15s'}}
+          onMouseEnter={e=>{ if(!act) e.currentTarget.style.background='rgba(255,255,255,0.04)'; }}
+          onMouseLeave={e=>{ if(!act) e.currentTarget.style.background='transparent'; }}>
+          <span style={{fontSize:13, width:16, textAlign:'center'}}>{ic}</span>
+          <span>{label}</span>
+          <span style={{marginLeft:'auto', fontSize:10, color:T.faint, fontFamily:F.mono}}>{badge}</span>
+        </div>
+        );
+      })}
+      <div style={{height:.5, background:T.line, margin:'8px 14px'}}/>
+      {/* 任务列表 */}
+      <div style={{display:'flex', alignItems:'center', padding:'2px 14px 6px'}}>
+        <span style={{fontSize:11, fontWeight:600, color:T.sub}}>任务列表</span>
+        <span onClick={newSession} title="新建会话：在当前项目/版本下创建并跳转（未选项目时落入「默认」）"
+          style={{marginLeft:'auto', display:'flex', alignItems:'center', gap:3, fontSize:10.5, color:T.sub,
+            cursor:'pointer', border:'0.5px solid '+T.line, borderRadius:6, padding:'2.5px 8px',
+            background:'rgba(255,255,255,0.03)'}}
+          onMouseEnter={e=>{e.currentTarget.style.background='rgba(255,255,255,0.07)'; e.currentTarget.style.color=T.ink;}}
+          onMouseLeave={e=>{e.currentTarget.style.background='rgba(255,255,255,0.03)'; e.currentTarget.style.color=T.sub;}}>
+          <span style={{fontSize:11}}>＋</span>新建会话
+        </span>
+      </div>
+      <div style={{flex:1, overflowY:'auto', padding:'0 10px'}}>
+        {/*「默认」项目：未选择任何项目时（非 chat 视图）置顶展示；当前会话就在「默认」中时保持可见 */}
+        {(view!=='chat' || (curTask && curTask.key==='default')) && (
+          <div style={{marginBottom:2}}>
+            <div onClick={()=>toggleProj('default')}
+              style={{display:'flex', alignItems:'center', gap:7, padding:'5px 8px', borderRadius:7, cursor:'pointer'}}>
+              <span style={{fontSize:8, color:T.faint, display:'inline-block',
+                transform:expanded.proj.default?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+              <span style={{fontSize:12}}>🗂</span>
+              <span style={{fontSize:12.5, fontWeight:600, color:T.sub}}>默认</span>
+              {view!=='chat' && <Tag c={T.faint} bg='rgba(255,255,255,0.04)'>未选择项目</Tag>}
+            </div>
+            {expanded.proj.default && DEFAULT_PROJECT.versions.map(vn=>{
+              const verId = 'default/'+vn.v;
+              return (
+                <div key={vn.v}>
+                  <div onClick={()=>toggleVer(verId)}
+                    style={{display:'flex', alignItems:'center', gap:7, padding:'3px 8px 3px 21px',
+                      fontSize:11.5, color:T.faint, cursor:'pointer', borderRadius:6}}>
+                    <span style={{fontSize:8, color:T.faint, display:'inline-block',
+                      transform:expanded.ver[verId]?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+                    <span style={{fontSize:10.5}}>📁</span>
+                    <span>{vn.v}</span>
+                    <span style={{fontSize:9, color:T.faint, marginLeft:'auto'}}>unversioned/</span>
+                  </div>
+                  {expanded.ver[verId] && sessionsOf('default', vn.v).map(s=>(
+                    <SessionRow key={s.id} s={s} curTask={curTask} view={view} onPick={()=>pick('default', vn.v, s.id)}/>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {TASK_TREE.map(proj=>{
+          const pEmoji = PROJECTS[proj.key]?.emoji;
+          const running = proj.versions.some(v=>(v.sessions||[]).some(s=>s.st==='run'));
+          return (
+            <div key={proj.key} style={{marginBottom:2}}>
+              {/* 第一层：项目节点（点击展开/收起，不切换任务） */}
+              <div onClick={()=>toggleProj(proj.key)}
+                style={{display:'flex', alignItems:'center', gap:7, padding:'5px 8px', borderRadius:7, cursor:'pointer'}}
+                onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.03)'}
+                onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                <span style={{fontSize:8, color:T.faint, display:'inline-block',
+                  transform:expanded.proj[proj.key]?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+                <span style={{fontSize:12}}>{pEmoji}</span>
+                <span style={{fontSize:12.5, fontWeight:600, color:T.sub}}>{proj.label}</span>
+                {running && <span className="run-dot" style={{width:6, height:6, borderRadius:'50%', background:T.purple, marginLeft:'auto'}}/>}
+              </div>
+              {/* 第二层：版本节点 + 每项目固定的「默认无版本号」目录（点击仅展开/收起） */}
+              {expanded.proj[proj.key] && proj.versions.map(vn=>{
+                const active = view==='chat' && curTask && curTask.key===proj.key && curTask.version===vn.v;
+                const verId = proj.key+'/'+vn.v;
+                return (
+                  <div key={vn.v}>
+                    <div onClick={()=>toggleVer(verId)}
+                      title={vn.noversion ? '存放未指定版本的会话与文件（unversioned/）· 点击展开' : undefined}
+                      style={{display:'flex', alignItems:'center', gap:6, padding:'4px 8px 4px 21px',
+                        borderRadius:6, cursor:'pointer',
+                        background:active?'rgba(139,92,246,0.12)':'transparent',
+                        opacity:vn.noversion && !(vn.sessions||[]).length ? 0.6 : 1}}>
+                      <span style={{fontSize:8, color:T.faint, display:'inline-block',
+                        transform:expanded.ver[verId]?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+                      {vn.locked
+                        ? <span style={{fontSize:10.5}}>📦</span>
+                        : vn.noversion
+                          ? <span style={{fontSize:10.5}}>📁</span>
+                          : <Tag mono c={active?T.purple:T.sub}>{vn.v}</Tag>}
+                      {vn.locked && <span style={{fontSize:11, color:T.faint, textDecoration:'none'}}>v1.0</span>}
+                      {vn.noversion && <span style={{fontSize:11, color:T.faint}}>{vn.v}</span>}
+                      {vn.locked && <span style={{fontSize:9, color:T.faint, marginLeft:'auto'}}>🔒 只读</span>}
+                      {vn.noversion && !vn.locked &&
+                        <span style={{fontSize:9, color:T.faint, marginLeft:'auto', fontFamily:F.mono}}>unversioned/</span>}
+                    </div>
+                    {/* 第三层：会话列表（每个节点 = 一个会话窗口，点击打开） */}
+                    {expanded.ver[verId] && sessionsOf(proj.key, vn.v).map(s=>(
+                      <SessionRow key={s.id} s={s} curTask={curTask} view={view} onPick={()=>pick(proj.key, vn.v, s.id)}/>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+      {/* 底部账户区 */}
+      <div style={{padding:'10px 14px', borderTop:'0.5px solid '+T.line, display:'flex', alignItems:'center', gap:9}}>
+        <div style={{width:24, height:24, borderRadius:'50%', background:'linear-gradient(135deg,#34D399,#059669)',
+          display:'flex', alignItems:'center', justifyContent:'center', fontSize:11}}>🧭</div>
+        <div style={{flex:1, minWidth:0}}>
+          <div style={{fontSize:11.5, color:T.ink, fontWeight:500}}>本地优先 <Tag c={T.purple} bg='rgba(139,92,246,0.15)'>MIT 开源</Tag></div>
+          <div style={{fontSize:9.5, color:T.faint}}>BYOK · Keychain · 快照 a91f3c</div>
+        </div>
+        <span style={{fontSize:11, color:T.faint}}>🔒</span>
+      </div>
+    </div>
+  );
+}
+
+/* ================= 中央：空态（TRAE 首页） ================= */
+function Home({onStart, input, setInput}) {
+  return (
+    <div style={{flex:1, minWidth:0, background:T.bg, display:'flex', flexDirection:'column', alignItems:'center',
+      justifyContent:'center', padding:'0 60px', position:'relative'}}>
+      {/* 品牌标题 */}
+      <div className="fadein" style={{display:'flex', alignItems:'center', gap:12, marginBottom:34}}>
+        <span style={{fontSize:26, color:T.ink, fontFamily:F.mono, fontWeight:700}}>&lt;/&gt;</span>
+        <span style={{fontSize:26, color:T.ink, fontWeight:700, letterSpacing:'-0.3px'}}>
+          PM with <span style={{color:T.purple}}>Copilot</span>
+        </span>
+      </div>
+      {/* 大输入框 */}
+      <div className="fadein" style={{width:640, maxWidth:'100%'}}>
+        <div style={{background:T.inputBg, border:'1px solid '+T.lineHi, borderRadius:16,
+          boxShadow:'0 8px 40px rgba(0,0,0,0.5)', overflow:'hidden'}}>
+          <textarea value={input} onChange={e=>setInput(e.target.value)} rows={2}
+            placeholder="说说你的产品想法——帮你澄清需求、调研竞品、撰写 PRD、生成可点击原型，交付带门禁质量分的完整方案。"
+            style={{width:'100%', background:'transparent', border:'none', outline:'none', color:T.ink,
+              fontSize:13.5, lineHeight:1.6, padding:'14px 16px 8px', fontFamily:'inherit'}}/>
+          {/* 工具条 */}
+          <div style={{display:'flex', alignItems:'center', gap:10, padding:'6px 10px 10px'}}>
+            <span style={{width:26, height:26, borderRadius:7, border:'0.5px solid '+T.lineHi, display:'flex',
+              alignItems:'center', justifyContent:'center', fontSize:13, color:T.sub, cursor:'pointer'}}>＋</span>
+            <span style={{display:'flex', alignItems:'center', gap:4, fontSize:11, color:T.sub, cursor:'pointer'}}>
+              ⚙ 自动流水线 <span style={{fontSize:8, color:T.faint}}>▼</span>
+            </span>
+            <span style={{display:'flex', gap:2}}>
+              {['🖼','📎','🎬'].map(i=><span key={i} style={{fontSize:12.5, padding:'2px 3px', cursor:'pointer'}}>{i}</span>)}
+            </span>
+            <span style={{marginLeft:'auto', display:'flex', alignItems:'center', gap:12}}>
+              <span style={{fontSize:11, color:T.sub, cursor:'pointer', fontFamily:F.mono}}>GLM-4.6 <span style={{fontSize:8, color:T.faint}}>▼</span></span>
+              <span style={{fontSize:12.5, color:T.faint, cursor:'pointer'}}>🔔</span>
+              <span onClick={()=>input.trim()&&onStart()} style={{width:28, height:28, borderRadius:'50%',
+                background:'linear-gradient(135deg,'+T.purpleD+','+T.purple+')', display:'flex', alignItems:'center',
+                justifyContent:'center', fontSize:12.5, cursor:'pointer', boxShadow:'0 2px 12px rgba(139,92,246,0.4)'}}>🎙</span>
+            </span>
+          </div>
+          {/* 展开行：环境 + 项目 */}
+          <div style={{display:'flex', gap:8, padding:'0 10px 12px'}}>
+            <span style={{display:'flex', alignItems:'center', gap:5, fontSize:10.5, color:T.sub,
+              background:'rgba(255,255,255,0.04)', border:'0.5px solid '+T.line, borderRadius:6, padding:'3px 9px', cursor:'pointer'}}>
+              💻 本地 <span style={{fontSize:7.5, color:T.faint}}>▼</span>
+            </span>
+            <span style={{display:'flex', alignItems:'center', gap:5, fontSize:10.5, color:T.sub,
+              background:'rgba(255,255,255,0.04)', border:'0.5px solid '+T.line, borderRadius:6, padding:'3px 9px', cursor:'pointer'}}>
+              📁 我的健身App · v1.1 <span style={{fontSize:7.5, color:T.faint}}>▼</span>
+            </span>
+          </div>
+        </div>
+        {/* 场景胶囊 */}
+        <div style={{display:'flex', gap:8, justifyContent:'center', marginTop:18, flexWrap:'wrap'}}>
+          {SCENES.map(([ic,label])=>(
+            <div key={label} onClick={()=>onStart(label)} style={{display:'flex', alignItems:'center', gap:6,
+              fontSize:11.5, color:T.sub, padding:'5.5px 14px', borderRadius:20, cursor:'pointer',
+              border:'1px solid '+T.line, background:'rgba(255,255,255,0.03)', transition:'all .15s'}}
+              onMouseEnter={e=>{e.currentTarget.style.background='rgba(255,255,255,0.07)'; e.currentTarget.style.color=T.ink;}}
+              onMouseLeave={e=>{e.currentTarget.style.background='rgba(255,255,255,0.03)'; e.currentTarget.style.color=T.sub;}}>
+              <span style={{fontSize:11}}>{ic}</span>{label}
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* 底部提示 */}
+      <div style={{position:'absolute', bottom:22, fontSize:10.5, color:T.faint}}>
+        文件是唯一事实源 · 数据在你自己的硬盘上 · MCP stdio 可被 Claude Desktop 调用
+      </div>
+    </div>
+  );
+}
+
+/* ================= 中央：对话态 ================= */
+
+/* Agent 卡片外壳 */
+function AgentShell({stage, time, children}) {
+  const m = STAGES[stage];
+  return (
+    <div style={{display:'flex', gap:10, marginBottom:16, maxWidth:'86%'}}>
+      <Avatar stage={stage} size={26}/>
+      <div style={{flex:1, minWidth:0}}>
+        <div style={{display:'flex', alignItems:'baseline', gap:7, marginBottom:5}}>
+          <span style={{fontSize:11.5, fontWeight:700, color:T.ink}}>{m.name}</span>
+          <span style={{fontSize:9.5, fontFamily:F.mono, color:T.faint}}>{m.agent}</span>
+          <span style={{fontSize:9.5, color:T.faint, fontFamily:F.mono}}>{time}</span>
+        </div>
+        <div className="fadein" style={{background:T.card, border:'0.5px solid '+T.line,
+          borderRadius:12, padding:'13px 15px'}}>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* 系统行 */
+function SysLine({icon, text, link, onLink}) {
+  return (
+    <div style={{display:'flex', justifyContent:'center', marginBottom:14}}>
+      <div style={{display:'flex', alignItems:'center', gap:6, fontSize:10.5, color:T.sub,
+        background:'rgba(255,255,255,0.04)', border:'0.5px solid '+T.line, borderRadius:20, padding:'3.5px 14px', maxWidth:'88%'}}>
+        <span style={{fontSize:10}}>{icon}</span>
+        <span>{text}</span>
+        {link && <span onClick={onLink} style={{color:T.purple, cursor:'pointer', fontWeight:500}}>{link} →</span>}
+      </div>
+    </div>
+  );
+}
+
+/* 计划卡 */
+function PlanCard() {
+  return (
+    <AgentShell stage="clarify" time="14:02">
+      <div style={{fontSize:13, fontWeight:700, color:T.ink, marginBottom:2}}>执行计划 · 五阶段流水线</div>
+      <div style={{fontSize:11, color:T.faint, marginBottom:10}}>① 需要你参与对话确认 · ②③④⑤ 一键自动 · 评审不过定向打回</div>
+      {Object.values(STAGES).map(m=>(
+        <div key={m.name} style={{display:'flex', alignItems:'center', gap:9, padding:'5.5px 10px',
+          borderRadius:7, background:'rgba(255,255,255,0.03)', marginBottom:4, fontSize:12}}>
+          <span style={{color:m.c, fontWeight:700, fontSize:11, width:14}}>{m.n}</span>
+          <span style={{fontWeight:600, color:T.ink}}>{m.name}</span>
+          <span style={{fontSize:10, color:T.faint, fontFamily:F.mono}}>{m.agent}</span>
+          <span style={{marginLeft:'auto', fontSize:10, color:T.sub}}>
+            {m.name==='需求澄清'?'对话式 · ≤5 轮':m.name==='竞品调研'?'web_search · 出处必带':m.name==='PRD 撰写'?'模板确定性路由':m.name==='原型生成'?'单文件 HTML · 断网可渲染':'门禁 ≥6 · 独立评审'}
+          </span>
+        </div>
+      ))}
+      <div style={{fontSize:10.5, color:T.faint, marginTop:8}}>顺序是建议不是硬约束 · 任意阶段可单测重试</div>
+    </AgentShell>
+  );
+}
+
+/* 要点表 */
+function TableCard() {
+  const rows = [
+    ['target_user','目标用户','健身小白 · 有过放弃经历'],
+    ['core_scenario','核心场景','每天 10 分钟跟练 + 打卡'],
+    ['core_value','核心价值','坚持反馈（周报/成就）优先于数据精度'],
+    ['constraints','约束','不做专业增肌 · iOS 优先 · 首版不做社交排位'],
+    ['open_questions','开放问题','推送权限申请时机？'],
+  ];
+  return (
+    <AgentShell stage="clarify" time="14:18">
+      <div style={{fontSize:13, fontWeight:700, color:T.ink, marginBottom:8}}>
+        澄清要点表 <Tag c={T.blue} bg='rgba(94,168,255,0.12)'>JSON Schema 校验通过</Tag>
+      </div>
+      {rows.map(([k,label,v])=>(
+        <div key={k} style={{display:'flex', gap:10, padding:'5px 0', borderTop:'0.5px solid '+T.line, fontSize:12}}>
+          <span style={{fontFamily:F.mono, color:T.blue, width:112, fontSize:10.5, flexShrink:0}}>{k}</span>
+          <span style={{color:T.faint, width:56, flexShrink:0}}>{label}</span>
+          <span style={{color:T.ink}}>{v}</span>
+        </div>
+      ))}
+      <div style={{display:'flex', gap:8, marginTop:12, justifyContent:'flex-end'}}>
+        <Btn small>修改答案</Btn>
+        <Btn small kind="primary">确认，进入调研 →</Btn>
+      </div>
+    </AgentShell>
+  );
+}
+
+/* 调研工具行 */
+function ToolRow({tool}) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div style={{margin:'5px 0'}}>
+      <div onClick={()=>tool.detail&&setOpen(!open)} style={{display:'flex', alignItems:'center', gap:8, padding:'6px 10px',
+        borderRadius:7, background:'rgba(255,255,255,0.03)', cursor:tool.detail?'pointer':'default',
+        border:'0.5px solid '+T.line, fontFamily:F.mono, fontSize:11}}>
+        <span style={{fontSize:8, color:tool.st==='ok'?T.green:T.purple, transition:'transform .15s',
+          display:'inline-block', width:9, transform:open?'rotate(90deg)':'none'}}>▶</span>
+        <span style={{fontSize:11}}>{tool.icon}</span>
+        <span style={{color:T.ink}}>{tool.title}</span>
+        <span style={{marginLeft:'auto', fontSize:10, color:tool.st==='ok'?T.green:T.purple, whiteSpace:'nowrap'}}>
+          {tool.st==='ok'?'✓ 1.2s':'● 运行中'}
+        </span>
+      </div>
+      {open && tool.detail && (
+        <div className="fadein" style={{marginLeft:22, marginTop:4, padding:'7px 10px', borderLeft:'2px solid '+T.lineHi,
+          fontSize:10.5, color:T.sub, fontFamily:F.mono, lineHeight:1.8, whiteSpace:'pre-wrap'}}>
+          {tool.detail}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResearchCard({running}) {
+  const tools = running
+    ? [{icon:'🌐', title:'web_search("桌面小组件 待办 竞品")', st:'run'}]
+    : [
+        {icon:'🌐', title:'web_search("健身打卡 App 竞品 留存")', st:'ok', detail:'Keep · 每日瑜伽 · 小白健身操\n结果 8 条 · 取前 3'},
+        {icon:'📄', title:'web_fetch(keep.com/features)', st:'ok', detail:'Keep 社区功能留存 +15%（官方博客 2026-06）\n出处：https://keep.com/blog/retention'},
+        {icon:'📄', title:'web_fetch(daily-yoga.com/pricing)', st:'ok', detail:'会员定价 ¥28/月 · 打卡返现机制\n出处：https://daily-yoga.com/pricing'},
+      ];
+  return (
+    <AgentShell stage="research" time={running?'15:44':'14:31'}>
+      <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:8}}>
+        <span style={{fontSize:13, fontWeight:700, color:T.ink}}>竞品调研执行</span>
+        {running
+          ? <Tag c={T.purple} bg='rgba(139,92,246,0.14)'>● 执行中</Tag>
+          : <Tag c={T.green} bg='rgba(74,222,128,0.12)'>✓ 完成 · 事实均带出处</Tag>}
+      </div>
+      {tools.map((tool,i)=><ToolRow key={i} tool={tool}/>)}
+      {!running && <div style={{fontSize:10.5, color:T.faint, marginTop:6}}>找不到的信息标「未找到」，不编造</div>}
+    </AgentShell>
+  );
+}
+
+/* 产物卡 */
+function ArtifactCard({kind, ver, onOpenFile}) {
+  if (kind==='research') return (
+    <AgentShell stage="research" time="14:36">
+      <ArtHead file="02-analysis/competitors-overview.md" tags={['3 竞品','出处 ×9','已落盘']} onOpen={onOpenFile}/>
+      {[
+        ['Keep','社区+课程生态成熟','坚持反馈仅靠排行榜——小白挫败感强','keep.com'],
+        ['每日瑜伽','打卡返现激励','现金激励停发即流失','daily-yoga.com'],
+        ['小白健身操','10 分钟低门槛','无留存设计，7 日流失 70%','fit-lite.app'],
+      ].map(([n,pro,con,src])=>(
+        <div key={n} style={{padding:'7px 10px', borderRadius:7, background:'rgba(255,255,255,0.03)',
+          marginBottom:5, fontSize:11.5, lineHeight:1.6}}>
+          <b style={{color:T.ink}}>{n}</b>
+          <div style={{color:T.sub, fontSize:11}}>✓ {pro}　✗ {con}</div>
+          <div style={{fontSize:10, color:T.blue, fontFamily:F.mono, marginTop:1}}>{src}</div>
+        </div>
+      ))}
+    </AgentShell>
+  );
+  if (kind==='prd') {
+    const v1 = ver===1;
+    return (
+      <AgentShell stage="prd" time={v1?'15:02':'15:26'}>
+        <ArtHead file={'01-requirements/prd-v'+(v1?1:2)+'.md'} stage="prd" warn={v1} onOpen={onOpenFile}
+          tags={v1?['6 章节','write-then-verify ✓']:['修订版','非功能需求补齐','快照 b02e7d']}/>
+        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:'4px 14px', fontSize:11.5, lineHeight:1.7}}>
+          {[
+            ['背景与目标',false],['用户画像与场景',false],['功能需求 · RICE 排序',false],
+            ['非功能需求',v1],['数据指标',v1],['边界与风险',false],
+          ].map(([s,warn])=>(
+            <div key={s} style={{display:'flex', gap:5, alignItems:'center', color:warn?T.amber:T.sub}}>
+              <span style={{fontSize:9}}>{warn?'⚠️':'·'}</span>
+              <span>{s}{v1&&warn?'（缺验收标准/埋点口径）':''}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{marginTop:9, display:'flex', gap:8}}>
+          <Btn small>预览全文</Btn>
+          <Btn small kind="ghost">在 Finder 中显示</Btn>
+        </div>
+      </AgentShell>
+    );
+  }
+  return (
+    <AgentShell stage="proto" time="15:10">
+      <ArtHead file="04-prototypes/prototype-v1.html" tags={['单文件 · 零依赖','断网可渲染','P0 流程 5 页']} onOpen={onOpenFile}/>
+      <div style={{border:'0.5px solid '+T.line, borderRadius:9, overflow:'hidden', marginTop:2}}>
+        <div style={{background:'rgba(255,255,255,0.04)', padding:'4px 10px', fontSize:9.5, color:T.faint,
+          display:'flex', gap:4, alignItems:'center', fontFamily:F.mono}}>
+          <span style={{width:7,height:7,borderRadius:'50%',background:'#ff5f57'}}/>
+          <span style={{width:7,height:7,borderRadius:'50%',background:'#febc2e'}}/>
+          <span style={{width:7,height:7,borderRadius:'50%',background:'#28c840'}}/>
+          <span style={{marginLeft:6}}>WKWebView · file://prototype-v1.html</span>
+        </div>
+        <div style={{display:'flex', height:112, background:'#0A0A0C'}}>
+          <div style={{flex:1, padding:10, borderRight:'0.5px solid '+T.line}}>
+            <div style={{fontSize:9, color:T.faint, marginBottom:4}}>① 今日打卡</div>
+            <div style={{height:24, borderRadius:5, background:'rgba(255,255,255,0.06)', marginBottom:5}}/>
+            <div style={{height:10, width:'60%', borderRadius:4, background:'rgba(255,255,255,0.07)', marginBottom:5}}/>
+            <div style={{display:'flex', gap:4}}>
+              {[0,1,2,3,4,5,6].map(d=>(
+                <div key={d} style={{flex:1, height:20, borderRadius:4,
+                  background:d<5?'rgba(74,222,128,0.25)':'rgba(255,255,255,0.05)'}}/>
+              ))}
+            </div>
+            <div style={{marginTop:6, height:16, borderRadius:8, background:T.purpleD, opacity:.8}}/>
+          </div>
+          <div style={{flex:1, padding:10, borderRight:'0.5px solid '+T.line}}>
+            <div style={{fontSize:9, color:T.faint, marginBottom:4}}>④ 坚持报告</div>
+            {[38,64,50,72,44].map((h,i)=>(
+              <div key={i} style={{display:'flex', alignItems:'flex-end', gap:3, height:54, marginTop:4}}>
+                {[0,1,2,3,4,5].map(w=>(
+                  <div key={w} style={{flex:1, height:(h*(0.5+((w+i)%3)*0.25))+'%', borderRadius:2, background:'rgba(139,92,246,0.4)'}}/>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div style={{flex:0.8, padding:10}}>
+            <div style={{fontSize:9, color:T.faint, marginBottom:4}}>⑤ 成就墙</div>
+            <div style={{display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:4}}>
+              {[...Array(6)].map((_,i)=>(
+                <div key={i} style={{height:22, borderRadius:5, background:i<3?'rgba(251,191,36,0.22)':'rgba(255,255,255,0.05)'}}/>
+              ))}
+            </div>
+            <div style={{fontSize:8.5, color:T.faint, marginTop:6, lineHeight:1.5}}>页面跳转可点击<br/>覆盖 PRD 核心流程</div>
+          </div>
+        </div>
+      </div>
+      <div style={{marginTop:8, display:'flex', gap:8}}>
+        <Btn small kind="primary">在内置浏览器打开</Btn>
+        <Btn small kind="ghost">与 PRD 功能对照</Btn>
+      </div>
+    </AgentShell>
+  );
+}
+
+function ArtHead({file, tags, warn, onOpen}) {
+  const name = file.split('/').pop();
+  return (
+    <div style={{display:'flex', alignItems:'center', gap:7, marginBottom:9, flexWrap:'wrap'}}>
+      <span style={{fontSize:14}}>📄</span>
+      <span onClick={()=>onOpen && onOpen(name)} title="在产物面板中定位"
+        style={{fontFamily:F.mono, fontSize:11.5, fontWeight:600, color:warn?T.amber:T.ink, cursor:'pointer',
+          borderBottom:'1px dashed '+(warn?'rgba(251,191,36,0.4)':'rgba(255,255,255,0.25)')}}>{file}</span>
+      {tags.map(t=><Tag key={t} c={warn?T.amber:T.sub}>{t}</Tag>)}
+    </div>
+  );
+}
+
+/* 评审卡 */
+function ReviewCard({pass}) {
+  const dims = pass
+    ? [['需求完整性',8],['方案合理性',7],['用户价值',7],['技术可行性',6.5],['文档质量',6.5],['原型一致性',6]]
+    : [['需求完整性',7],['方案合理性',6],['用户价值',6],['技术可行性',7],['文档质量',5],['原型一致性',6]];
+  const avg = pass?6.4:5.8;
+  return (
+    <AgentShell stage="review" time={pass?'15:34':'15:20'}>
+      <div style={{display:'flex', alignItems:'center', gap:10, marginBottom:10}}>
+        <span style={{fontSize:26, fontWeight:800, fontFamily:F.mono, color:pass?T.green:T.red}}>{avg.toFixed(1)}</span>
+        <div>
+          <div style={{fontSize:12, fontWeight:700, color:pass?T.green:T.red}}>
+            {pass?'✓ 复审通过（≥6）':'✗ 未过门禁（< 6）'}
+          </div>
+          <div style={{fontSize:10, color:T.faint}}>独立评审（未注入 ③④ 生成上下文） · 打回 {pass?'1':'0'}/2 次</div>
+        </div>
+        <Tag c={T.sub} >{pass?'可封板':'责任层：prd'}</Tag>
+      </div>
+      {dims.map(([k,v])=>(
+        <div key={k} style={{display:'flex', alignItems:'center', gap:8, marginBottom:5}}>
+          <span style={{fontSize:11, width:70, color:v<6?T.red:T.sub}}>{k}</span>
+          <div style={{flex:1, height:5, borderRadius:3, background:'rgba(255,255,255,0.07)', overflow:'hidden'}}>
+            <div style={{width:v*10+'%', height:'100%', background:v<6?T.red:(v>=7?T.green:T.amber)}}/>
+          </div>
+          <span style={{fontSize:10, fontFamily:F.mono, width:20, color:v<6?T.red:T.sub}}>{v}</span>
+        </div>
+      ))}
+      {!pass && (
+        <div style={{marginTop:9, padding:'8px 11px', borderRadius:7, background:'rgba(248,113,113,0.07)', border:'0.5px solid rgba(248,113,113,0.25)'}}>
+          <div style={{fontSize:11, fontWeight:700, color:T.red, marginBottom:2}}>扣分点 · 文档质量 5/10</div>
+          <div style={{fontSize:11.5, color:T.ink, lineHeight:1.6}}>
+            非功能需求只有一句话，缺「提醒触达率」验收标准；数据指标没写埋点口径。
+            <div style={{color:T.sub, marginTop:2}}>建议：按「指标 + 阈值 + 验收方式」三列补齐。</div>
+          </div>
+          <div style={{marginTop:8, display:'flex', gap:8}}>
+            <Btn small kind="danger">↩ 定向打回 ③（只重跑 PRD）</Btn>
+            <Btn small kind="ghost">人工介入</Btn>
+          </div>
+        </div>
+      )}
+      {pass && (
+        <div style={{marginTop:10, display:'flex', gap:8, justifyContent:'flex-end'}}>
+          <Btn small>继续修改</Btn>
+          <Btn small kind="primary">📦 封板（git tag + 冻结 + release notes）</Btn>
+        </div>
+      )}
+    </AgentShell>
+  );
+}
+
+/* 封板卡 */
+function DoneCard() {
+  return (
+    <AgentShell stage="review" time="15:40">
+      <div style={{display:'flex', alignItems:'center', gap:9, marginBottom:8}}>
+        <span style={{fontSize:16}}>📦</span>
+        <span style={{fontSize:13, fontWeight:700, color:T.ink}}>v1.1 已封板</span>
+        <Tag c={T.green} bg='rgba(74,222,128,0.12)'>git tag v1.1 · 目录已冻结</Tag>
+      </div>
+      <div style={{padding:'9px 12px', borderRadius:7, background:'rgba(255,255,255,0.03)', fontSize:11.5, lineHeight:1.8, color:T.ink}}>
+        <b style={{fontSize:10.5, color:T.faint}}>release-notes.md（自动生成）</b><br/>
+        <span style={{color:T.green}}>+</span> 周报自动生成（每周一）<br/>
+        <span style={{color:T.green}}>+</span> 中断恢复 = 温和提醒 + 每周 1 次补签（d_004）<br/>
+        <span style={{color:T.red}}>−</span> 好友排行（d_002 · 竞品验证留存提升有限）
+      </div>
+      <div style={{marginTop:8, fontSize:10.5, color:T.faint}}>开 v1.2 继承约束与否决项，不继承讨论</div>
+    </AgentShell>
+  );
+}
+
+/* 对话面板 */
+function ChatPanel({curTask, setVersion, readOnly, openPanel, onOpenFile, goHome, rightOpen, rightTab}) {
+  const p = PROJECTS[curTask.key] || PROJECTS.fitness;
+  const session = findSession(curTask.sid);   // 第三层会话：内容与会话一一对应
+  const run = session
+    ? (session.main ? (curTask.key==='widget' ? RUN_WIDGET : RUN_FITNESS) : (session.msgs||[]))
+    : (curTask.key==='widget' ? RUN_WIDGET : RUN_FITNESS);
+  const ver = curTask.version;
+  const render = (m,i) => {
+    switch(m.t) {
+      case 'user': return (
+        <div key={i} style={{display:'flex', justifyContent:'flex-end', marginBottom:16}}>
+          <div style={{background:T.userBubble, border:'0.5px solid '+T.lineHi, color:T.ink, fontSize:12.5,
+            lineHeight:1.6, padding:'9px 14px', borderRadius:14, borderBottomRightRadius:5, maxWidth:'72%'}}>{m.text}</div>
+        </div>
+      );
+      case 'sys': return <div key={i}><SysLine icon={m.icon} text={m.text} link={m.link} onLink={()=>openPanel('ctx')}/></div>;
+      case 'plan': return <PlanCard key={i}/>;
+      case 'table': return <TableCard key={i}/>;
+      case 'research': return <ResearchCard key={i} running={m.running}/>;
+      case 'artifact': return <ArtifactCard key={i} kind={m.kind} ver={m.ver} onOpenFile={onOpenFile}/>;
+      case 'review': return <ReviewCard key={i} pass={m.pass}/>;
+      case 'done': return <DoneCard key={i}/>;
+      case 'chat': return (
+        <AgentShell key={i} stage={m.stage} time={m.time}>
+          <div style={{fontSize:12.5, color:T.ink, lineHeight:1.75}}>{m.text}</div>
+        </AgentShell>
+      );
+    }
+  };
+  return (
+    <div style={{flex:1, minWidth:0, display:'flex', flexDirection:'column', background:T.bg}}>
+      {/* 顶栏 */}
+      <div style={{height:44, flexShrink:0, background:T.side, borderBottom:'0.5px solid '+T.line,
+        display:'flex', alignItems:'center', padding:'0 14px', gap:9}}>
+        <span style={{fontSize:14, cursor:'pointer', color:T.faint}} onClick={goHome}>‹</span>
+        <span style={{fontSize:13}}>{p.emoji}</span>
+        <span style={{fontSize:13, fontWeight:600, color:T.ink}}>{p.name}</span>
+        <select value={ver} onChange={e=>setVersion(e.target.value)}
+          style={{fontSize:10.5, padding:'2.5px 7px', borderRadius:6, background:T.cardHi, color:readOnly?T.amber:T.sub,
+            border:'0.5px solid '+T.lineHi, fontFamily:F.mono, cursor:'pointer', outline:'none'}}>
+          {p.versions.map(v=><option key={v} value={v}>{v}{v!==p.versions[0]?' 🔒':''}</option>)}
+        </select>
+        {/* 当前会话（第三层节点） */}
+        {session && (
+          <span style={{fontSize:10.5, color:T.sub, background:'rgba(255,255,255,0.05)',
+            border:'0.5px solid '+T.line, borderRadius:6, padding:'2.5px 9px', display:'flex', alignItems:'center', gap:5}}>
+            <span style={{fontSize:9, color:session.st==='run'?T.purple:T.faint}}>
+              {session.st==='done'?'●':(session.st==='run'?'◐':'○')}
+            </span>
+            <span style={{maxWidth:180, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis'}}>{session.title}</span>
+          </span>
+        )}
+        <span style={{fontSize:10.5, color:T.faint}}>{p.goal}</span>
+        <div style={{marginLeft:'auto', display:'flex', gap:8, alignItems:'center'}}>
+          <span style={{fontSize:10.5, color:T.faint, fontFamily:F.mono}}>本月 ¥4.2</span>
+          {[['files','🗂 产物'],['ctx','◧ 上下文']].map(([k,label])=>(
+            <span key={k} onClick={()=>openPanel(k, rightOpen && rightTab===k)}
+              style={{display:'flex', alignItems:'center', gap:5, fontSize:11, color:T.sub,
+                background: rightOpen && rightTab===k ? 'rgba(139,92,246,0.15)' : 'rgba(255,255,255,0.04)',
+                border:'0.5px solid '+T.line, borderRadius:6, padding:'3px 10px', cursor:'pointer'}}>
+              {label}
+            </span>
+          ))}
+        </div>
+      </div>
+      {/* 消息流 */}
+      <div style={{flex:1, overflowY:'auto', padding:'20px 28px 10px'}}>
+        <div style={{maxWidth:720, margin:'0 auto'}}>
+          {readOnly
+            ? <React.Fragment>
+                <div style={{textAlign:'center', padding:'28px 0 6px', fontSize:12, color:T.sub}}>
+                  正在回看已封版 <b style={{fontFamily:F.mono, color:T.amber}}>v1.0</b> 的对话与产物 · 与封版快照逐字一致（E13）
+                </div>
+                {run.map(render)}
+              </React.Fragment>
+            : (run.length
+                ? run.map(render)
+                : <div style={{textAlign:'center', padding:'56px 0', color:T.faint, fontSize:12}}>
+                    <div style={{fontSize:26, marginBottom:10}}>💬</div>
+                    会话「{session?.title||'新会话'}」尚未开始<br/>
+                    <span style={{fontSize:10.5}}>发送第一条消息，结论与决策会自动沉淀到该项目</span>
+                  </div>)}
+        </div>
+      </div>
+      {/* 输入区（对话态紧凑版） */}
+      <div style={{flexShrink:0, padding:'10px 28px 14px'}}>
+        <div style={{maxWidth:720, margin:'0 auto', background:T.inputBg, border:'0.5px solid '+T.lineHi, borderRadius:12, padding:'8px 12px'}}>
+          {readOnly ? (
+            <div style={{fontSize:11.5, color:T.amber, textAlign:'center', padding:'4px 0'}}>🔒 只读模式 · 切回 {p.versions[0]} 可继续</div>
+          ) : (
+            <div style={{display:'flex', gap:8, alignItems:'center'}}>
+              <span style={{fontSize:12, color:T.faint, cursor:'pointer'}}>＋</span>
+              <div style={{flex:1, fontSize:12, color:T.faint}}>
+                回复 Agent…（① 每轮只问一个最关键的问题 · Cmd+K 技能）
+              </div>
+              <Btn small>★ 记下来</Btn>
+              <span style={{width:26, height:26, borderRadius:'50%', background:'linear-gradient(135deg,'+T.purpleD+','+T.purple+')',
+                display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, cursor:'pointer'}}>🎙</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= 右侧面板：产物 / 上下文 双 Tab ================= */
+function RightPanel({pKey, tab, setTab, onClose, selectedFile, onSelectFile, artView, setArtView}) {
+  return (
+    <div className="slidein" style={{width:312, flexShrink:0, background:T.side, borderLeft:'0.5px solid '+T.line,
+      display:'flex', flexDirection:'column'}}>
+      {/* Tab 切换（仿参考图：产物=资源管理器，上下文=检查器） */}
+      <div style={{display:'flex', alignItems:'center', gap:6, padding:'10px 12px 8px'}}>
+        <div style={{display:'flex', flex:1, background:'rgba(255,255,255,0.05)', borderRadius:8, padding:2}}>
+          {[['files','产物'],['ctx','上下文']].map(([k,label])=>(
+            <div key={k} onClick={()=>setTab(k)}
+              style={{flex:1, textAlign:'center', fontSize:11.5, fontWeight:tab===k?600:400, padding:'4px 0', borderRadius:6,
+                background:tab===k?T.cardHi:'transparent', color:tab===k?T.ink:T.faint, cursor:'pointer',
+                boxShadow:tab===k?'inset 0 0 0 1px '+T.lineHi:'none', display:'flex', alignItems:'center', justifyContent:'center', gap:4}}>
+              {label}
+              {k==='files' && <span style={{fontSize:9, color:T.faint, fontFamily:F.mono}}>{FILES[pKey].count}</span>}
+              {k==='ctx' && <span style={{width:5, height:5, borderRadius:'50%', background:T.green, display:'inline-block'}}/>}
+            </div>
+          ))}
+        </div>
+        <span onClick={onClose} style={{fontSize:13, color:T.faint, cursor:'pointer'}}>✕</span>
+      </div>
+      {/* 产物 Tab 二级视图：文件树（§5.1）/ 按阶段（§4）/ 交接（§7） */}
+      {tab==='files' && (
+        <div style={{display:'flex', gap:2, padding:'0 12px 8px'}}>
+          {[['tree','文件'],['stage','按阶段'],['handoff','交接']].map(([k,label])=>(
+            <div key={k} onClick={()=>setArtView(k)}
+              style={{flex:1, textAlign:'center', fontSize:10, fontWeight:artView===k?600:400, padding:'3px 0', borderRadius:6,
+                cursor:'pointer', color:artView===k?T.purple:T.faint,
+                background:artView===k?'rgba(139,92,246,0.13)':'transparent',
+                boxShadow:artView===k?'inset 0 0 0 1px rgba(139,92,246,0.35)':'none'}}>
+              {label}
+            </div>
+          ))}
+        </div>
+      )}
+      {tab==='files'
+        ? (artView==='tree'
+            ? <FilesPanel pKey={pKey} selectedFile={selectedFile} onSelectFile={onSelectFile}/>
+            : artView==='stage'
+              ? <StageArtifactsPanel pKey={pKey} onLocate={f=>{onSelectFile(f); setArtView('tree');}}/>
+              : <HandoffPanel pKey={pKey}/>)
+        : <CtxPanel pKey={pKey}/>}
+    </div>
+  );
+}
+
+/* ---- 产物面板：VS Code 资源管理器风格 ---- */
+
+/* 文件类型图标（VS Code 式着色：md 蓝 / html 橙 / json 黄） */
+function FileIco({type}) {
+  const map = {
+    md:   {g:'M',   c:T.blue,   bg:'rgba(94,168,255,0.16)', fs:9},
+    html: {g:'</>', c:'#FB923C', bg:'rgba(251,146,60,0.16)', fs:6.5, mono:true},
+    json: {g:'{}',  c:T.amber,  bg:'rgba(251,191,36,0.16)', fs:8, mono:true},
+  };
+  const m = map[type] || {g:'·', c:T.faint, bg:'transparent', fs:9};
+  return (
+    <span style={{width:15, height:15, borderRadius:3.5, background:m.bg, color:m.c, fontSize:m.fs,
+      fontWeight:700, display:'inline-flex', alignItems:'center', justifyContent:'center', flexShrink:0,
+      fontFamily:m.mono?F.mono:undefined}}>{m.g}</span>
+  );
+}
+
+/* 目录节点（可折叠） */
+function DirNode({node, depth, render}) {
+  const [open, setOpen] = React.useState(node.open!==false);
+  return (
+    <div>
+      <div onClick={()=>setOpen(!open)} style={{display:'flex', alignItems:'center', gap:5, padding:'3px 6px',
+        borderRadius:5, cursor:'pointer', paddingLeft:6+depth*13}}
+        onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+        onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+        <span style={{fontSize:7.5, color:T.faint, display:'inline-block', width:8,
+          transform:open?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+        <span style={{fontSize:11}}>📁</span>
+        <span style={{fontFamily:F.mono, fontSize:10.5, fontWeight:600, color:T.sub}}>{node.dir}</span>
+      </div>
+      {open && node.children.map(c=>render(c, depth+1))}
+    </div>
+  );
+}
+
+function FilesPanel({pKey, selectedFile, onSelectFile}) {
+  const tree = FILES[pKey].tree;
+  const [outlineOpen, setOutlineOpen] = React.useState(true);
+  const [timelineOpen, setTimelineOpen] = React.useState(false);
+  const outline = OUTLINES[selectedFile] || null;
+
+  const renderNode = (node, depth) => {
+    if (node.f) {
+      const sel = node.f===selectedFile;
+      return (
+        <div key={node.f} onClick={()=>onSelectFile(node.f)} title={node.meta}
+          style={{display:'flex', alignItems:'center', gap:6, padding:'3px 6px', borderRadius:5, cursor:'pointer',
+            background:sel?'rgba(139,92,246,0.15)':'transparent', paddingLeft:6+depth*13}}
+          onMouseEnter={e=>{if(!sel)e.currentTarget.style.background='rgba(255,255,255,0.04)';}}
+          onMouseLeave={e=>{if(!sel)e.currentTarget.style.background='transparent';}}>
+          <FileIco type={node.type}/>
+          <span style={{fontFamily:F.mono, fontSize:10.5, color:sel?T.ink:T.sub,
+            fontWeight:node.star||sel?600:400}}>{node.f}</span>
+          {node.star && <span style={{fontSize:8, color:T.amber}}>★</span>}
+          {node.old && <Tag c={T.faint}>旧</Tag>}
+          {node.badge && <Tag c={T.blue} bg='rgba(94,168,255,0.12)' mono>{node.badge}</Tag>}
+        </div>
+      );
+    }
+    return <DirNode key={node.dir} node={node} depth={depth} render={renderNode}/>;
+  };
+
+  return (
+    <div style={{flex:1, overflowY:'auto', display:'flex', flexDirection:'column'}}>
+      {/* 工具条（仿参考图顶部图标行） */}
+      <div style={{display:'flex', alignItems:'center', gap:2, padding:'2px 10px 6px'}}>
+        {['⟳','⇤','🔍','⊕'].map(ic=>(
+          <span key={ic} style={{width:22, height:22, borderRadius:5, display:'flex', alignItems:'center',
+            justifyContent:'center', fontSize:11, color:T.faint, cursor:'pointer'}}
+            onMouseEnter={e=>{e.currentTarget.style.background='rgba(255,255,255,0.06)'; e.currentTarget.style.color=T.sub;}}
+            onMouseLeave={e=>{e.currentTarget.style.background='transparent'; e.currentTarget.style.color=T.faint;}}>{ic}</span>
+        ))}
+        <span style={{fontSize:10, color:T.faint, marginLeft:'auto'}}>文件是唯一事实源</span>
+      </div>
+      {/* 文件树 */}
+      <div style={{padding:'0 6px'}}>
+        {tree.map((n,i)=>renderNode(n, 0))}
+      </div>
+      {/* 选中文件 meta */}
+      {selectedFile && (
+        <div style={{margin:'8px 12px 0', padding:'6px 9px', borderRadius:6, background:'rgba(255,255,255,0.03)',
+          border:'0.5px solid '+T.line, display:'flex', alignItems:'center', gap:6}}>
+          <FileIco type={selectedFile.split('.').pop()==='html'?'html':(selectedFile.includes('.json')?'json':'md')}/>
+          <span style={{fontFamily:F.mono, fontSize:10, color:T.sub}}>{selectedFile}</span>
+        </div>
+      )}
+      <div style={{flex:1}}/>
+      {/* 大纲（仿 VS Code Outline） */}
+      <div style={{borderTop:'0.5px solid '+T.line, margin:'8px 8px 0'}}>
+        <div onClick={()=>setOutlineOpen(!outlineOpen)} style={{display:'flex', alignItems:'center', gap:5,
+          padding:'6px 6px', cursor:'pointer', fontSize:11, fontWeight:700, color:T.sub}}>
+          <span style={{fontSize:7.5, color:T.faint, display:'inline-block', width:8,
+            transform:outlineOpen?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+          大纲
+          <span style={{marginLeft:'auto', fontSize:9.5, fontWeight:400, color:T.faint}}>
+            {outline ? outline.length+' 节' : '选择文件查看'}
+          </span>
+        </div>
+        {outlineOpen && (outline
+          ? <div style={{padding:'0 6px 6px'}}>
+              {outline.map((s,i)=>(
+                <div key={i} style={{display:'flex', alignItems:'center', gap:6, padding:'2.5px 5px 2.5px 19px',
+                  fontSize:10.5, color:s.includes('⚠️')?T.amber:T.sub, cursor:'pointer', borderRadius:4}}
+                  onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                  onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <span style={{fontSize:8, color:T.faint}}>{s.includes('⚠️')?'⚠':'·'}</span>{s.replace(' ⚠️','')}
+                </div>
+              ))}
+            </div>
+          : <div style={{padding:'0 6px 8px 19px', fontSize:10, color:T.faint}}>无大纲（非文档类型或未选择）</div>
+        )}
+      </div>
+      {/* 时间线（仿 VS Code Timeline · 快照历史） */}
+      <div style={{borderTop:'0.5px solid '+T.line, margin:'0 8px 8px'}}>
+        <div onClick={()=>setTimelineOpen(!timelineOpen)} style={{display:'flex', alignItems:'center', gap:5,
+          padding:'6px 6px', cursor:'pointer', fontSize:11, fontWeight:700, color:T.sub}}>
+          <span style={{fontSize:7.5, color:T.faint, display:'inline-block', width:8,
+            transform:timelineOpen?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+          时间线
+          <span style={{marginLeft:'auto', fontSize:9.5, fontWeight:400, color:T.faint}}>{TIMELINES[pKey].length}</span>
+        </div>
+        {timelineOpen && (
+          <div style={{padding:'0 6px 6px'}}>
+            {TIMELINES[pKey].map((e,i)=>(
+              <div key={i} style={{display:'flex', alignItems:'center', gap:7, padding:'3px 5px 3px 19px',
+                fontSize:10, borderRadius:4, cursor:'pointer'}}
+                onMouseEnter={e2=>e2.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                onMouseLeave={e2=>e2.currentTarget.style.background='transparent'}>
+                <span style={{fontFamily:F.mono, fontSize:9, color:e.tag?T.amber:T.purple}}>{e.h}</span>
+                <span style={{color:T.sub, flex:1, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis'}}>{e.m}</span>
+                <span style={{fontSize:9, color:T.faint, fontFamily:F.mono}}>{e.t}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {/* 底部操作 */}
+      <div style={{padding:'0 12px 12px', display:'flex', gap:7}}>
+        <Btn small>在 Finder 中打开</Btn>
+        <Btn small kind="ghost">重建索引</Btn>
+      </div>
+    </div>
+  );
+}
+
+/* ---- 产物面板 · 视图二：按阶段（design.md §4：阶段完成 = 产物落盘 + 纪要 + 知识点抽取 + 决策写入） ---- */
+function StageArtifactsPanel({pKey, onLocate}) {
+  const list = STAGE_ARTIFACTS[pKey];
+  const [open, setOpen] = React.useState(
+    ()=>Object.fromEntries(list.map(s=>[s.s, s.files.length>0 || !!s.running])));
+  return (
+    <div style={{flex:1, overflowY:'auto', padding:'2px 10px 12px', display:'flex', flexDirection:'column', gap:6}}>
+      <div style={{fontSize:9.5, color:T.faint, padding:'0 2px'}}>
+        每阶段完成 = 产物落盘 + 纪要 + 知识点抽取 + 决策写入 · 点击文件在文件树中定位
+      </div>
+      {list.map(seg=>{
+        const st = STAGES[seg.s];
+        const isOpen = open[seg.s];
+        const ftype = f => f.endsWith('.html')?'html':(f.includes('.json')?'json':'md');
+        return (
+          <div key={seg.s} style={{borderRadius:8, border:'0.5px solid '+T.line,
+            background:'rgba(255,255,255,0.02)', overflow:'hidden',
+            opacity:(!seg.files.length && !seg.running)?0.55:1}}>
+            {/* 阶段头 */}
+            <div onClick={()=>setOpen({...open, [seg.s]:!isOpen})}
+              style={{display:'flex', alignItems:'center', gap:7, padding:'6px 8px', cursor:'pointer'}}
+              onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.03)'}
+              onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+              <Avatar stage={seg.s} size={18}/>
+              <span style={{fontSize:11.5, fontWeight:600, color:T.ink}}>{st.name}</span>
+              {seg.running
+                ? <Tag c={T.blue} bg='rgba(94,168,255,0.12)'>● 运行中</Tag>
+                : seg.files.length
+                  ? <Tag c={T.green} bg='rgba(74,222,128,0.1)'>✓ {seg.files.length} 产物</Tag>
+                  : <Tag>未开始</Tag>}
+              <span style={{fontSize:7.5, color:T.faint, marginLeft:'auto', display:'inline-block', width:8,
+                transform:isOpen?'rotate(90deg)':'none', transition:'transform .15s'}}>▶</span>
+            </div>
+            {/* 阶段体 */}
+            {isOpen && (
+              <div className="fadein" style={{padding:'1px 8px 7px'}}>
+                {seg.files.length
+                  ? seg.files.map(fl=>(
+                      <div key={fl.f} onClick={()=>onLocate(fl.f.split('/').pop())} title={fl.meta}
+                        style={{display:'flex', alignItems:'center', gap:6, padding:'3px 5px', borderRadius:5, cursor:'pointer'}}
+                        onMouseEnter={e=>e.currentTarget.style.background='rgba(139,92,246,0.1)'}
+                        onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                        <FileIco type={ftype(fl.f)}/>
+                        <span style={{fontFamily:F.mono, fontSize:10, color:T.sub, fontWeight:fl.star?600:400,
+                          textDecoration:fl.old?'line-through':'none'}}>
+                          {(fl.dir||'')+fl.f}
+                        </span>
+                        {fl.star && <span style={{fontSize:8, color:T.amber}}>★</span>}
+                        <span style={{fontSize:9, color:T.faint, marginLeft:'auto',
+                          overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis', flexShrink:1}}>{fl.meta}</span>
+                      </div>
+                    ))
+                  : <div style={{fontSize:10, color:T.faint, padding:'2px 5px 3px'}}>
+                      {seg.running ? (seg.note||'阶段执行中…') : '本阶段尚未产出文件'}
+                    </div>}
+                {/* 阶段收尾三件事 */}
+                <div style={{display:'flex', gap:4, flexWrap:'wrap', marginTop:5, paddingLeft:2}}>
+                  <Tag c={seg.extract!=='—'?T.green:T.faint}
+                       bg={seg.extract!=='—'?'rgba(74,222,128,0.08)':'rgba(255,255,255,0.04)'}>
+                    知识 {seg.extract}
+                  </Tag>
+                  <Tag c={seg.decisions>0?T.amber:T.faint}
+                       bg={seg.decisions>0?'rgba(251,191,36,0.08)':'rgba(255,255,255,0.04)'}>
+                    决策 +{seg.decisions}
+                  </Tag>
+                  {seg.note && !seg.running && (
+                    <Tag c={T.blue} bg='rgba(94,168,255,0.08)'>{seg.note}</Tag>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---- 产物面板 · 视图三：交接（design.md §7：封板交接 + MCP 开放通道 + V2 导出） ---- */
+function HandoffPanel({pKey}) {
+  const h = HANDOFF[pKey];
+  const [sealed, setSealed] = React.useState(false); // 演示：封板动作
+  const canSeal = h.sealable && !sealed;
+  return (
+    <div style={{flex:1, overflowY:'auto', padding:'2px 14px 14px'}}>
+      {/* 封板状态（§6 版本状态机） */}
+      <PT>版本封板 · release-notes 自动生成</PT>
+      <div style={{padding:'7px 9px', borderRadius:7, marginBottom:12,
+        background: sealed ? 'rgba(74,222,128,0.06)' : (canSeal ? 'rgba(139,92,246,0.08)' : 'rgba(255,255,255,0.03)'),
+        border:'0.5px solid '+(sealed ? 'rgba(74,222,128,0.25)' : (canSeal ? 'rgba(139,92,246,0.3)' : T.line))}}>
+        {sealed
+          ? <div style={{fontSize:11, color:T.green, fontWeight:600}}>🔒 已封板 · git tag 冻结 · 01-requirements/ 转为只读</div>
+          : canSeal
+            ? <div style={{display:'flex', alignItems:'center', gap:8}}>
+                <div style={{flex:1, fontSize:11, color:T.ink}}>
+                  ✓ 评审已过门禁（六维 6.4）· 全部产物落盘 · 可封板
+                </div>
+                <Btn small kind="primary" onClick={()=>setSealed(true)}>封板</Btn>
+              </div>
+            : <div style={{fontSize:11, color:T.faint}}>○ 未满足封板条件：流水线未完成 / 评审未过门禁</div>}
+        {sealed && <div style={{fontSize:9.5, color:T.faint, marginTop:3}}>release-notes.md 已生成 · V1 版本目录冻结 · 新需求进 v1.1+ 继承</div>}
+      </div>
+      {/* release notes diff */}
+      {h.release.length>0 && (
+        <div style={{marginBottom:12}}>
+          <PT>release-notes.md（封板时自动生成）</PT>
+          <div style={{padding:'5px 8px', borderRadius:7, background:'rgba(255,255,255,0.03)',
+            border:'0.5px solid '+T.line, fontFamily:F.mono}}>
+            {h.release.map((r,i)=>(
+              <div key={i} style={{display:'flex', gap:6, fontSize:10, padding:'2px 0',
+                color:r.op==='+'?T.green:T.red}}>
+                <span style={{fontWeight:700}}>{r.op}</span>
+                <span style={{color:T.sub}}>{r.text}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:9.5, color:T.faint, marginTop:4}}>每行均可回链决策日志（d_xxx）· 追溯「为什么不做」</div>
+        </div>
+      )}
+      {/* 不可变文件 */}
+      {h.immutable.length>0 && (
+        <div style={{marginBottom:12}}>
+          <PT>封板后不可变（快照冻结）</PT>
+          {h.immutable.map(im=>(
+            <div key={im.f} style={{display:'flex', alignItems:'center', gap:6, padding:'4px 7px', marginBottom:3,
+              borderRadius:6, background:'rgba(255,255,255,0.03)', border:'0.5px solid '+T.line}}>
+              <span style={{fontSize:9.5, color:T.amber}}>🔒</span>
+              <FileIco type={im.f.endsWith('.html')?'html':(im.f.includes('.json')?'json':'md')}/>
+              <div style={{flex:1, minWidth:0}}>
+                <div style={{fontFamily:F.mono, fontSize:10, color:T.ink}}>{im.f}</div>
+                <div style={{fontSize:9, color:T.faint, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis'}}>{im.meta}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* MCP 开放通道 */}
+      <PT>MCP Server · stdio · 本地进程</PT>
+      <div style={{display:'flex', alignItems:'center', gap:6, marginBottom:5, fontSize:10.5}}>
+        <span style={{width:6, height:6, borderRadius:'50%', background:T.green, display:'inline-block'}}/>
+        <span style={{color:T.sub}}>运行中 · 今日被调用 {h.mcp.calls} 次</span>
+        <span style={{marginLeft:'auto'}}><Tag mono>claude desktop / cursor</Tag></span>
+      </div>
+      {h.mcp.tools.map(t=>(
+        <div key={t.n} style={{padding:'4px 8px', marginBottom:3, borderRadius:6,
+          background:'rgba(255,255,255,0.03)', border:'0.5px solid '+T.line}}>
+          <div style={{fontFamily:F.mono, fontSize:10, color:T.blue, fontWeight:600}}>{t.n}</div>
+          <div style={{fontSize:9.5, color:T.faint}}>{t.d}</div>
+        </div>
+      ))}
+      <div style={{fontSize:9.5, color:T.faint, marginTop:4}}>异步任务模式：generate_prd 返回 task_id → get_task 轮询取结果</div>
+      {/* V2 导出通道 */}
+      <PT style={{marginTop:14}}>V2 导出通道（规划中）</PT>
+      <div style={{display:'flex', gap:5}}>
+        {['飞书文档','Notion','墨刀'].map(x=>(
+          <Tag key={x} c={T.faint}>{x}</Tag>
+        ))}
+      </div>
+      <div style={{fontSize:9.5, color:T.faint, marginTop:4}}>文件是唯一事实源 · 导出仅为投影，可随时重建</div>
+    </div>
+  );
+}
+
+/* ---- 上下文面板（检查器 · E11/E12） ---- */
+function CtxPanel({pKey}) {
+  const ctx = PROJECTS[pKey].ctx;
+  const [missOpen, setMissOpen] = React.useState(false);
+  const used = ctx.tokens.reduce((a,t)=>a+t.v,0);
+  return (
+      <div style={{flex:1, overflowY:'auto', padding:'2px 14px 14px'}}>
+        {/* token */}
+        <PT>Token 构成 · {used.toFixed(1)}k / 32k</PT>
+        <div style={{display:'flex', height:12, borderRadius:4, overflow:'hidden', marginBottom:7}}>
+          {ctx.tokens.map(t=><div key={t.k} style={{width:(t.v/ctx.total*100)+'%', background:t.c}}/>)}
+        </div>
+        <div style={{display:'flex', flexWrap:'wrap', gap:'3px 10px', marginBottom:14}}>
+          {ctx.tokens.map(t=>(
+            <span key={t.k} style={{fontSize:10, color:T.sub, display:'flex', alignItems:'center', gap:4}}>
+              <span style={{width:7, height:7, borderRadius:2, background:t.c}}/>{t.k} {t.v}k
+            </span>
+          ))}
+        </div>
+        {/* trace */}
+        <PT>检索 Trace · scope 强制过滤</PT>
+        <div style={{fontSize:10, fontFamily:F.mono, color:T.faint, marginBottom:6}}>query: {ctx.query}</div>
+        {ctx.hits.map(h=>(
+          <div key={h.id} style={{display:'flex', alignItems:'center', gap:6, padding:'4px 7px', borderRadius:6,
+            background:'rgba(255,255,255,0.03)', border:'0.5px solid '+T.line, marginBottom:4}}>
+            <span style={{fontFamily:F.mono, fontSize:9.5, color:T.blue}}>{h.id}</span>
+            <span style={{fontSize:10.5, color:T.ink, flex:1, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis'}}>{h.name}</span>
+            <span style={{fontFamily:F.mono, fontSize:9.5, color:T.green}}>{h.sim}</span>
+            <Tag c={h.scope==='全局'?T.faint:T.blue} bg={h.scope==='全局'?'rgba(255,255,255,0.05)':'rgba(94,168,255,0.12)'}>{h.scope}</Tag>
+          </div>
+        ))}
+        <div style={{fontSize:10, color:T.faint, margin:'4px 0 14px'}}>{ctx.filtered}</div>
+        {/* skill */}
+        <PT>Skill 注入 · 1/30</PT>
+        <div style={{padding:'6px 9px', borderRadius:7, background:'rgba(139,92,246,0.08)',
+          border:'0.5px solid rgba(139,92,246,0.25)', marginBottom:5}}>
+          <div style={{fontSize:11.5, fontWeight:600, color:T.purple}}>✓ {ctx.skill}</div>
+          <div style={{fontSize:10, color:T.sub}}>正文 1.5k tokens · 仅此 1 条注入</div>
+        </div>
+        <div onClick={()=>setMissOpen(!missOpen)} style={{fontSize:10.5, color:T.sub, cursor:'pointer',
+          display:'flex', alignItems:'center', gap:5, marginBottom:14}}>
+          <span style={{fontSize:8, display:'inline-block', transition:'transform .15s',
+            transform:missOpen?'rotate(90deg)':'none'}}>▶</span>
+          展开未命中 29 条（证明正文未注入 · E11）
+        </div>
+        {missOpen && (
+          <div className="fadein" style={{fontSize:10, color:T.faint, fontFamily:F.mono, lineHeight:1.8,
+            padding:'6px 9px', borderRadius:6, background:'rgba(255,255,255,0.03)', marginBottom:14}}>
+            KANO · RICE · 用户故事地图 · 漏项雷达 …<br/>
+            <span style={{color:T.sub}}>仅元数据常驻，正文 0 token</span>
+          </div>
+        )}
+        {/* 记忆 */}
+        <PT>记忆注入 · 覆盖而非并存</PT>
+        {ctx.memories.map((m,i)=>(
+          <div key={i} style={{display:'flex', gap:6, alignItems:'flex-start', padding:'4px 7px', marginBottom:3,
+            borderRadius:6, background:'rgba(255,255,255,0.03)', border:'0.5px solid '+T.line, opacity:m.dead?0.45:1}}>
+            <Tag c={m.kind==='否决项'?T.red:(m.kind==='约束'?T.blue:T.faint)}
+                 bg={m.kind==='否决项'?'rgba(248,113,113,0.1)':(m.kind==='约束'?'rgba(94,168,255,0.1)':'rgba(255,255,255,0.05)')}>{m.kind}</Tag>
+            <div style={{flex:1, fontSize:10.5, color:T.ink, textDecoration:m.dead?'line-through':'none', lineHeight:1.5}}>
+              {m.t}
+              {m.dead && <div style={{fontSize:9.5, color:T.blue, textDecoration:'none', marginTop:1}}>↳ 被 {m.by} 覆盖 · 未注入</div>}
+            </div>
+            <Tag mono>{m.s}</Tag>
+          </div>
+        ))}
+        {/* verify */}
+        <PT style={{marginTop:12}}>落盘校验 · write-then-verify</PT>
+        {ctx.verify.map(v=>(
+          <div key={v} style={{fontSize:10.5, fontFamily:F.mono, color:T.green, padding:'2px 0'}}>✓ {v} · 回读一致</div>
+        ))}
+      </div>
+  );
+}
+function PT({children, style}) {
+  return <div style={{fontSize:10.5, fontWeight:700, color:T.ink, marginBottom:6, ...style}}>{children}</div>;
+}
+
+/* ================= 技能库 ================= */
+
+/* 技能种子数据：src = market（来自市场）/ personal（个人上传） */
+const SKILLS = [
+  {id:1,  ic:'📊', name:'竞品快速扫描',   src:'market', on:true,  uses:23, desc:'自动抓取竞品官网、应用商店与更新日志，输出结构化对比矩阵。'},
+  {id:2,  ic:'🚦', name:'PRD 门禁检查',   src:'market', on:true,  uses:18, desc:'按团队 PRD 模板逐项校验完整性，输出门禁质量分与待补清单。'},
+  {id:3,  ic:'🗣', name:'毒舌评审',       src:'market', on:true,  uses:15, desc:'模拟最挑剔的评审人，对 PRD 逐节追问、质疑并标记薄弱点。'},
+  {id:4,  ic:'🎨', name:'Figma 转原型',   src:'market', on:true,  uses:9,  desc:'读取 Figma 链接，生成可在浏览器中直接点击的 HTML 原型。'},
+  {id:5,  ic:'📝', name:'访谈纪要结构化', src:'market', on:true,  uses:12, desc:'将访谈录音 / 速记提炼为洞察卡与待验证假设，自动去重合并。'},
+  {id:6,  ic:'📈', name:'数据看板解读',   src:'market', on:false, uses:7,  desc:'读取 DAU / 留存 / 漏斗数据，生成 PM 可读的结论与归因摘要。'},
+  {id:7,  ic:'🧭', name:'KANO 问卷分析',  src:'market', on:false, uses:5,  desc:'对问卷结果做 KANO 模型归类，输出需求优先级建议。'},
+  {id:8,  ic:'🧪', name:'A/B 实验设计',   src:'market', on:false, uses:4,  desc:'生成实验假设、分流方案与显著性计算模板。'},
+  {id:9,  ic:'📚', name:'Notion 知识沉淀', src:'market', on:true, uses:11, desc:'将会话结论与决策记录沉淀为结构化 Notion 页面并归档。'},
+  {id:10, ic:'🪶', name:'飞书文档导出',   src:'market', on:true,  uses:6,  desc:'将 PRD / 会议纪要一键导出至飞书云文档，保留结构与链接。'},
+  {id:11, ic:'🏷', name:'公司品牌规范 v2', src:'personal', on:true, uses:21, desc:'团队内部品牌色、字体与文案语气规范。skill.yaml · 4 个资源文件。'},
+  {id:12, ic:'🔢', name:'内部埋点字典',   src:'personal', on:true, uses:8,  desc:'查询内部事件埋点定义，统一各端数据口径。skill.yaml · 1 个数据文件。'},
+];
+
+/* 通用弹窗外壳 */
+function SkillModal({title, onClose, width=430, children}) {
+  return (
+    <div onClick={onClose} style={{position:'absolute', inset:0, background:'rgba(0,0,0,0.55)',
+      display:'flex', alignItems:'center', justifyContent:'center', zIndex:60}}>
+      <div onClick={e=>e.stopPropagation()} className="fadein"
+        style={{width, background:T.card, border:'0.5px solid '+T.lineHi, borderRadius:12,
+          padding:'20px 22px', boxShadow:'0 24px 80px rgba(0,0,0,0.6)'}}>
+        <div style={{display:'flex', alignItems:'center', marginBottom:14}}>
+          <span style={{fontSize:14, fontWeight:700, color:T.ink}}>{title}</span>
+          <span onClick={onClose} style={{marginLeft:'auto', fontSize:13, color:T.faint, cursor:'pointer'}}>✕</span>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* 开关 */
+function SkillToggle({on, onChange}) {
+  return (
+    <div onClick={e=>{e.stopPropagation(); onChange();}}
+      style={{width:30, height:17, borderRadius:9, flexShrink:0, cursor:'pointer',
+        background:on?T.purple:'rgba(255,255,255,0.12)', transition:'background .18s', position:'relative'}}>
+      <div style={{position:'absolute', top:2, left:on?15:2, width:13, height:13, borderRadius:'50%',
+        background:'#fff', transition:'left .18s', boxShadow:'0 1px 3px rgba(0,0,0,0.4)'}}/>
+    </div>
+  );
+}
+
+/* 技能卡片 */
+function SkillCard({s, onToggle, onDelete}) {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      className="fadein" style={{display:'flex', alignItems:'center', gap:12, padding:'11px 14px',
+        background:hover?T.cardHi:T.card, border:'0.5px solid '+T.line, borderRadius:10,
+        marginBottom:8, transition:'background .15s'}}>
+      <div style={{width:34, height:34, borderRadius:8, flexShrink:0, fontSize:16,
+        display:'flex', alignItems:'center', justifyContent:'center',
+        background:s.src==='personal'?'rgba(139,92,246,0.12)':'rgba(255,255,255,0.05)'}}>{s.ic}</div>
+      <div style={{flex:1, minWidth:0}}>
+        <div style={{display:'flex', alignItems:'center', gap:7, marginBottom:2}}>
+          <span style={{fontSize:12.5, fontWeight:600, color:T.ink}}>{s.name}</span>
+          {s.src==='personal'
+            ? <Tag c={T.purple} bg='rgba(139,92,246,0.12)'>个人</Tag>
+            : <Tag>来自市场</Tag>}
+          {!s.on && <Tag c={T.faint}>已停用</Tag>}
+        </div>
+        <div style={{fontSize:11, color:T.sub, lineHeight:1.5}}>{s.desc}</div>
+      </div>
+      <div style={{fontSize:10, color:T.faint, fontFamily:F.mono, whiteSpace:'nowrap',
+        marginRight:4}} title="累计调用次数">调用 {s.uses}</div>
+      <SkillToggle on={s.on} onChange={()=>onToggle(s.id)}/>
+      <span onClick={()=>onDelete(s)} title="删除技能"
+        style={{fontSize:12, color:hover?T.red:T.faint, cursor:'pointer', padding:'2px 3px',
+          transition:'color .15s', marginLeft:2}}>🗑</span>
+    </div>
+  );
+}
+
+function SkillLibrary({skills, setSkills}) {
+  const [filter, setFilter] = React.useState('all');          // all | market | personal
+  const [query, setQuery] = React.useState('');
+  const [delTarget, setDelTarget] = React.useState(null);     // 待删除技能
+  const [uploadOpen, setUploadOpen] = React.useState(false);
+  const [uploadName, setUploadName] = React.useState('');
+  const [uploading, setUploading] = React.useState(false);
+
+  const market = skills.filter(s=>s.src==='market');
+  const personal = skills.filter(s=>s.src==='personal');
+  const enabled = skills.filter(s=>s.on).length;
+  const totalUses = skills.reduce((a,s)=>a+s.uses, 0);
+  const hit = s => !query.trim() || s.name.includes(query.trim()) || s.desc.includes(query.trim());
+
+  const toggle = id => setSkills(list=>list.map(s=>s.id===id?{...s, on:!s.on}:s));
+  const del = () => { setSkills(list=>list.filter(s=>s.id!==delTarget.id)); setDelTarget(null); };
+  const doUpload = () => {
+    setUploading(true);
+    setTimeout(()=>{
+      setSkills(list=>[...list, {id:Date.now(), ic:'⬆️', src:'personal', on:true, uses:0,
+        name:uploadName.trim()||'我的自定义技能',
+        desc:'个人上传 · skill.yaml 已解析 · 1 个触发词 / 2 个资源文件。'}]);
+      setUploading(false); setUploadOpen(false); setUploadName('');
+    }, 900);
+  };
+
+  const groups = filter==='personal' ? [['个人上传', personal]]
+               : filter==='market'   ? [['来自市场', market]]
+               : [['来自市场', market], ['个人上传', personal]];
+
+  return (
+    <div style={{flex:1, minWidth:0, background:T.bg, display:'flex', flexDirection:'column', position:'relative'}}>
+      {/* 头部 */}
+      <div style={{padding:'24px 34px 0', flexShrink:0}}>
+        <div style={{display:'flex', alignItems:'flex-start', marginBottom:16}}>
+          <div>
+            <div style={{fontSize:20, fontWeight:700, color:T.ink, marginBottom:4}}>技能库</div>
+            <div style={{fontSize:11.5, color:T.sub}}>
+              管理已添加的技能 · Agent 按五阶段自动路由，技能通过 skill.yaml 声明触发词
+            </div>
+          </div>
+          <div style={{marginLeft:'auto', display:'flex', gap:9, alignItems:'center'}}>
+            <div style={{display:'flex', alignItems:'center', gap:6, background:T.inputBg,
+              border:'0.5px solid '+T.line, borderRadius:8, padding:'5px 11px', width:190}}>
+              <span style={{fontSize:11, color:T.faint}}>🔍</span>
+              <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索技能"
+                style={{flex:1, background:'transparent', border:'none', outline:'none',
+                  color:T.ink, fontSize:11.5, fontFamily:'inherit'}}/>
+            </div>
+            <div onClick={()=>setUploadOpen(true)}
+              style={{fontSize:11.5, fontWeight:600, color:'#fff', cursor:'pointer',
+                background:'linear-gradient(135deg,'+T.purpleD+','+T.purple+')',
+                borderRadius:8, padding:'6px 14px', boxShadow:'0 2px 12px rgba(139,92,246,0.35)'}}>
+              ＋ 上传技能
+            </div>
+          </div>
+        </div>
+        {/* 筛选 + 概览 */}
+        <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
+          {[['all','全部 '+skills.length], ['market','来自市场 '+market.length], ['personal','个人 '+personal.length]].map(([k,label])=>(
+            <div key={k} onClick={()=>setFilter(k)}
+              style={{fontSize:11.5, padding:'4.5px 13px', borderRadius:20, cursor:'pointer',
+                color:filter===k?T.ink:T.sub, border:'1px solid '+(filter===k?T.lineHi:T.line),
+                background:filter===k?'rgba(255,255,255,0.06)':'transparent', fontWeight:filter===k?600:400}}>
+              {label}
+            </div>
+          ))}
+          <div style={{marginLeft:'auto', fontSize:10.5, color:T.faint, fontFamily:F.mono}}>
+            已启用 {enabled}/{skills.length} · 累计调用 {totalUses} 次 · 市场技能随上游更新 · 个人技能仅本地可见
+          </div>
+        </div>
+      </div>
+      {/* 列表 */}
+      <div style={{flex:1, overflowY:'auto', padding:'10px 34px 26px'}}>
+        {groups.map(([label, list])=>(
+          <div key={label} style={{marginBottom:6}}>
+            <div style={{fontSize:10.5, fontWeight:600, color:T.faint, margin:'8px 0 8px'}}>{label}</div>
+            {list.filter(hit).map(s=>(
+              <SkillCard key={s.id} s={s} onToggle={toggle} onDelete={setDelTarget}/>
+            ))}
+            {label==='个人上传' && list.filter(hit).length===0 && (
+              <div style={{fontSize:11.5, color:T.faint, padding:'18px 0', textAlign:'center',
+                border:'1px dashed '+T.line, borderRadius:10}}>
+                {personal.length===0 ? '还没有个人技能 · 点击右上「＋ 上传技能」添加' : '没有匹配「'+query.trim()+'」的个人技能'}
+              </div>
+            )}
+          </div>
+        ))}
+        {groups.every(([,l])=>l.filter(hit).length===0) && groups.length===1 && filter!=='personal' && (
+          <div style={{fontSize:11.5, color:T.faint, padding:'24px 0', textAlign:'center',
+            border:'1px dashed '+T.line, borderRadius:10}}>没有匹配「{query.trim()}」的技能</div>
+        )}
+      </div>
+      {/* 删除确认 */}
+      {delTarget && (
+        <SkillModal title="删除技能" onClose={()=>setDelTarget(null)}>
+          <div style={{fontSize:12.5, color:T.ink, marginBottom:6}}>确定删除「{delTarget.name}」？</div>
+          <div style={{fontSize:11.5, color:T.sub, lineHeight:1.6, marginBottom:18}}>
+            删除后 Agent 将不再路由该技能；{delTarget.src==='market'?'市场技能可随时重新添加，':'个人技能删除后不可恢复，'}历史产物不受影响。
+          </div>
+          <div style={{display:'flex', justifyContent:'flex-end', gap:9}}>
+            <Btn onClick={()=>setDelTarget(null)}>取消</Btn>
+            <Btn kind="danger" onClick={del}>确认删除</Btn>
+          </div>
+        </SkillModal>
+      )}
+      {/* 上传弹窗 */}
+      {uploadOpen && (
+        <SkillModal title="上传技能" onClose={()=>!uploading&&setUploadOpen(false)}>
+          <div onClick={()=>!uploading&&setUploadName(n=>n||'')}
+            style={{border:'1.5px dashed '+T.lineHi, borderRadius:10, padding:'22px 0', textAlign:'center',
+              marginBottom:14, cursor:uploading?'default':'pointer', background:'rgba(255,255,255,0.02)'}}>
+            <div style={{fontSize:22, marginBottom:6}}>{uploading?'⏳':'📦'}</div>
+            <div style={{fontSize:12, color:T.ink, marginBottom:3}}>
+              {uploading ? '正在解析 skill.yaml …' : '拖入 .zip 或包含 skill.yaml 的文件夹'}
+            </div>
+            <div style={{fontSize:10.5, color:T.faint}}>
+              {uploading ? '识别触发词与资源文件' : '或点击选择文件 · 上传后仅本项目可用'}
+            </div>
+          </div>
+          <div style={{marginBottom:16}}>
+            <div style={{fontSize:10.5, color:T.sub, marginBottom:6}}>技能名称</div>
+            <input value={uploadName} disabled={uploading} onChange={e=>setUploadName(e.target.value)}
+              placeholder="例如：竞品价格监控"
+              style={{width:'100%', background:T.inputBg, border:'0.5px solid '+T.line, borderRadius:8,
+                padding:'7px 11px', color:T.ink, fontSize:12, outline:'none', fontFamily:'inherit'}}/>
+          </div>
+          <div style={{display:'flex', justifyContent:'flex-end', gap:9}}>
+            <Btn onClick={()=>setUploadOpen(false)} disabled={uploading}>取消</Btn>
+            <Btn kind="primary" onClick={doUpload} disabled={uploading}>{uploading?'解析中…':'解析并添加'}</Btn>
+          </div>
+        </SkillModal>
+      )}
+    </div>
+  );
+}
+
+/* ================= 知识库（知识与技能层 · 卡片库） =================
+   schema 四字段：概念名 / 出处 / 我的话复述 / 关联卡片（design.md §5.4）
+   · 卡片 =「是什么」，被检索（top-k 注入）；技能 =「怎么做」，被调用 —— 同层双库、语义分离
+   · 相似度 >0.92 合并而非新建；同主题冲突时旧卡标失效；每张卡可跳回出处（E10） ---- */
+const SCOPE_META = {
+  global:  {label:'全局',        ic:'🌐', c:T.purple, bg:'rgba(139,92,246,0.12)'},
+  fitness: {label:'我的健身App', ic:'🏃', c:T.blue,   bg:'rgba(94,168,255,0.12)'},
+  widget:  {label:'WidgetToDo',  ic:'🧩', c:T.amber,  bg:'rgba(251,191,36,0.12)'},
+};
+
+const CARDS = [
+  {id:'kp_001', name:'目标用户偏好：坚持反馈 > 数据精度', scope:'fitness',
+   desc:'健身小白更在意「今天练没练成」的即时正反馈；心率/配速的精度提升对留存几乎无感——反馈设计优先级高于数据颗粒度。',
+   src:'需求澄清 · 记下来', srcRef:'我的健身App v1.1 · 澄清会话第 2 轮', linked:['kp_003'], hits:6, time:'09-03'},
+  {id:'kp_002', name:'社区功能对留存提升有限', scope:'fitness',
+   desc:'竞品验证：3 个对标产品的社区模块 DAU 占比 <8%，且与 7 日留存无显著相关——这是否决「训练社区」方向的依据。',
+   src:'竞品调研 · 自动抽取', srcRef:'我的健身App v1.1 · 调研报告 §4', linked:[], hits:3, time:'09-04'},
+  {id:'kp_003', name:'打卡类产品动机模型', scope:'global',
+   desc:'外部动机（连胜/徽章）拉新留，内部动机（目标感）保长留；打卡产品要在第 7 天前完成外部→内部动机的交接。',
+   src:'竞品调研 · 自动抽取', srcRef:'我的健身App v1.1 · 调研报告 §2', linked:['kp_001','kp_012'], hits:9, time:'09-02'},
+  {id:'kp_004', name:'目标用户锁定健身小白，不做专业增肌', scope:'fitness',
+   desc:'长期约束：训练计划的专业度让位于「看得懂、跟得上」；专业增肌人群的工具诉求与小白冲突，明确不做。',
+   src:'项目主页 · 长期约束', srcRef:'我的健身App · project.json · 约束 #1', linked:['kp_001'], hits:8, time:'08-27'},
+  {id:'kp_006', name:'KANO：基本型不满足 = 一票否决', scope:'global',
+   desc:'KANO 归类中基本型需求缺失时，兴奋型做得再好也救不回满意度——排优先级先保基本型，再谈魅力属性。',
+   src:'技能「学」模式 · 复述', srcRef:'技能库 · KANO 问卷分析 · 学模式产出', linked:['kp_007'], hits:11, time:'08-28'},
+  {id:'kp_007', name:'RICE 的 Reach 取周活跃而非注册量', scope:'global',
+   desc:'注册量会高估触达：用周活跃做分母，Impact 用 0.5~2 的锚定分，避免拍脑袋放大单个需求的价值。',
+   src:'技能「学」模式 · 复述', srcRef:'技能库 · RICE 模板 · 学模式产出', linked:['kp_006'], hits:8, time:'08-28'},
+  {id:'kp_008', name:'用户故事地图适合 MVP 裁剪', scope:'global',
+   desc:'把故事按「用户旅程 × 释放轮次」铺开，第一列只留最小可用路径——比直接砍功能清单更能守住闭环。',
+   src:'毒舌评审 · 记下来', srcRef:'我的健身App v1.0 · 评审会话', linked:[], hits:5, time:'08-30'},
+  {id:'kp_009', name:'毒舌评审三问：断点 / 反例 / 代价', scope:'global',
+   desc:'每个需求答不上「断点（用户为何停）· 反例（哪类用户不成立）· 代价（做错最坏结果）」之一，就是薄弱点。',
+   src:'PRD 撰写 · 记下来', srcRef:'我的健身App v1.1 · PRD 会话', linked:[], hits:7, time:'09-01'},
+  {id:'kp_010', name:'验收标准必须可测', scope:'global',
+   desc:'「加载快」不可测，「冷启动 <1.5s（P90）」可测；PRD 门禁对模糊验收一律打回，这是门禁分最低的常见项。',
+   src:'PRD 门禁检查 · 抽取', srcRef:'我的健身App v1.1 · 门禁报告', linked:[], hits:6, time:'09-02'},
+  {id:'kp_011', name:'小组件交互受系统尺寸约束', scope:'widget',
+   desc:'iOS Widget 交互被限制为点击直达，不支持滚动/嵌套——功能裁剪必须先过系统能力这道墙。',
+   src:'需求澄清 · 记下来', srcRef:'WidgetToDo v0.3 · 澄清会话第 4 轮', linked:['kp_013'], hits:5, time:'09-06'},
+  {id:'kp_012', name:'中断恢复 = 温和提醒 + 每周 1 次补签', scope:'fitness',
+   desc:'断卡不清零：连续 3 天未打卡触发温和提醒，每周给 1 次补签机会——替代 v1.0 的清零策略（决策 d_004）。',
+   src:'决策 d_004 → 记下来', srcRef:'我的健身App v1.1 · 决策日志 d_004', linked:['kp_003'], hits:4, time:'09-05'},
+  {id:'kp_013', name:'快速捕获 = 零成本添加任务', scope:'widget',
+   desc:'核心体验是「想到→记下 <2 秒」：不选清单、不填属性，标题即全部；结构化留给事后整理。',
+   src:'需求澄清 · 记下来', srcRef:'WidgetToDo v0.3 · 澄清会话第 1 轮', linked:['kp_011'], hits:6, time:'09-06'},
+  {id:'kp_014', name:'竞品更新日志 = 免费的需求验证信号', scope:'global',
+   desc:'竞品连续两个版本做同一功能 ≈ 该需求被市场验证过；下线功能同样有价值——说明试错失败的方向。',
+   src:'竞品调研 · 记下来', srcRef:'我的健身App v1.1 · 调研会话', linked:[], hits:4, time:'09-03'},
+  {id:'kp_015', name:'访谈洞察需标注证据强度', scope:'global',
+   desc:'每条洞察标注「单点观察 / 多点一致 / 有反例」，未标证据强度的结论禁止直接进 PRD。',
+   src:'访谈纪要结构化 · 抽取', srcRef:'我的健身App v1.0 · 访谈纪要', linked:[], hits:3, time:'08-31'},
+  {id:'kp_016', name:'埋点口径要先统一各端定义', scope:'global',
+   desc:'同一事件在 iOS/Android 触发时机不同会导致漏斗失真；接数据前先用内部埋点字典对齐定义，再谈分析。',
+   src:'数据看板解读 · 记下来', srcRef:'我的健身App v1.0 · 数据会话', linked:[], hits:2, time:'09-07'},
+  {id:'kp_017', name:'A/B 最小可检测效应先算再开', scope:'global',
+   desc:'按基线转化率与流量算 MDE，检测不出显著性的实验是浪费流量；样本不够就换代理指标或延长周期。',
+   src:'A/B 实验设计 · 记下来', srcRef:'我的健身App v1.0 · 实验设计会话', linked:[], hits:2, time:'09-08'},
+  {id:'kp_018', name:'每条 AI 输出必须有来源入口', scope:'global',
+   desc:'卡片跳回出处、数字点开代码、检索结果点开原文——信任不是靠模型自信，是靠可回溯。',
+   src:'全局规则 · 复述', srcRef:'design.md §7 · 原则 8', linked:['kp_019'], hits:12, time:'08-26'},
+  {id:'kp_019', name:'上下文构成必须可视', scope:'global',
+   desc:'注入了什么规则/记忆/技能/检索，用户要能一眼看到；黑盒注入是信任的天花板。',
+   src:'全局规则 · 复述', srcRef:'design.md §7 · 原则 8', linked:['kp_018'], hits:10, time:'08-26'},
+];
+
+/* ---- 卡片行 ---- */
+function KnowledgeCard({c, onOpen}) {
+  const [hover, setHover] = React.useState(false);
+  const m = SCOPE_META[c.scope];
+  return (
+    <div onMouseEnter={()=>setHover(true)} onMouseLeave={()=>setHover(false)}
+      onClick={()=>onOpen(c)} className="fadein"
+      style={{display:'flex', alignItems:'center', gap:12, padding:'11px 14px',
+        background:hover?T.cardHi:T.card, border:'0.5px solid '+T.line, borderRadius:10,
+        marginBottom:8, cursor:'pointer', transition:'background .15s', opacity:c.dead?0.5:1}}>
+      <div style={{width:34, height:34, borderRadius:8, flexShrink:0, fontSize:16,
+        display:'flex', alignItems:'center', justifyContent:'center', background:m.bg}}>{m.ic}</div>
+      <div style={{flex:1, minWidth:0}}>
+        <div style={{display:'flex', alignItems:'center', gap:7, marginBottom:2}}>
+          <span style={{fontSize:12.5, fontWeight:600, color:c.dead?T.faint:T.ink,
+            textDecoration:c.dead?'line-through':'none'}}>{c.name}</span>
+          <Tag c={m.c} bg={m.bg}>{m.label}</Tag>
+          {c.dead && <Tag c={T.faint}>已失效</Tag>}
+        </div>
+        <div style={{fontSize:11, color:T.sub, lineHeight:1.5, overflow:'hidden',
+          whiteSpace:'nowrap', textOverflow:'ellipsis'}}>{c.desc}</div>
+        <div style={{fontSize:9.5, color:T.faint, fontFamily:F.mono, marginTop:3}}>
+          出处 {c.src} · 关联 {c.linked.length} 张 · 命中 {c.hits} 次
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KnowledgeLibrary({cards, setCards}) {
+  const [filter, setFilter] = React.useState('all');          // all | global | fitness | widget
+  const [query, setQuery] = React.useState('');
+  const [detailId, setDetailId] = React.useState(null);        // 查看卡片
+  const [addOpen, setAddOpen] = React.useState(false);         // 「记下来」新建
+  const [draft, setDraft] = React.useState({name:'', desc:'', scope:'global'});
+  const [mergeOld, setMergeOld] = React.useState(null);        // 相似卡片合并目标
+  const [toast, setToast] = React.useState('');
+  const timer = React.useRef(null);
+  const say = t => { setToast(t); clearTimeout(timer.current);
+    timer.current = setTimeout(()=>setToast(''), 2600); };
+
+  const detail = cards.find(c=>c.id===detailId);
+  const byScope = k => cards.filter(c=>c.scope===k);
+  const totalHits = cards.reduce((a,c)=>a+c.hits, 0);
+  const weekNew = cards.filter(c=>c.time>='09-06').length;
+  const hit = c => !query.trim() || c.name.includes(query.trim()) || c.desc.includes(query.trim());
+  const groups = filter==='all'
+    ? [['全局', byScope('global')], ['我的健身App', byScope('fitness')], ['WidgetToDo', byScope('widget')]]
+    : [[SCOPE_META[filter].label, cards.filter(c=>c.scope===filter)]];
+
+  /* 相似度：2-gram 重合度（演示用，真实实现为 embedding 余弦） */
+  const bigrams = s => { const t=String(s).replace(/[\s，。、·：:；;（）()「」《》/<>\-—]/g,'');
+    const r=new Set(); for(let i=0;i<t.length-1;i++) r.add(t.slice(i,i+2)); return [...r]; };
+  const simOf = (a,b) => { const A=bigrams(a.name+a.desc), B=bigrams(b.name+b.desc);
+    const m=A.filter(g=>B.includes(g)).length;
+    return Math.min(0.97, +(0.78+0.06*m).toFixed(2)); };
+
+  const resetDraft = () => { setDraft({name:'', desc:'', scope:'global'}); setAddOpen(false); };
+  const doAdd = () => {
+    setCards(list=>[{id:'kp_'+(Date.now()%10000), name:draft.name.trim(), desc:draft.desc.trim(),
+      scope:draft.scope, src:'手动 · 记下来', srcRef:'知识库 · 手动新建', linked:[], hits:0, time:'09-10'}, ...list]);
+    resetDraft();
+    say('已写入 cards/ 并同步索引 · 下次对话可被检索（E10）');
+  };
+  const doMerge = () => {
+    const card = mergeOld.card;
+    setCards(list=>list.map(c=>c.id===card.id
+      ? {...c, desc:draft.desc.trim(), src:card.src+' · 手动记下来'} : c));
+    setMergeOld(null); resetDraft();
+    say('已合并到「'+card.name+'」· 未另建新卡（>0.92 合并 · E10）');
+  };
+  const submitAdd = () => {
+    if (!draft.name.trim() || !draft.desc.trim()) return;
+    let best=null, sim=0;
+    cards.forEach(c=>{ if (c.dead) return; const s=simOf(draft, c); if (s>sim) { sim=s; best=c; } });
+    if (best && sim>0.92) setMergeOld({card:best, sim});
+    else doAdd();
+  };
+  const toggleDead = c => setCards(list=>list.map(x=>x.id===c.id?{...x, dead:!x.dead}:x));
+
+  return (
+    <div style={{flex:1, minWidth:0, background:T.bg, display:'flex', flexDirection:'column', position:'relative'}}>
+      {/* 头部 */}
+      <div style={{padding:'24px 34px 0', flexShrink:0}}>
+        <div style={{display:'flex', alignItems:'flex-start', marginBottom:16}}>
+          <div>
+            <div style={{fontSize:20, fontWeight:700, color:T.ink, marginBottom:4}}>知识库</div>
+            <div style={{fontSize:11.5, color:T.sub}}>
+              schema 约束的知识卡片（是什么 · 被检索）· 与技能库（怎么做 · 被调用）同层分库
+            </div>
+          </div>
+          <div style={{marginLeft:'auto', display:'flex', gap:9, alignItems:'center'}}>
+            <div style={{display:'flex', alignItems:'center', gap:6, background:T.inputBg,
+              border:'0.5px solid '+T.line, borderRadius:8, padding:'5px 11px', width:190}}>
+              <span style={{fontSize:11, color:T.faint}}>🔍</span>
+              <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="搜索概念名"
+                style={{flex:1, background:'transparent', border:'none', outline:'none',
+                  color:T.ink, fontSize:11.5, fontFamily:'inherit'}}/>
+            </div>
+            <div onClick={()=>setAddOpen(true)}
+              style={{fontSize:11.5, fontWeight:600, color:'#fff', cursor:'pointer',
+                background:'linear-gradient(135deg,'+T.purpleD+','+T.purple+')',
+                borderRadius:8, padding:'6px 14px', boxShadow:'0 2px 12px rgba(139,92,246,0.35)'}}>
+              ＋ 记下来
+            </div>
+          </div>
+        </div>
+        {/* 筛选 + 概览 */}
+        <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
+          {[['all','全部 '+cards.length],
+            ['global','全局 '+byScope('global').length],
+            ['fitness','我的健身App '+byScope('fitness').length],
+            ['widget','WidgetToDo '+byScope('widget').length]].map(([k,label])=>(
+            <div key={k} onClick={()=>setFilter(k)}
+              style={{fontSize:11.5, padding:'4.5px 13px', borderRadius:20, cursor:'pointer',
+                color:filter===k?T.ink:T.sub, border:'1px solid '+(filter===k?T.lineHi:T.line),
+                background:filter===k?'rgba(255,255,255,0.06)':'transparent', fontWeight:filter===k?600:400}}>
+              {label}
+            </div>
+          ))}
+          <div style={{marginLeft:'auto', fontSize:10.5, color:T.faint, fontFamily:F.mono}}>
+            检索命中累计 {totalHits} 次 · 本周新增 {weekNew} · 同概念 &gt;0.92 自动合并 · 冲突旧卡标失效
+          </div>
+        </div>
+      </div>
+      {/* 列表 */}
+      <div style={{flex:1, overflowY:'auto', padding:'10px 34px 26px'}}>
+        {groups.map(([label, list])=>(
+          <div key={label} style={{marginBottom:6}}>
+            <div style={{fontSize:10.5, fontWeight:600, color:T.faint, margin:'8px 0 8px'}}>{label}</div>
+            {list.filter(hit).map(c=>(
+              <KnowledgeCard key={c.id} c={c} onOpen={x=>setDetailId(x.id)}/>
+            ))}
+          </div>
+        ))}
+        {groups.every(([,l])=>l.filter(hit).length===0) && (
+          <div style={{fontSize:11.5, color:T.faint, padding:'24px 0', textAlign:'center',
+            border:'1px dashed '+T.line, borderRadius:10}}>没有匹配「{query.trim()}」的知识卡片</div>
+        )}
+      </div>
+      {/* 卡片详情：四字段 schema · 来源跳转 · 关联卡片 */}
+      {detail && (
+        <SkillModal title={'知识卡片 · '+detail.id} onClose={()=>setDetailId(null)} width={480}>
+          <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:12}}>
+            <span style={{fontSize:14.5, fontWeight:700, color:detail.dead?T.faint:T.ink,
+              textDecoration:detail.dead?'line-through':'none'}}>{detail.name}</span>
+            <Tag c={SCOPE_META[detail.scope].c} bg={SCOPE_META[detail.scope].bg}>{SCOPE_META[detail.scope].label}</Tag>
+            {detail.dead && <Tag c={T.faint}>已失效</Tag>}
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.faint, marginBottom:4}}>出处</div>
+            <div style={{display:'flex', alignItems:'center', gap:9}}>
+              <span style={{fontSize:11.5, color:T.sub, flex:1}}>{detail.srcRef}</span>
+              <Btn small kind="ghost" onClick={()=>say('已定位到会话原文（演示）')}>↗ 跳转出处</Btn>
+            </div>
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.faint, marginBottom:4}}>我的话复述</div>
+            <div style={{fontSize:12, color:T.ink, lineHeight:1.7}}>{detail.desc}</div>
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.faint, marginBottom:5}}>关联卡片</div>
+            <div style={{display:'flex', gap:6, flexWrap:'wrap'}}>
+              {detail.linked.length
+                ? cards.filter(x=>detail.linked.includes(x.id)).map(x=>(
+                  <span key={x.id} onClick={()=>setDetailId(x.id)}
+                    style={{fontSize:10.5, color:T.blue, background:'rgba(94,168,255,0.1)', borderRadius:5,
+                      padding:'3px 8px', cursor:'pointer'}}>🔗 {x.name}</span>
+                ))
+                : <span style={{fontSize:11, color:T.faint}}>—</span>}
+            </div>
+          </div>
+          <div style={{fontSize:9.5, color:T.faint, fontFamily:F.mono, marginBottom:16}}>
+            {detail.id} · 被检索命中 {detail.hits} 次 · 创建于 {detail.time} · cards/{detail.id}.md
+          </div>
+          <div style={{display:'flex', justifyContent:'flex-end', gap:9}}>
+            <Btn kind={detail.dead?'primary':'danger'} onClick={()=>{toggleDead(detail);
+              say(detail.dead?'已恢复有效 · 恢复参与检索':'已标失效 · 不再参与检索注入');}}>
+              {detail.dead?'恢复有效':'标为失效（同主题冲突）'}
+            </Btn>
+            <Btn onClick={()=>setDetailId(null)}>关闭</Btn>
+          </div>
+        </SkillModal>
+      )}
+      {/* 「记下来」新建弹窗 */}
+      {addOpen && (
+        <SkillModal title="记下来 · 新知识卡片" onClose={()=>setAddOpen(false)}>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.sub, marginBottom:6}}>概念名（一卡一概念）</div>
+            <input value={draft.name} onChange={e=>setDraft(d=>({...d, name:e.target.value}))} placeholder="例如：打卡动机"
+              style={{width:'100%', background:T.inputBg, border:'0.5px solid '+T.line, borderRadius:8,
+                padding:'7px 11px', color:T.ink, fontSize:12, outline:'none', fontFamily:'inherit'}}/>
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.sub, marginBottom:6}}>我的话复述（schema 第 3 字段）</div>
+            <textarea value={draft.desc} onChange={e=>setDraft(d=>({...d, desc:e.target.value}))} rows={3}
+              placeholder="用自己的话复述这个概念，写入后可被检索注入"
+              style={{width:'100%', background:T.inputBg, border:'0.5px solid '+T.line, borderRadius:8,
+                padding:'7px 11px', color:T.ink, fontSize:12, outline:'none', fontFamily:'inherit', resize:'vertical'}}/>
+          </div>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:10.5, color:T.sub, marginBottom:6}}>作用域</div>
+            <div style={{display:'flex', gap:7}}>
+              {Object.entries(SCOPE_META).map(([k,m])=>(
+                <span key={k} onClick={()=>setDraft(d=>({...d, scope:k}))}
+                  style={{fontSize:10.5, padding:'3px 11px', borderRadius:20, cursor:'pointer',
+                    color:draft.scope===k?T.ink:T.sub, border:'1px solid '+(draft.scope===k?T.lineHi:T.line),
+                    background:draft.scope===k?'rgba(255,255,255,0.06)':'transparent'}}>{m.label}</span>
+              ))}
+            </div>
+          </div>
+          <div style={{fontSize:10, color:T.faint, lineHeight:1.5, marginBottom:16}}>
+            提示：试试输入「打卡动机」——相似度 &gt;0.92 时将触发合并弹窗而非另建新卡（E10）
+          </div>
+          <div style={{display:'flex', justifyContent:'flex-end', gap:9}}>
+            <Btn onClick={()=>setAddOpen(false)}>取消</Btn>
+            <Btn kind="primary" onClick={submitAdd}
+              disabled={!draft.name.trim() || !draft.desc.trim()}>生成卡片</Btn>
+          </div>
+        </SkillModal>
+      )}
+      {/* 相似卡片合并弹窗（>0.92 触发 · E10） */}
+      {mergeOld && (
+        <SkillModal title="相似卡片合并" onClose={()=>setMergeOld(null)} width={470}>
+          <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:12}}>
+            <Tag c={T.amber} bg="rgba(251,191,36,0.12)">相似度 {mergeOld.sim.toFixed(2)}</Tag>
+            <span style={{fontSize:10.5, color:T.faint, fontFamily:F.mono}}>&gt; 0.92 阈值</span>
+          </div>
+          <div style={{fontSize:11.5, color:T.sub, lineHeight:1.6, marginBottom:12}}>
+            新概念与已有卡片高度相似，按知识层规则将<b style={{color:T.ink}}>合并而非另建</b>——没有去重的知识库三个月后就是垃圾场。
+          </div>
+          {[['原卡', mergeOld.card, T.blue], ['新卡', {name:draft.name.trim(), desc:draft.desc.trim(),
+            src:'手动 · 记下来', scope:draft.scope}, T.green]].map(([label, c, color])=>(
+            <div key={label} style={{border:'0.5px solid '+T.line, borderRadius:9, padding:'10px 12px',
+              marginBottom:8, background:'rgba(255,255,255,0.02)'}}>
+              <div style={{display:'flex', alignItems:'center', gap:7, marginBottom:3}}>
+                <Tag c={color} bg={color+'1F'}>{label}</Tag>
+                <span style={{fontSize:12, fontWeight:600, color:T.ink}}>{c.name}</span>
+                <Tag c={SCOPE_META[c.scope].c} bg={SCOPE_META[c.scope].bg}>{SCOPE_META[c.scope].label}</Tag>
+              </div>
+              <div style={{fontSize:10.5, color:T.sub, lineHeight:1.5}}>{c.desc}</div>
+              <div style={{fontSize:9.5, color:T.faint, fontFamily:F.mono, marginTop:4}}>出处 {c.src}</div>
+            </div>
+          ))}
+          <div style={{fontSize:10.5, color:T.faint, marginBottom:14}}>
+            合并规则：保留原卡概念名 · 复述取新卡 · 出处并存 · 关联卡片自动串接
+          </div>
+          <div style={{display:'flex', justifyContent:'flex-end', gap:9}}>
+            <Btn onClick={()=>setMergeOld(null)}>取消</Btn>
+            <Btn onClick={()=>{doAdd(); setMergeOld(null);}}>仍要另建</Btn>
+            <Btn kind="primary" onClick={doMerge}>合并到原卡</Btn>
+          </div>
+        </SkillModal>
+      )}
+      {/* 操作反馈 */}
+      {toast && (
+        <div className="fadein" style={{position:'absolute', bottom:22, left:'50%', transform:'translateX(-50%)',
+          background:'#222228', border:'0.5px solid '+T.lineHi, borderRadius:8, padding:'8px 16px',
+          fontSize:11.5, color:T.ink, boxShadow:'0 8px 30px rgba(0,0,0,0.5)', whiteSpace:'nowrap', zIndex:80}}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================= 应用外壳 ================= */
+function App() {
+  const [view, setView] = React.useState('home');            // home | chat | skills | knowledge
+  const [skills, setSkills] = React.useState(SKILLS);         // 技能库（可增删/启停）
+  const [cards, setCards] = React.useState(CARDS);             // 知识库（可增删/标失效/合并）
+  const [curTask, setCurTask] = React.useState({key:'fitness', version:'v1.1', sid:'fit-run'});
+  const [rightOpen, setRightOpen] = React.useState(true);
+  const [rightTab, setRightTab] = React.useState('files');   // files | ctx
+  const [artView, setArtView] = React.useState('tree');       // tree | stage | handoff（产物 Tab 二级视图）
+  const [selectedFile, setSelectedFile] = React.useState('prd-v2.md');
+  const [input, setInput] = React.useState('');
+  // 只读 = 查看非当前版本的历史封版；「默认无版本号」（unversioned/）可正常对话
+  const curProj = PROJECTS[curTask.key] || PROJECTS.fitness;
+  const readOnly = view==='chat' && curTask.version!=='默认无版本号' && curTask.version!==curProj.versions[0];
+
+  const start = () => {
+    setView('chat'); setCurTask({key:'fitness', version:'v1.1', sid:'fit-run'});
+    setRightOpen(true); setRightTab('files'); setArtView('tree'); setSelectedFile('prd-v2.md');
+  };
+
+  // 切项目时重置产物面板选中
+  React.useEffect(()=>{
+    setSelectedFile(curTask.key==='widget' ? 'clarification.md' : 'prd-v2.md');
+  }, [curTask.key]);
+
+  React.useEffect(()=>{
+    const fit = ()=>{
+      const s = Math.min(window.innerWidth/1480, window.innerHeight/920, 1);
+      document.getElementById('stage').style.transform = 'scale('+s+')';
+    };
+    fit(); window.addEventListener('resize', fit);
+    return ()=>window.removeEventListener('resize', fit);
+  },[]);
+
+  return (
+    <div id="stage" style={{width:1480, height:920}}>
+      <div style={{width:'100%', height:'100%', background:T.bg, borderRadius:11, overflow:'hidden',
+        boxShadow:'0 60px 140px rgba(0,0,0,0.8), 0 0 0 0.5px rgba(255,255,255,0.1)',
+        display:'flex', flexDirection:'column'}}>
+        {/* 标题栏 */}
+        <div style={{height:38, flexShrink:0, background:'#141416', borderBottom:'0.5px solid '+T.line,
+          display:'flex', alignItems:'center', padding:'0 13px', position:'relative'}}>
+          <div style={{display:'flex', gap:8}}>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#ff5f57'}}/>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#febc2e'}}/>
+            <span style={{width:12,height:12,borderRadius:'50%',background:'#28c840'}}/>
+          </div>
+          <div style={{position:'absolute', left:0, right:0, textAlign:'center', fontSize:12.5,
+            fontWeight:600, color:T.sub, pointerEvents:'none'}}>
+            PM Copilot — {view==='chat' ? (PROJECTS[curTask.key]||PROJECTS.fitness).name
+              : view==='skills' ? '技能库'
+              : view==='knowledge' ? '知识库' : '新任务'}
+          </div>
+          <div style={{marginLeft:'auto', display:'flex', gap:10, alignItems:'center', fontSize:11, color:T.faint}}>
+            <span>🔍</span><span>⛶</span>
+          </div>
+        </div>
+        {/* 只读黄条 */}
+        {readOnly && view==='chat' && (
+          <div className="fadein" style={{background:'rgba(251,191,36,0.09)', borderBottom:'0.5px solid rgba(251,191,36,0.25)',
+            padding:'5px 16px', fontSize:11.5, color:T.amber, display:'flex', alignItems:'center', gap:8}}>
+            🔒 正在查看已封版 {curTask.version} · 全界面只读 · 与封版快照逐字一致（E13）
+          </div>
+        )}
+        {/* 主体 */}
+        <div style={{flex:1, minHeight:0, display:'flex'}}>
+          <Sidebar view={view} curTask={curTask} setCurTask={setCurTask} setView={setView}
+            skillCount={skills.length} cardCount={cards.length}/>
+          {view==='home'
+            ? <Home onStart={start} input={input} setInput={setInput}/>
+            : view==='skills'
+            ? <SkillLibrary skills={skills} setSkills={setSkills}/>
+            : view==='knowledge'
+            ? <KnowledgeLibrary cards={cards} setCards={setCards}/>
+            : <ChatPanel curTask={curTask} setVersion={v=>setCurTask({...curTask, version:v})}
+                readOnly={readOnly} goHome={()=>setView('home')}
+                rightOpen={rightOpen} rightTab={rightTab}
+                openPanel={(tab, active)=>{
+                  if (active) { setRightOpen(false); }           // 再点同 Tab = 收起
+                  else { setRightTab(tab); setRightOpen(true); } // 切 Tab / 打开
+                }}
+                onOpenFile={(f)=>{ setSelectedFile(f); setRightTab('files'); setArtView('tree'); setRightOpen(true); }}/>}
+          {view==='chat' && rightOpen &&
+            <RightPanel pKey={FILES[curTask.key]?curTask.key:'fitness'} tab={rightTab} setTab={setRightTab}
+              onClose={()=>setRightOpen(false)} selectedFile={selectedFile} onSelectFile={setSelectedFile}
+              artView={artView} setArtView={setArtView}/>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

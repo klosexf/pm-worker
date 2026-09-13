@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# IDE / AI 工具本地配置
+.trae/
+.vscode/
+.idea/
+
+# LLVM 覆盖率输出
+default.profraw
+
+# Xcode 用户数据
+xcuserdata/
+*.xcuserstate
+
+# Swift Package / Xcode 构建产物
+.build/
+DerivedData/
+
+# 日志
+*.log

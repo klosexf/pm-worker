@@ -1,0 +1,378 @@
+//
+//  ContextBuilderTests.swift
+//  pm_workerTests
+//
+//  M4 Task 4.1 + 4.8：Context Builder 唯一注入收口 + pitfalls 确定性路由进自检清单。
+//  - 规则层常驻注入（预算极小也不裁）
+//  - 记忆段注入 + 假设态校准文本排段尾（预算压力下最先被裁的位置语义）
+//  - token 预算裁剪优先级（history → retrieval → skillBodies → memory；rules 永不裁）
+//  - 技能正文渐进式披露（命中才注入正文，未命中不注入）
+//  - pitfalls 确定性路由进 system prompt 尾部自检清单
+//  - 空段省略 + ContextAssembly Codable 往返
+//  - SessionStore.trimmedHistory 成对丢最旧整轮
+//  不依赖网络：DeterministicHashEmbedder + 临时 AppDatabase，直接 INSERT 测试行。
+//
+
+import XCTest
+import GRDB
+@testable import pm_worker
+
+final class ContextBuilderTests: XCTestCase {
+    var tempRoot: URL!
+    var database: AppDatabase!
+    let embedder = DeterministicHashEmbedder()
+
+    override func setUp() {
+        super.setUp()
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pmagent-context-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        do {
+            database = try AppDatabase(indexURL: tempRoot.appendingPathComponent("index.sqlite"))
+        } catch {
+            XCTFail("AppDatabase 初始化失败: \(error)")
+        }
+    }
+
+    override func tearDown() {
+        // 先释放 AppDatabase（同步关闭 GRDB 连接）再删临时目录，
+        // 避免 macOS sqlite 的「vnode unlinked while in use」API 告警。
+        database = nil
+        if let root = tempRoot { try? FileManager.default.removeItem(at: root) }
+        super.tearDown()
+    }
+
+    // MARK: - 测试行插入（与 RetrievalTests 同口径）
+
+    private func insertCard(id: String, projectId: String, content: String) throws {
+        let vector = DeterministicHashEmbedder.vector(for: content)
+        try database.dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO knowledge_points
+                        (id, project_id, content, source_type, source_ref, embedding,
+                         annotation_count, confidence, superseded_by, created_at)
+                    VALUES (?, ?, ?, 'methodology', '', ?, 0, 1.0, NULL, '2026-09-11')
+                    """,
+                arguments: [id, projectId, content, VectorMath.encode(vector)]
+            )
+        }
+    }
+
+    private func insertSkill(
+        id: String,
+        name: String,
+        whenToUse: String,
+        bestFor: [String] = [],
+        tags: [String] = [],
+        pitfalls: [String] = [],
+        docPath: String = "/nonexistent/skill.md"
+    ) throws {
+        // 与 IndexRebuilder 同口径：embedding 对 name + when_to_use + best_for + tags 编码
+        let fourField = ([name, whenToUse] + bestFor + tags).joined(separator: "\n")
+        let vector = DeterministicHashEmbedder.vector(for: fourField)
+        let encoder = JSONEncoder()
+        try database.dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO skills
+                        (id, name, type, when_to_use, best_for, tags, pitfalls,
+                         doc_path, embedding, hit_count, enabled)
+                    VALUES (?, ?, 'component', ?, ?, ?, ?, ?, ?, 0, 1)
+                    """,
+                arguments: [
+                    id, name, whenToUse,
+                    String(decoding: try encoder.encode(bestFor), as: UTF8.self),
+                    String(decoding: try encoder.encode(tags), as: UTF8.self),
+                    String(decoding: try encoder.encode(pitfalls), as: UTF8.self),
+                    docPath,
+                    VectorMath.encode(vector),
+                ]
+            )
+        }
+    }
+
+    /// 被测组装器（默认预算）。
+    private func makeBuilder(
+        budgets: [ContextSegment: Int] = ContextBuilder.defaultBudgets
+    ) -> ContextBuilder {
+        ContextBuilder(database: database, embedder: embedder, budgets: budgets)
+    }
+
+    // MARK: - 1. 规则层常驻注入（预算极小也不裁）
+
+    func testRulesAlwaysInjectedAndNeverTrimmed() async {
+        let builder = ContextBuilder(
+            database: database, embedder: embedder,
+            budgets: [.rules: 1]  // 规则预算压到 1——设计上规则层常驻永不裁
+        )
+        let assembly = await builder.assemble(
+            stage: .clarify, project: "项目X", stageQuery: "一句话想法",
+            memoryContext: "", calibration: []
+        ) { injection in
+            "骨架前缀。\n\(injection)\n骨架后缀。"
+        }
+
+        // 注入区必有规则段（测试环境 Bundle 无 rules/global.md → 走内置兜底文本）
+        XCTAssertTrue(assembly.systemPrompt.contains("### 规则层（全局产品约束，常驻）"))
+        // 兜底文本与 Bundle 文本均含该核心约束——两条路径都可断言
+        XCTAssertTrue(assembly.systemPrompt.contains("不确认不推进"))
+        // rules 永不记入 trimmed；实际 token 超出预算值也不裁
+        XCTAssertFalse(assembly.breakdown.trimmed.contains(.rules))
+        XCTAssertGreaterThan(assembly.breakdown.segments[.rules] ?? 0, 1)
+    }
+
+    // MARK: - 2. 记忆段注入 + 假设态校准文本排段尾
+
+    func testMemoryInjectionWithCalibrationAtTail() async throws {
+        let memoryText = "- [结论] 目标用户是独立开发者\n- [约束] 只做 macOS 桌面端"
+        let calibration = [
+            "📈 记忆校准（该方法论的历史使用倾向——假设态，未验证前不作硬约束）：\n"
+                + "- [经验·假设态] 该用户偏好先看反例再定方案"
+        ]
+        let assembly = await makeBuilder().assemble(
+            stage: .structure, project: "项目X", stageQuery: "结构设计",
+            memoryContext: memoryText, calibration: calibration
+        ) { "骨架。" + $0 }
+
+        let prompt = assembly.systemPrompt
+        XCTAssertTrue(prompt.contains("### 记忆（版本 > 项目，新覆盖旧，不得矛盾）"))
+        XCTAssertTrue(prompt.contains("目标用户是独立开发者"))
+        XCTAssertTrue(prompt.contains("[经验·假设态] 该用户偏好先看反例再定方案"))
+        // 校准文本排记忆段尾（预算压力下最先被裁——design.md 校准注入语义）
+        let memoryRange = try XCTUnwrap(prompt.range(of: "目标用户是独立开发者"))
+        let calibrationRange = try XCTUnwrap(prompt.range(of: "[经验·假设态]"))
+        XCTAssertLessThan(memoryRange.lowerBound, calibrationRange.lowerBound)
+        // 组装产物回填校准原文（检查器展示）
+        XCTAssertEqual(assembly.calibration, calibration)
+        XCTAssertGreaterThan(assembly.breakdown.segments[.memory] ?? 0, 0)
+    }
+
+    // MARK: - 3. token 预算裁剪优先级（history → retrieval → skillBodies → memory）
+
+    func testBudgetTrimmingPriority() async throws {
+        // 技能正文 + 检索命中各一（预算压到极小 → 逐段让位）
+        let skillBody = "BUDGET_SKILL_BODY_SENTINEL " + String(repeating: "很长的技能正文内容。", count: 200)
+        let skillPath = tempRoot.appendingPathComponent("budget-skill.md").path
+        try """
+        ---
+        name: 预算技能
+        ---
+        \(skillBody)
+        """.write(to: URL(fileURLWithPath: skillPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "预算技能", name: "预算技能",
+            whenToUse: "KANO 需求优先级排序时", docPath: skillPath
+        )
+        try insertCard(
+            id: "kp-trim", projectId: "项目X",
+            content: "KANO 模型将需求分为基本型、期望型、兴奋型三类，先分类再排优先级"
+        )
+
+        let builder = ContextBuilder(
+            database: database, embedder: embedder,
+            budgets: [.rules: 500, .memory: 5, .skillBodies: 5, .retrieval: 1, .history: 0]
+        )
+        let memoryText = (1...8)
+            .map { "- [结论] 第\($0)条记忆结论，内容足够长以触发预算裁剪" }
+            .joined(separator: "\n")
+        let assembly = await builder.assemble(
+            stage: .clarify, project: "项目X", stageQuery: "KANO 需求优先级排序",
+            memoryContext: memoryText, calibration: []
+        ) { $0 }
+
+        // 历史预算 0 → 历史段整体让位（最低优先级，trimmed 首位）
+        XCTAssertEqual(assembly.breakdown.trimmed.first, .history)
+        XCTAssertEqual(assembly.breakdown.segments[.history], 0)
+        // 检索预算 1 → 卡片行全裁（段省略）
+        XCTAssertTrue(assembly.breakdown.trimmed.contains(.retrieval))
+        XCTAssertFalse(assembly.systemPrompt.contains("### 检索参考"))
+        // 技能正文预算 5 → 整块丢弃（不截断正文，保持技能完整性）
+        XCTAssertTrue(assembly.breakdown.trimmed.contains(.skillBodies))
+        XCTAssertFalse(assembly.systemPrompt.contains("BUDGET_SKILL_BODY_SENTINEL"))
+        XCTAssertTrue(assembly.injectedSkillBodies.isEmpty)
+        // 记忆预算 5 → 尾部逐行丢至空（段省略）
+        XCTAssertTrue(assembly.breakdown.trimmed.contains(.memory))
+        XCTAssertFalse(assembly.systemPrompt.contains("### 记忆"))
+        XCTAssertLessThanOrEqual(assembly.breakdown.segments[.memory] ?? 99, 5)
+        // rules 常驻不裁
+        XCTAssertFalse(assembly.breakdown.trimmed.contains(.rules))
+        XCTAssertTrue(assembly.systemPrompt.contains("### 规则层"))
+        // trimmed 按优先级从低到高记录
+        let expectedOrder: [ContextSegment] = [.history, .retrieval, .skillBodies, .memory]
+        XCTAssertEqual(
+            assembly.breakdown.trimmed,
+            expectedOrder.filter { assembly.breakdown.trimmed.contains($0) }
+        )
+    }
+
+    // MARK: - 4. 技能正文渐进式披露（命中才注入正文）
+
+    func testSkillBodyProgressiveDisclosureInAssembly() async throws {
+        let xBody = "技能X正文：PROGRESSIVE_X_SENTINEL 先定访谈目标再列提纲"
+        let yBody = "技能Y正文：PROGRESSIVE_Y_SENTINEL 摸清竞品格局"
+        let xPath = tempRoot.appendingPathComponent("disclosure-x.md").path
+        let yPath = tempRoot.appendingPathComponent("disclosure-y.md").path
+        try """
+        ---
+        name: 技能X
+        ---
+        \(xBody)
+        """.write(to: URL(fileURLWithPath: xPath), atomically: true, encoding: .utf8)
+        try """
+        ---
+        name: 技能Y
+        ---
+        \(yBody)
+        """.write(to: URL(fileURLWithPath: yPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "技能X", name: "技能X", whenToUse: "用户访谈前列提纲时", docPath: xPath
+        )
+        try insertSkill(
+            id: "技能Y", name: "技能Y", whenToUse: "需要摸清竞品格局时", docPath: yPath
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .clarify, project: "项目X", stageQuery: "用户访谈前列提纲时",
+            memoryContext: "", calibration: []
+        ) { "骨架。" + $0 }
+
+        // 命中技能正文注入（带 id 标头，按相关度降序）
+        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：技能X"))
+        XCTAssertTrue(assembly.systemPrompt.contains("PROGRESSIVE_X_SENTINEL"))
+        // 未命中技能正文不注入——渐进式披露（E11 在组装层的证明）
+        XCTAssertFalse(assembly.systemPrompt.contains("PROGRESSIVE_Y_SENTINEL"))
+        XCTAssertEqual(assembly.injectedSkillBodies.count, 1)
+        XCTAssertTrue(assembly.injectedSkillBodies[0].hasPrefix("技能X：\n"))
+        // 检索 trace 可观测（未命中技能进 unmatchedSkills）
+        let trace = try XCTUnwrap(assembly.retrieval)
+        XCTAssertTrue(trace.unmatchedSkills.contains("技能Y"))
+        XCTAssertFalse(trace.unmatchedSkills.contains("技能X"))
+    }
+
+    // MARK: - 5. pitfalls 确定性路由进自检清单（Task 4.8）
+
+    func testPitfallsRoutedIntoSelfChecklistTail() async throws {
+        try insertSkill(
+            id: "原型技能", name: "原型技能", whenToUse: "产出高保真原型时",
+            tags: ["原型", "wireframe"], pitfalls: ["p1", "p2"]
+        )
+        try insertSkill(
+            id: "竞品技能", name: "竞品技能", whenToUse: "摸清竞品格局",
+            tags: ["竞品"], pitfalls: ["q1"]
+        )
+
+        let builder = makeBuilder()
+        let assembly = await builder.assemble(
+            stage: .prototype, project: "项目X", stageQuery: "原型页面",
+            memoryContext: "", calibration: []
+        ) { _ in "PROMPT_SKELETON_END" }
+
+        // 自检清单 + 命中阶段技能的全部 pitfalls
+        XCTAssertTrue(assembly.systemPrompt.contains("## 自检清单（pitfalls 确定性路由）"))
+        XCTAssertTrue(assembly.systemPrompt.contains("- [原型技能] p1"))
+        XCTAssertTrue(assembly.systemPrompt.contains("- [原型技能] p2"))
+        // 无关阶段技能的 pitfalls 不进（确定性路由只按当前阶段关键词）
+        XCTAssertFalse(assembly.systemPrompt.contains("q1"))
+        XCTAssertEqual(assembly.pitfalls.count, 2)
+        XCTAssertTrue(assembly.pitfalls.allSatisfy { $0.source == "pitfalls确定性路由" })
+        // 拼到 system prompt 尾部：清单在 promptBuilder 骨架之后
+        let skeleton = try XCTUnwrap(assembly.systemPrompt.range(of: "PROMPT_SKELETON_END"))
+        let checklist = try XCTUnwrap(assembly.systemPrompt.range(of: "## 自检清单"))
+        XCTAssertLessThan(skeleton.lowerBound, checklist.lowerBound)
+
+        // 无关键词映射的阶段（classify）→ 不产自检清单
+        let classifyAssembly = await builder.assemble(
+            stage: .classify, project: "项目X", stageQuery: "任意",
+            memoryContext: "", calibration: []
+        ) { "骨架。" + $0 }
+        XCTAssertFalse(classifyAssembly.systemPrompt.contains("自检清单（pitfalls"))
+        XCTAssertTrue(classifyAssembly.pitfalls.isEmpty)
+    }
+
+    // MARK: - 6. 空段省略 + ContextAssembly Codable 往返
+
+    func testEmptySectionsOmittedAndAssemblyCodable() async throws {
+        var capturedInjection = ""
+        let assembly = await makeBuilder().assemble(
+            stage: .clarify, project: "项目X", stageQuery: "一句话想法",
+            memoryContext: "   \n  ", calibration: ["  ", ""]
+        ) { injection in
+            capturedInjection = injection
+            return "骨架。" + injection
+        }
+
+        // 空段省略：记忆/技能正文/检索段整段不出现
+        let prompt = assembly.systemPrompt
+        XCTAssertFalse(prompt.contains("### 记忆"))
+        XCTAssertFalse(prompt.contains("### 技能正文"))
+        XCTAssertFalse(prompt.contains("### 检索参考"))
+        // 规则层常驻 → 注入区非空（promptBuilder 必拿到规则段）
+        XCTAssertTrue(capturedInjection.contains("### 规则层"))
+        // 空库无命中但 trace 仍可观测
+        let trace = try XCTUnwrap(assembly.retrieval)
+        XCTAssertTrue(trace.hits.isEmpty)
+        XCTAssertTrue(assembly.pitfalls.isEmpty)
+        XCTAssertTrue(assembly.breakdown.trimmed.isEmpty)
+        XCTAssertEqual(assembly.stage, LLMStage.clarify.rawValue)
+        XCTAssertEqual(assembly.query, "一句话想法")
+
+        // ContextAssembly Codable 往返（检查器持久化契约）
+        let data = try JSONEncoder().encode(assembly)
+        let decoded = try JSONDecoder().decode(ContextAssembly.self, from: data)
+        XCTAssertEqual(decoded, assembly)
+    }
+
+    // MARK: - 7. SessionStore.trimmedHistory：成对丢最旧整轮
+
+    func testSessionStoreTrimmedHistoryRoundPairs() {
+        let system = ChatMessage(role: .system, content: "系统提示词（组装后的阶段 prompt）")
+        func round(_ n: Int, repeatCount: Int) -> [ChatMessage] {
+            [
+                ChatMessage(
+                    role: .user,
+                    content: "第\(n)轮提问：" + String(repeating: "细节", count: repeatCount)
+                ),
+                ChatMessage(
+                    role: .assistant,
+                    content: "第\(n)轮回答：" + String(repeating: "说明", count: repeatCount)
+                ),
+            ]
+        }
+        let messages = [system] + round(1, repeatCount: 30)
+            + round(2, repeatCount: 30) + round(3, repeatCount: 30)
+
+        // 预算充足 → 原样保留
+        XCTAssertEqual(SessionStore.trimmedHistory(messages, budget: 10_000), messages)
+
+        // 预算只装得下最新轮 → 从最旧起成对丢（user+assistant 不拆对）
+        let trimmed = SessionStore.trimmedHistory(messages, budget: 200)
+        XCTAssertEqual(trimmed.first, system)
+        let rest = Array(trimmed.dropFirst())
+        XCTAssertFalse(rest.isEmpty)
+        XCTAssertTrue(rest.contains { $0.content.contains("第3轮") })    // 最新轮保住
+        XCTAssertFalse(rest.contains { $0.content.contains("第1轮") })   // 最旧轮成对丢
+        // 轮内成对：不出现连续两条 user 的断头轮
+        var danglingUser = false
+        var previous: ChatMessage?
+        for message in rest {
+            if previous?.role == .user && message.role == .user { danglingUser = true }
+            previous = message
+        }
+        XCTAssertFalse(danglingUser)
+        // 保留的历史总量 ≤ 预算
+        XCTAssertLessThanOrEqual(
+            TokenBreakdown.estimate(rest.map(\.content).joined(separator: "\n")),
+            200
+        )
+
+        // 预算 ≤ 0 → 只剩 system（历史段整体让位）
+        XCTAssertEqual(SessionStore.trimmedHistory(messages, budget: 0), [system])
+        // 首条 system 不占历史预算：system 很长也不影响裁剪判定
+        let longSystem = ChatMessage(
+            role: .system, content: String(repeating: "很长的系统提示词。", count: 500)
+        )
+        let withLongSystem = [longSystem] + round(1, repeatCount: 5)
+        XCTAssertEqual(SessionStore.trimmedHistory(withLongSystem, budget: 50), withLongSystem)
+    }
+}
