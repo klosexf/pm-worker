@@ -60,6 +60,8 @@ struct pm_workerApp: App {
         //   内容从窗口 frame 最顶缘开始布局；
         // 系统红绿灯由 ContentView 挂载的 WindowChromeConfigurator 隐藏，
         // 窗口控制改由侧栏首行自绘三色圆接管（WindowControlButtons）。
+        // 默认窗口尺寸：1280×800，三栏布局首次打开不至于局促
+        .defaultSize(width: 1280, height: 800)
         .windowStyle(.hiddenTitleBar)
 
         // 卡片库（Task 4.7）：knowledge_points 全表浏览 + 注记时间线 + 来源跳转

@@ -5,7 +5,7 @@
 //  版本封板运行时（Task 3.7，design.md 版本管理）：
 //  ① 风险结算挂载点（settleRisks 回调——AppModel 接线 RiskStore.settleAllForRelease，
 //     因为 RiskStore 实例归 AppModel 持有）
-//  ② release-notes 写入 07-reports/release-notes.md（write-then-verify）
+//  ② release-notes 写入 07-reports/发布说明.md（write-then-verify）
 //  ③ version.json status → released（保持 PMAgentStore 的 prettyPrinted + sortedKeys 编码）
 //  ④ 版本目录及其子项递归 immutable（目录只读）
 //  Git 快照（GitSnapshotQueue）由调用方在封板成功后自行触发（主 agent 在 AppModel 接线）。
@@ -61,10 +61,10 @@ final class VersionStore: ObservableObject {
         //    release(..., settleRisks: { try riskStore.settleAllForRelease() })
         try settleRisks?()
 
-        // ② release-notes.md（write-then-verify，E5）
+        // ② 发布说明.md（write-then-verify，E5）
         try PMAgentStore.writeVerified(
             notes,
-            to: dir.appendingPathComponent("07-reports/release-notes.md")
+            to: dir.appendingPathComponent(ArtifactPath.releaseNotes)
         )
 
         // ③ version.json：status = released（编码格式与 PMAgentStore 私有 write 一致，读写兼容）

@@ -21,6 +21,7 @@ nonisolated struct PipelineEvent: Codable, Equatable, Identifiable {
         case prdStaleMarked     // PRD 过期标记
         case prdStaleCleared    // PRD 过期清除
         case radarRecorded      // 自评审入账（修正数）
+        case gateEvaluated      // 机器门评审（Tier1/Tier2 结果与打回）
     }
 
     var id: String

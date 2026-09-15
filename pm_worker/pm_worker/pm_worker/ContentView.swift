@@ -17,8 +17,9 @@ struct ContentView: View {
         // 页面顶部无任何标题栏与横条导航。
         // 全出血关键点：HSplitView 桥接 NSSplitView，每个 pane 是独立 NSHostingView，
         // 外层 ignoresSafeArea 的扩张不会传播进 pane（pane 重新继承窗口顶部安全区，
-        // Tahoe 上 hiddenTitleBar 窗口顶部 inset 非 0）——必须在每个 pane 根部各自忽略，
-        // 否则三栏内容整体被顶部安全区压下，窗口顶缘露出一条底色横条。
+        // Tahoe 上 hiddenTitleBar 窗口顶部 inset 非 0）——各 pane 在各自根部决定
+        // 顶部策略：左栏（自绘窗口控制钮）与右栏（tabs 紧凑间距）根部忽略贴顶；
+        // 中栏按路由在 middlePane 内部决定（对话页贴顶 / 功能导航整页尊重安全区）。
         HSplitView {
             ProjectSidebar(model: model)
                 .frame(minWidth: 220, idealWidth: 260, maxWidth: 320)
@@ -28,27 +29,11 @@ struct ContentView: View {
                 // 安全区(31pt)开始，露出 hosting 白底，形成顶部白条色差。
                 .ignoresSafeArea(.container, edges: .top)
 
-            middle
-                .frame(minWidth: 480)
-                .frame(maxWidth: .infinity)
-                .background(Color.surfaceBase)
-                // 右栏收起态：悬浮展开钮叠在中栏右上角（不占布局宽度，参考图形制）。
-                // 顺序关键：overlay 必须挂在 ignoresSafeArea **内侧**——挂外侧时
-                // 对齐基准是未含顶部安全区扩张的 frame，按钮被顶部 inset 整体压下，
-                // 与左栏首行（贴顶 8pt）横向错位。
-                .overlay(alignment: .topTrailing) {
-                    if showsInspectorPanel, model.inspectorCollapsed {
-                        InspectorExpandButton()
-                            // 与展开态面板头部收起钮同一垂直位：该钮 = top 10 + 行高 32
-                            // （DSTabs 28+4）中 24pt 盒居中 → 图标中心 26pt；本钮 28pt 盒
-                            // top 12 → 中心同为 26pt，两态切换按钮零跳动。
-                            .padding(.top, DS.Spacing.s12)
-                            .padding(.trailing, DS.Spacing.s12)
-                            .transition(.opacity.combined(with: .scale(scale: 0.92)))
-                    }
-                }
-                .ignoresSafeArea(.container, edges: .top)
-                .animation(DS.Motion.springFast, value: model.inspectorCollapsed)
+            // 中栏：顶部安全区策略在 middlePane 内部按路由决定（对话页全出血 /
+            // 功能导航整页尊重顶部安全区）。策略必须放在 pane **内部**而非直接
+            // 分支 pane 本身——HSplitView 子级保持单一结构身份，路由切换不重建
+            // split item（否则分割条位置被重置）。
+            middlePane
 
             // 原型 v4 App Shell：右栏四 Tab 面板只在对话 / 新建任务等上下文页
             // 渲染；技能库 / 知识库 / 决策日志为独立整页（不挂 RightPanel）。
@@ -74,6 +59,9 @@ struct ContentView: View {
             }
         }
         .animation(DS.Motion.springFast, value: model.settingsPresented)
+        // 窗口级瞬态通知：顶部居中（侧栏删除/重命名/新建版本等操作反馈）。
+        // 侧栏 pane 宽度只有 220–320pt，在其内部弹通知必然偏居一侧。
+        .dsNotifCenter($model.notif, alignment: .top)
     }
 
     /// 功能导航三页（技能库 / 知识库 / 决策日志）为独立整页——只展示
@@ -83,6 +71,45 @@ struct ContentView: View {
         case .skillLibrary, .knowledgeHub, .decisionsPage: false
         default: true
         }
+    }
+
+    /// 中栏 pane 骨架（frame / 背景 / 动效）。顶部安全区策略按路由在内部决定：
+    /// - 对话上下文页（挂右栏）：全出血 ignoresSafeArea——顶栏自绘 chrome 贴窗口
+    ///   顶缘（overlay 挂在 ignoresSafeArea **内侧**，对齐基准含顶部扩张，展开钮
+    ///   与左栏首行零错位）；
+    /// - 功能导航整页（技能库 / 知识库 / 决策日志）：**尊重顶部安全区**——Tahoe 上
+    ///   hiddenTitleBar 窗口保留 ~31pt 标题栏工具区，macOS 会在该区域绘制材质 /
+    ///   滚动边带，整页 ScrollView 全出血时 hero 标题滚入区域即被遮挡（实测截图）；
+    ///   与独立窗口（真实标题栏）同构：内容从安全区下方开始，页面背景经
+    ///   background(_:ignoresSafeAreaEdges:) 默认全边延伸，顶缘无色差。
+    private var middlePane: some View {
+        Group {
+            if showsInspectorPanel {
+                middle
+                    // 右栏收起态：悬浮展开钮叠在中栏右上角（不占布局宽度，参考图形制）。
+                    // 顺序关键：overlay 必须挂在 ignoresSafeArea **内侧**——挂外侧时
+                    // 对齐基准是未含顶部安全区扩张的 frame，按钮被顶部 inset 整体压下，
+                    // 与左栏首行（贴顶 8pt）横向错位。
+                    .overlay(alignment: .topTrailing) {
+                        if model.inspectorCollapsed {
+                            InspectorExpandButton()
+                                // 与展开态面板头部收起钮同一垂直位：该钮 = top 10 + 行高 32
+                                // （DSTabs 28+4）中 24pt 盒居中 → 图标中心 26pt；本钮 28pt 盒
+                                // top 12 → 中心同为 26pt，两态切换按钮零跳动。
+                                .padding(.top, DS.Spacing.s12)
+                                .padding(.trailing, DS.Spacing.s12)
+                                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                        }
+                    }
+                    .ignoresSafeArea(.container, edges: .top)
+            } else {
+                middle
+            }
+        }
+        .frame(minWidth: 480)
+        .frame(maxWidth: .infinity)
+        .background(Color.surfaceBase)
+        .animation(DS.Motion.springFast, value: model.inspectorCollapsed)
     }
 
     /// 中栏工作区：按 model.selection 路由（新建任务 / 项目主页 / 会话 /

@@ -6,8 +6,11 @@
 //  输入框上方停靠的问答卡（2026-09 布局改版：选项卡片 + 右下角动作钮）——
 //  单页直接确认（2026-09-12 简化，design.md v0.9.12：取消两段式提交的第二页摘要，
 //  「确认后会发生什么」由选项卡副标题用人话承载，选中后页脚按钮直接提交生效）——
-//  ① 选择处理方式（确认并进入 / 继续修改 / 稍后再说），单选卡片 + 数字徽章
-//  ② 稍后再说 / 继续修改：折叠为细条，可展开
+//  ① 选择处理方式（确认并进入 / 继续修改），单选卡片 + 数字徽章
+//  ② 弹出纪律（2026-09-14，每阶段弹一次）：产物落盘弹坞一次；「稍后再说 / 继续修改」
+//     写入 AppModel.deferConfirmGate → 本阶段永久静默不再弹（修订落盘也不弹），
+//     推进由用户发起（自由作答「进入下一阶段」/ 摘要条兜底行）；
+//     静默中的修订轮由 gateInviteSuffix 在 AI 回复末尾融一句推进邀请。
 //  提交后对话流落确认记录胶囊（AppModel 写入）。
 //
 
@@ -19,18 +22,15 @@ struct ConfirmDock: View {
 
     let target: AppModel.ConfirmTarget
 
-    /// ② 稍后再说 / 继续修改 → 折叠细条。
-    @State private var deferred = false
     /// 单选（默认推荐项：确认并进入）。
     @State private var selection: Option = .proceed
     /// 选项卡 hover 态（边框升阶）。
     @State private var hoveredOption: Option?
 
-    /// 处理方式选项（单选；rawValue = 数字徽章编号）。
+    /// 处理方式选项（单选；rawValue = 数字徽章编号）。「稍后再说」走页脚次按钮，不占选项位。
     enum Option: Int, CaseIterable {
         case proceed = 1       // 确认并进入
         case editLater = 2     // 继续修改
-        case deferAction = 3   // 稍后再说
     }
 
     init(model: AppModel, target: AppModel.ConfirmTarget) {
@@ -40,46 +40,12 @@ struct ConfirmDock: View {
     }
 
     var body: some View {
-        Group {
-            if deferred {
-                collapsedBar
-            } else {
-                dock
-            }
-        }
-        // 与输入区同宽的 720 居中列（原型 DockCard 停靠于输入框正上方）
-        .frame(maxWidth: 720 + DS.Spacing.s64)
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, DS.Spacing.s32)
-        .padding(.bottom, DS.Spacing.s8)
-    }
-
-    // MARK: - 折叠细条（③ 触发，可展开；原型 DockBar 虚线胶囊）
-
-    private var collapsedBar: some View {
-        Button {
-            withAnimation { deferred = false }
-        } label: {
-            HStack(spacing: DS.Spacing.s6) {
-                DSIcon(.clock, size: 13)
-                Text("\(target.title)待确认——稍后再说")
-                    .font(DS.Font.bodySM)
-            }
-            .foregroundStyle(Color.ink500)
-            .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s4)
-            .background(
-                Capsule().fill(Color.surfaceSecondary)
-            )
-            .overlay(
-                Capsule().strokeBorder(
-                    Color.borderL2,
-                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])
-                )
-            )
-        }
-        .buttonStyle(.plain)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        dock
+            // 与输入区同宽的 720 居中列（原型 DockCard 停靠于输入框正上方）
+            .frame(maxWidth: 720 + DS.Spacing.s64)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, DS.Spacing.s32)
+            .padding(.bottom, DS.Spacing.s8)
     }
 
     // MARK: - 停靠卡（白底浮起 · 淡紫描边 · 大软阴影）
@@ -132,7 +98,11 @@ struct ConfirmDock: View {
 
     private var optionsArea: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
-            Text("\(target.title)已就绪，选择接下来的处理方式：")
+            // ① 的要点表在确认时才生成（此刻尚未落盘），不能说「已就绪」——
+            // ②③ 产物已在盘，保持「已就绪」表述
+            Text(target == .clarify
+                 ? "澄清对话已收束，确认后将生成要点表并进入 ② 结构设计："
+                 : "\(target.title)已就绪，选择接下来的处理方式：")
                 .font(DS.Font.bodySM)
                 .foregroundStyle(Color.ink500)
                 .padding(.bottom, DS.Spacing.s2)
@@ -147,11 +117,6 @@ struct ConfirmDock: View {
                     .editLater,
                     title: "继续修改",
                     subtitle: "收起确认坞，回到对话补充信息"
-                )
-                optionCard(
-                    .deferAction,
-                    title: "稍后再说",
-                    subtitle: "折叠为细条，稍后再展开确认"
                 )
             }
         }
@@ -252,14 +217,14 @@ struct ConfirmDock: View {
     private var footerRow: some View {
         HStack(spacing: DS.Spacing.s8) {
             Spacer()
-            if selection != .deferAction {
-                Button {
-                    deferred = true
-                } label: {
-                    Text("稍后再说")
-                }
-                .buttonStyle(.ds(.secondary, size: .sm))
+            Button {
+                // 稍后再说：本阶段永久静默（每阶段弹一次），坞随挂载条件消失；
+                // 推进改由自由作答 / 摘要条兜底行发起
+                model.deferConfirmGate(target)
+            } label: {
+                Text("稍后再说")
             }
+            .buttonStyle(.ds(.secondary, size: .sm))
 
             Button {
                 performSelection()
@@ -280,18 +245,16 @@ struct ConfirmDock: View {
         switch selection {
         case .proceed: "确认并进入"
         case .editLater: "继续修改"
-        case .deferAction: "稍后再说"
         }
     }
 
-    /// 执行所选选项：确认 → 提交生效（触发下一阶段生成）；其余 → 折叠细条。
+    /// 执行所选选项：确认 → 提交生效（触发下一阶段生成）；继续修改 → 静默本阶段。
     private func performSelection() {
         guard selection == .proceed else {
-            deferred = true
+            model.deferConfirmGate(target)
             return
         }
         Task {
-            deferred = true  // 提交后收起（对话流落确认胶囊）
             await model.confirmCurrentStage()
         }
     }

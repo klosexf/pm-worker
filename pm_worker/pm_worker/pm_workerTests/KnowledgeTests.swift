@@ -8,6 +8,7 @@
 //  - Recommender：阶段推荐（阈值过滤 / 降序 / 上限 3 / 同阶段不重复被拒项 / 确定性理由）
 //  - KnowledgeCalibration：经验按假设态注入（主题匹配 / 非 experience 不注入）
 //  - MemoryStore.recordExperience / allExperiences：经验沉淀落盘 + 跨项目聚合 + 覆盖语义
+//  - MemoryStore 经验校准：注入置待校准（幂等）→ 确认/否定升降置信度（边界 clamp）
 //  不依赖网络：DeterministicHashEmbedder + 临时目录（rootOverride）+ 临时 AppDatabase。
 //
 
@@ -456,8 +457,8 @@ final class KnowledgeTests: XCTestCase {
                     id: UUID().uuidString, sessionId: "s", role: .system,
                     content: "结论行", think: nil,
                     memory: MemoryEntry(
-                        scope: .version, scopeId: "v1", kind: .conclusion,
-                        content: "结论不应被聚合"
+                        scope: .project, scopeId: "测试项目", kind: .conclusion,
+                        content: "结论不应被聚合", versions: "v1"
                     ),
                     createdAt: "t"
                 ),
@@ -489,5 +490,127 @@ final class KnowledgeTests: XCTestCase {
         all = MemoryStore.allExperiences()
         XCTAssertEqual(all.count, 1)
         XCTAssertEqual(all.first?.content, "乙经验：原型先做灰盒")
+    }
+
+    // MARK: - 10. 经验校准（注入标记 → 确认/否定，置信度自动升降）
+
+    /// 沉淀一条经验并返回其 id（走 recordExperience 正式链路）。
+    @MainActor
+    private func sedimentExperience(
+        _ content: String, confidence: Double,
+        project: String, version: String, url: URL
+    ) throws -> String {
+        let store = MemoryStore(project: project, version: version)
+        _ = store.recordExperience(
+            content: content, sourceRef: "\(project)/\(version)", confidence: confidence,
+            sessionId: "s1"
+        ) { line in
+            try PMAgentStore.appendLine(line, to: url)
+        }
+        return try XCTUnwrap(store.effective.first(where: { $0.content == content })?.id)
+    }
+
+    @MainActor
+    func testExperienceCalibrationLifecycle() throws {
+        try PMAgentStore.createProject(named: "校准项目")
+        try PMAgentStore.ensureWorkspace(project: "校准项目", version: "v1")
+        let url = PMAgentStore.jsonlURL(
+            project: "校准项目", version: "v1", file: "discussions.jsonl"
+        )
+        let entryId = try sedimentExperience(
+            "KANO 分类要访谈交叉验证，不能拍脑袋定档",
+            confidence: MemoryStore.experienceHypothesisConfidence,
+            project: "校准项目", version: "v1", url: url
+        )
+
+        // ① 注入标记：置待校准 + 记注入时间，置信度不动
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [entryId]), 1)
+        let calibrated = try XCTUnwrap(
+            MemoryStore.allExperiences().first(where: { $0.id == entryId })
+        )
+        XCTAssertEqual(calibrated.calibrationPending, true)
+        XCTAssertNotNil(calibrated.lastInjectedAt)
+        XCTAssertEqual(
+            calibrated.confidence ?? -1,
+            MemoryStore.experienceHypothesisConfidence, accuracy: 1e-9
+        )
+
+        // 幂等：已 pending 不重复标记（返回 0，不落新行）
+        let lineCountBefore = PMAgentStore.readLines(DiscussionEntry.self, from: url).count
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [entryId]), 0)
+        XCTAssertEqual(
+            PMAgentStore.readLines(DiscussionEntry.self, from: url).count, lineCountBefore
+        )
+
+        // ② 确认有效：0.7 + 0.1 = 0.8，清除待校准
+        let confirmed = try XCTUnwrap(
+            MemoryStore.applyExperienceCalibration(id: entryId, confirmed: true)
+        )
+        XCTAssertEqual(confirmed.confidence ?? -1, 0.8, accuracy: 1e-9)
+        XCTAssertEqual(confirmed.calibrationPending, false)
+
+        // ③ 再注入 → 否定：0.8 − 0.2 = 0.6（负证据降得快）
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [entryId]), 1)
+        let rejected = try XCTUnwrap(
+            MemoryStore.applyExperienceCalibration(id: entryId, confirmed: false)
+        )
+        XCTAssertEqual(rejected.confidence ?? -1, 0.6, accuracy: 1e-9)
+
+        // ④ 无待校准标记 → 拒绝回写（防重复升降）；未知 id → 0（未标记任何条目）
+        XCTAssertNil(MemoryStore.applyExperienceCalibration(id: entryId, confirmed: true))
+        XCTAssertNil(MemoryStore.applyExperienceCalibration(id: "m_不存在", confirmed: true))
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: ["m_不存在"]), 0)
+    }
+
+    @MainActor
+    func testExperienceCalibrationBoundariesAndKindGuard() throws {
+        try PMAgentStore.createProject(named: "边界项目")
+        try PMAgentStore.ensureWorkspace(project: "边界项目", version: "v1")
+        let url = PMAgentStore.jsonlURL(
+            project: "边界项目", version: "v1", file: "discussions.jsonl"
+        )
+
+        // 上限：confidence 1.0 确认后仍为 1.0（不破 1）
+        let topId = try sedimentExperience(
+            "上限经验：天花板测试", confidence: 1.0,
+            project: "边界项目", version: "v1", url: url
+        )
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [topId]), 1)
+        let topped = try XCTUnwrap(
+            MemoryStore.applyExperienceCalibration(id: topId, confirmed: true)
+        )
+        XCTAssertEqual(topped.confidence ?? -1, 1.0, accuracy: 1e-9)
+
+        // 下限：0.1 连续两轮否定 → 0.0 触底不转负
+        let lowId = try sedimentExperience(
+            "下限经验：触底测试", confidence: 0.1,
+            project: "边界项目", version: "v1", url: url
+        )
+        for _ in 0..<2 {
+            XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [lowId]), 1)
+            let rejected = try XCTUnwrap(
+                MemoryStore.applyExperienceCalibration(id: lowId, confirmed: false)
+            )
+            XCTAssertGreaterThanOrEqual(rejected.confidence ?? -1, 0)
+        }
+        let grounded = try XCTUnwrap(
+            MemoryStore.allExperiences().first(where: { $0.id == lowId })
+        )
+        XCTAssertEqual(grounded.confidence ?? -1, 0.0, accuracy: 1e-9)
+
+        // 非「经验」条目不参与校准（结论 / 约束不走该机制）
+        let conclusion = MemoryEntry(
+            scope: .project, scopeId: "测试项目", kind: .conclusion,
+            content: "结论不参与校准", versions: "v1"
+        )
+        try PMAgentStore.appendLine(
+            DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s", role: .system,
+                content: "结论行", think: nil, memory: conclusion, createdAt: "t"
+            ),
+            to: url
+        )
+        XCTAssertEqual(MemoryStore.markExperiencesPendingCalibration(ids: [conclusion.id]), 0)
+        XCTAssertNil(MemoryStore.applyExperienceCalibration(id: conclusion.id, confirmed: true))
     }
 }

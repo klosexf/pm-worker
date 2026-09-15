@@ -4,7 +4,7 @@
 //
 //  状态机骨架 + 运行态持久化（Task 2.5，design.md §6.1）：
 //  CLARIFY → STRUCTURE →【确认闸口】→ PROTOTYPE →【确认闸口】→ PRD。
-//  阶段从磁盘产物推导（文件是唯一事实源）：clarification.md / confirmed.json
+//  阶段从磁盘产物推导（文件是唯一事实源）：澄清要点表 / confirmed.json
 //  是闸口依据；澄清轮次等运行态存 pipeline_runs（SQLite，重启不丢）。
 //
 
@@ -48,7 +48,8 @@ final class PipelineEngine: ObservableObject {
     // MARK: - 磁盘推导（闸口状态以文件为准）
 
     /// 从版本目录产物推导当前阶段：
-    /// 无 clarification.md → clarify；有 → structure（未过闸口）；
+    /// 无澄清要点表 → clarify；有 → structure（未过闸口）；
+    /// 有表但处于增补澄清（01-requirements/amend.json，新功能诉求从下游回①）→ clarify；
     /// 02-structure/confirmed.json 存在 → prototype；03-prototypes/confirmed.json 存在 → prd。
     nonisolated static func deriveStage(project: String, version: String) -> PipelineRun.Stage {
         let dir = PMAgentStore.versionURL(project: project, version: version)
@@ -56,7 +57,9 @@ final class PipelineEngine: ObservableObject {
         let has = { (rel: String) in fm.fileExists(atPath: dir.appendingPathComponent(rel).path) }
         if has("03-prototypes/confirmed.json") { return .prd }
         if has("02-structure/confirmed.json") { return .prototype }
-        if has("01-requirements/clarification.md") { return .structure }
+        if has(ArtifactPath.clarification) {
+            return has(ArtifactPath.clarifyAmend) ? .clarify : .structure
+        }
         return .clarify
     }
 
@@ -187,11 +190,18 @@ final class PipelineEngine: ObservableObject {
     /// 5 轮耗尽？→ 强制收束（缺失项入 open_questions，不阻塞流水线）。
     var clarifyExhausted: Bool { clarifyRounds >= Self.clarifyRoundLimit }
 
-    /// 澄清要点表落盘后的阶段推进（①→②）。
+    /// 澄清要点表落盘后的阶段推进（①→②）；增补澄清收束时清增补标记。
     func advanceFromClarify() {
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        let wasAmending = FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(ArtifactPath.clarifyAmend).path
+        )
+        removeIfExists(ArtifactPath.clarifyAmend)
         stage = .structure
         persist()
-        log(.stageAdvance, detail: "① 澄清 → ② 结构（澄清要点表已确认）")
+        log(.stageAdvance, detail: wasAmending
+            ? "① 增补澄清收束 → ② 结构（要点表已按新功能诉求更新）"
+            : "① 澄清 → ② 结构（澄清要点表已确认）")
     }
 
     /// ② 确认闸口：写 confirmed.json（闸口事实源）。
@@ -251,6 +261,47 @@ final class PipelineEngine: ObservableObject {
         log(.stageInvalidate, detail: "③ 回退：原型重做", reason: "prototype_regen")
     }
 
+    /// 增补澄清进行中（01-requirements/amend.json 存在）。
+    var isAmendingClarify: Bool {
+        FileManager.default.fileExists(
+            atPath: PMAgentStore.versionURL(project: project, version: version)
+                .appendingPathComponent(ArtifactPath.clarifyAmend).path
+        )
+    }
+
+    /// ① 增补澄清回退（新功能/范围变化诉求从 ②③④ 回到澄清）：
+    /// 写增补标记（deriveStage 据此推导回①）+ 清下游确认 + PRD 过期传播。
+    /// 要点表与下游产物文件**保留**——表是增补基底，结构/原型/PRD 是后续增量修订基底。
+    /// 触发信号 clarify_backtrack。轮次重置（新一轮澄清周期）。
+    func invalidateClarify() {
+        struct AmendRecord: Codable {
+            var reason: String
+            var markedAt: String
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        if let data = try? encoder.encode(
+            AmendRecord(reason: "clarify_backtrack", markedAt: ISO8601.timestamp())
+        ) {
+            try? PMAgentStore.writeVerified(
+                String(decoding: data, as: UTF8.self),
+                to: PMAgentStore.versionURL(project: project, version: version)
+                    .appendingPathComponent(ArtifactPath.clarifyAmend)
+            )
+        }
+        // 过期传播：澄清重开 → 下游确认全部失效（产物文件保留作修订基底）
+        removeIfExists("02-structure/confirmed.json")
+        removeIfExists("03-prototypes/confirmed.json")
+        structureConfirmed = false
+        prototypeConfirmed = false
+        clarifyRounds = 0
+        stage = .clarify
+        markPRDStale(reason: "clarify_backtrack", scope: "全部")
+        persist()
+        log(.stageInvalidate, detail: "① 增补澄清：新功能诉求回①（要点表保留作基底）",
+            reason: "clarify_backtrack")
+    }
+
     /// PRD 重写完成后清除过期标记（App 在 writePRDArtifact 成功后调用）。
     func clearPRDStale() {
         let wasStale = prdStale
@@ -265,7 +316,7 @@ final class PipelineEngine: ObservableObject {
     private func markPRDStale(reason: String, scope: String) {
         let dir = PMAgentStore.versionURL(project: project, version: version)
         let fm = FileManager.default
-        guard fm.fileExists(atPath: dir.appendingPathComponent("04-prd/prd-v1.md").path) else {
+        guard fm.fileExists(atPath: dir.appendingPathComponent(ArtifactPath.prd).path) else {
             return
         }
         struct StaleRecord: Codable {

@@ -65,12 +65,29 @@ nonisolated final class Retriever {
 
     /// 检索方法论卡（knowledge_points）+ 技能（skills 表 when_to_use 四字段语义命中）。
     /// 返回完整 RetrievalTrace（命中 + scope 标签 + 相似度 + 未命中技能列表）。
-    func search(query: String, project: String, topK: Int = 5) async throws -> RetrievalTrace {
+    /// - Parameters:
+    ///   - skillQuery: 技能检索独立查询（意图优先路由，2026-09-14）——卡片按 `query`
+    ///     （阶段产物 + 消息，保阶段连续性），技能按 `skillQuery`（最近用户消息，
+    ///     消息意图主信号）。nil 时技能与卡片共用 `query`（旧行为）。
+    ///   - countsSkillHits: 技能命中是否计入 hit_count。ContextBuilder 注入正文后
+    ///     自行按「实际注入」计数（语义 + 锚点同口径），组装链路传 false 防双计；
+    ///     知识库页直搜等无注入环节的调用方保持 true。
+    func search(
+        query: String,
+        project: String,
+        topK: Int = 5,
+        skillQuery: String? = nil,
+        countsSkillHits: Bool = true
+    ) async throws -> RetrievalTrace {
         let clock = ContinuousClock()
         let start = clock.now
 
-        // 1. query 向量化（embedder 契约保证等长返回；空兜底 → 全部余弦为 0 的空 trace）
-        let queryVector = (try await embedder.embed(texts: [query])).first ?? []
+        // 1. query 向量化（embedder 契约保证等长返回；空兜底 → 全部余弦为 0 的空 trace）。
+        //    双查询合并一次 embed 调用（真实端点省一次网络往返）。
+        let embedTexts = skillQuery.map { [query, $0] } ?? [query]
+        let vectors = try await embedder.embed(texts: embedTexts)
+        let queryVector = vectors.first ?? []
+        let skillVector = (skillQuery != nil ? vectors.last : vectors.first) ?? []
 
         // 2. 读全部行（两条 SELECT：卡片 + 技能；当前 MVP 内存余弦，
         //    SQLiteVec 切换点见 sqliteVecChunkThreshold）
@@ -103,7 +120,7 @@ nonisolated final class Retriever {
             }
         }
 
-        // 3. 卡片：scope 隔离（E12）+ 阈值过滤
+        // 3. 卡片：scope 隔离（E12）+ 阈值过滤（按 stage query 向量）
         var filteredCrossProject = 0
         var cardCandidates: [(hit: RetrievalHit, vector: [Float])] = []
         for row in cardRows {
@@ -146,14 +163,15 @@ nonisolated final class Retriever {
         }
         let cardHits = deduped.prefix(topK).map { $0.hit }
 
-        // 5. 技能：阈值过滤。命中只给 when_to_use 摘要（正文渐进式披露）；
-        //    未命中（含被 topK 截断与零长度占位）的技能全部 id 进 unmatchedSkills——E11 验证依据
+        // 5. 技能：阈值过滤（按 skillQuery 向量——意图优先）。命中只给 when_to_use
+        //    摘要（正文渐进式披露）；未命中（含被 topK 截断与零长度占位）的技能
+        //    全部 id 进 unmatchedSkills——E11 验证依据
         var skillCandidates: [RetrievalHit] = []
         var allSkillIds: [String] = []
         for row in skillRows {
             allSkillIds.append(row.id)
             guard !row.embedding.isEmpty, let vector = VectorMath.decode(row.embedding) else { continue }
-            let score = VectorMath.cosine(queryVector, vector)
+            let score = VectorMath.cosine(skillVector, vector)
             guard score > Self.skillThreshold else { continue }
             skillCandidates.append(
                 RetrievalHit(
@@ -173,8 +191,9 @@ nonisolated final class Retriever {
         let hitIds = Set(skillHits.map(\.id))
         let unmatchedSkills = allSkillIds.filter { !hitIds.contains($0) }
 
-        // 6. 命中计数（技能库 UI 的 hit_count 数据源）
-        if !hitIds.isEmpty {
+        // 6. 命中计数（技能库 UI 的 hit_count 数据源）。组装链路传 countsSkillHits: false——
+        //    注入才算命中，由 ContextBuilder 统一计数（语义 + 锚点同口径）
+        if countsSkillHits, !hitIds.isEmpty {
             try await database.dbQueue.write { db in
                 for id in hitIds {
                     try db.execute(
@@ -190,7 +209,8 @@ nonisolated final class Retriever {
             hits: cardHits + skillHits,
             filteredCrossProject: filteredCrossProject,
             unmatchedSkills: unmatchedSkills,
-            durationMs: Self.milliseconds(of: clock.now - start)
+            durationMs: Self.milliseconds(of: clock.now - start),
+            skillQuery: skillQuery
         )
     }
 

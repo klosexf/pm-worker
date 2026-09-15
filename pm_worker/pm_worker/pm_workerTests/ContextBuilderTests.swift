@@ -7,6 +7,9 @@
 //  - 记忆段注入 + 假设态校准文本排段尾（预算压力下最先被裁的位置语义）
 //  - token 预算裁剪优先级（history → retrieval → skillBodies → memory；rules 永不裁）
 //  - 技能正文渐进式披露（命中才注入正文，未命中不注入）
+//  - 技能路由「意图优先、阶段兜底」（2026-09-14）：语义命中按 skillQuery 注入、
+//    零命中时注入阶段钦定锚点技能（PitfallsRouter.stageAnchorSkills），命中计数
+//    收口为「正文实际进上下文才算」
 //  - pitfalls 确定性路由进 system prompt 尾部自检清单
 //  - 空段省略 + ContextAssembly Codable 往返
 //  - SessionStore.trimmedHistory 成对丢最旧整轮
@@ -206,7 +209,7 @@ final class ContextBuilderTests: XCTestCase {
         )
     }
 
-    // MARK: - 4. 技能正文渐进式披露（命中才注入正文）
+    // MARK: - 4. 技能正文渐进式披露（命中才注入正文；意图 query 驱动技能命中）
 
     func testSkillBodyProgressiveDisclosureInAssembly() async throws {
         let xBody = "技能X正文：PROGRESSIVE_X_SENTINEL 先定访谈目标再列提纲"
@@ -232,8 +235,12 @@ final class ContextBuilderTests: XCTestCase {
             id: "技能Y", name: "技能Y", whenToUse: "需要摸清竞品格局时", docPath: yPath
         )
 
+        // 意图分流证明：stageQuery（卡片查询口径）与技能四字段零重合，
+        // skillQuery（本轮用户消息）命中技能X——技能跟消息语义走、不跟阶段走
         let assembly = await makeBuilder().assemble(
-            stage: .clarify, project: "项目X", stageQuery: "用户访谈前列提纲时",
+            stage: .clarify, project: "项目X",
+            stageQuery: "阶段产物锚定的卡片查询文本",
+            skillQuery: "用户访谈前列提纲时",
             memoryContext: "", calibration: []
         ) { "骨架。" + $0 }
 
@@ -244,10 +251,105 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertFalse(assembly.systemPrompt.contains("PROGRESSIVE_Y_SENTINEL"))
         XCTAssertEqual(assembly.injectedSkillBodies.count, 1)
         XCTAssertTrue(assembly.injectedSkillBodies[0].hasPrefix("技能X：\n"))
-        // 检索 trace 可观测（未命中技能进 unmatchedSkills）
+        // skillIds 与注入正文同口径（过预算裁剪后实际注入的技能 id）
+        XCTAssertEqual(assembly.skillIds, ["技能X"])
+        // 检索 trace 可观测（未命中技能进 unmatchedSkills；意图 query 留痕）
         let trace = try XCTUnwrap(assembly.retrieval)
         XCTAssertTrue(trace.unmatchedSkills.contains("技能Y"))
         XCTAssertFalse(trace.unmatchedSkills.contains("技能X"))
+        XCTAssertEqual(trace.skillQuery, "用户访谈前列提纲时")
+    }
+
+    // MARK: - 4.5 意图优先 + 阶段锚点兜底（2026-09-14 技能路由改造）
+
+    func testSkillInjectionFollowsIntentWithoutStageForcing() async throws {
+        // 「语义技能」四字段与 stageQuery 重合（语义命中）；
+        // 「高保真原型设计」是原型阶段钦定锚点——语义命中存在时不得注入（不再阶段强制）
+        let semanticBody = "语义命中技能正文：SEMANTIC_ONLY_SENTINEL 摸清竞品格局"
+        let semanticPath = tempRoot.appendingPathComponent("semantic-only.md").path
+        try """
+        ---
+        name: 语义技能
+        ---
+        \(semanticBody)
+        """.write(to: URL(fileURLWithPath: semanticPath), atomically: true, encoding: .utf8)
+        let anchorBody = "锚点技能正文：STAGE_ANCHOR_SENTINEL 设计令牌先行再谈配色"
+        let anchorPath = tempRoot.appendingPathComponent("stage-anchor.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        \(anchorBody)
+        """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "语义技能", name: "语义技能",
+            whenToUse: "STAGE_QUERY_NEEDS_COMPETITIVE_LANDSCAPE", docPath: semanticPath
+        )
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时", docPath: anchorPath
+        )
+
+        // skillQuery 缺省回退 stageQuery（旧行为兼容）：语义命中仅语义技能
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "STAGE_QUERY_NEEDS_COMPETITIVE_LANDSCAPE",
+            memoryContext: "", calibration: []
+        ) { "骨架。" + $0 }
+
+        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：语义技能"))
+        // 锚点不注入：语义命中存在 = 意图已表达，阶段不再强制塞技能
+        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertEqual(assembly.skillIds, ["语义技能"])
+        // 计数收口：注入的语义技能 +1，未注入的锚点 0
+        let counts = try await database.dbQueue.read { db -> [String: Int] in
+            var map: [String: Int] = [:]
+            for row in try Row.fetchAll(db, sql: "SELECT id, hit_count FROM skills") {
+                map[row["id"]] = row["hit_count"]
+            }
+            return map
+        }
+        XCTAssertEqual(counts["语义技能"], 1)
+        XCTAssertEqual(counts["高保真原型设计"], 0)
+    }
+
+    func testStageAnchorFallsBackWhenSemanticMisses() async throws {
+        // 语义零命中（skillQuery 与技能四字段零重合）→ 阶段钦定锚点技能兜底注入
+        let anchorBody = "锚点技能正文：STAGE_ANCHOR_SENTINEL 设计令牌先行再谈配色"
+        let anchorPath = tempRoot.appendingPathComponent("stage-anchor.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        \(anchorBody)
+        """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时", docPath: anchorPath
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "零命中查询墨水瓶",
+            memoryContext: "", calibration: []
+        ) { "骨架。" + $0 }
+
+        // 锚点正文兜底注入（主干方法论不因检索失效而缺席）
+        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：高保真原型设计"))
+        XCTAssertTrue(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
+        // 兜底注入计入命中数（正文实际进上下文 = 实际应用）
+        let anchorHits = try await database.dbQueue.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT hit_count FROM skills WHERE id = ?",
+                arguments: ["高保真原型设计"]
+            ) ?? 0
+        }
+        XCTAssertEqual(anchorHits, 1)
+        // 意图 query 留痕（检查器 trace 可观测）
+        let trace = try XCTUnwrap(assembly.retrieval)
+        XCTAssertEqual(trace.skillQuery, "零命中查询墨水瓶")
     }
 
     // MARK: - 5. pitfalls 确定性路由进自检清单（Task 4.8）

@@ -44,7 +44,16 @@ nonisolated enum KeychainStore {
         }
     }
 
-    static func get(_ key: String) -> String? {
+    /// 读取三态：「不存在」与「访问失败」必须区分——沙盒/并行构建重签等环境会把
+    /// 读取整条拒绝（item 完好），若混为 nil，UI 会把失败显示成「未配置」，
+    /// 且空值清理路径可能把真 Key 删掉（2026-09-13 Key「消失」事故根因）。
+    nonisolated enum KeychainRead {
+        case found(String)
+        case notFound
+        case accessFailed(OSStatus)
+    }
+
+    static func read(_ key: String) -> KeychainRead {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -54,8 +63,19 @@ nonisolated enum KeychainStore {
         ]
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard status == errSecSuccess else {
+            return status == errSecItemNotFound ? .notFound : .accessFailed(status)
+        }
+        guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
+            return .notFound
+        }
+        return .found(value)
+    }
+
+    /// 便捷读取：notFound 与 accessFailed 都归 nil（调用方只需要「有没有值」时用）。
+    static func get(_ key: String) -> String? {
+        if case .found(let value) = read(key) { return value }
+        return nil
     }
 
     static func delete(_ key: String) {

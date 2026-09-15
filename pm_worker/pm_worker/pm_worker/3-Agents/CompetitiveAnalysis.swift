@@ -3,7 +3,7 @@
 //  pm_worker
 //
 //  竞品分析分支（Task 3.8）：五要素结构化竞品分析 prompt 构造。
-//  产物走 ```artifact:analysis``` 围栏块，由 ArtifactParser 落盘 05-analysis/competitive-analysis.md。
+//  产物走 ```artifact:analysis``` 围栏块，由 ArtifactParser 落盘 05-analysis/竞品分析.md。
 //
 
 import Foundation
@@ -44,7 +44,7 @@ nonisolated enum CompetitiveAnalysisAgent {
         4. 报告结构：开头一段分析口径说明 → 每个竞品一个小节（含五要素）→ \
         末尾汇总表格（| 竞品名 | 定位 | 核心差异 | 出处 |）→ 一段「对本方向的启示」。
 
-        ## 输出协议（严格遵守，App 会解析落盘到 05-analysis/competitive-analysis.md）
+        ## 输出协议（严格遵守，App 会解析落盘到 05-analysis/竞品分析.md）
         先用 1~2 句话说明检索口径，然后把完整 Markdown 报告放进一个围栏块，\
         标记写在围栏语言位置：
 

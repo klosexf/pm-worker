@@ -4,7 +4,7 @@
 //
 //  版本对比（轻量 MVP，Task 3.7）：选两个版本 → 同名产物左右并排只读展示。
 //  同名产物 = 两版本 stage 子目录（01-requirements…07-reports）下相对路径一致的文件
-//  （覆盖 clarification.md / architecture.md / module-page-map.md / prototype-v1.html / prd-v1.md 等关键产物）。
+//  （覆盖 澄清要点表 / 功能架构图 / 模块-页面映射表 / 可点击原型.html / PRD文档.md 等关键产物）。
 //  不做 diff 算法：.html 用 HTMLPreviewView 渲染，文本类用 ScrollView + Text(monospaced) 并排。
 //  视觉还原 Wave 3-B：两栏 dsCard + 版本标识 brand 高亮 + DSEmptyState。
 //
@@ -48,7 +48,12 @@ struct VersionCompareView: View {
                 }
             }
         }
-        .frame(minWidth: 760, minHeight: 480)
+        // 面板钳在 min–max 之间（ideal 保底尺寸，窗口大于 ideal 时浮卡可长到 max）
+        .frame(
+            minWidth: 760, idealWidth: 1080, maxWidth: 1320,
+            minHeight: 480, idealHeight: 700, maxHeight: 820
+        )
+        .dsDismissOnOutsideTap { dismiss() }  // 点击面板外关闭（与「完成」同动作）
         .onAppear(perform: reload)
         .onChange(of: leftVersion) { _, _ in recomputeArtifacts() }
         .onChange(of: rightVersion) { _, _ in recomputeArtifacts() }
@@ -137,7 +142,7 @@ struct VersionCompareView: View {
         }
     }
 
-    /// 一个版本 stage 子目录下的产物相对路径集合（深度 1：`02-structure/architecture.md`）。
+    /// 一个版本 stage 子目录下的产物相对路径集合（深度 1：`02-structure/功能架构图.md`）。
     private static func artifacts(in versionDir: URL) -> Set<String> {
         let fm = FileManager.default
         var result: Set<String> = []

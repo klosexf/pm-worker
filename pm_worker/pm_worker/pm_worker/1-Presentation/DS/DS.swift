@@ -201,6 +201,9 @@ nonisolated enum AppearanceMode: String, CaseIterable, Identifiable {
     /// NSWindow.effectiveAppearance（DS 令牌 / vibrancy / popover 全不跟随），
     /// 改以应用级 appearance 为单一事实源：覆盖所有窗口与浮层，全链路生效。
     /// 注意用 NSApplication.shared 而非 NSApp：App.init 阶段 NSApp 全局指针尚未初始化（nil IUO，取用即崩）。
+    /// @MainActor：枚举本体 nonisolated（值模型隔离坑），但 NSApplication.shared
+    /// 是 MainActor 隔离的——写 appearance 必须回主隔离域；调用点均在主线程。
+    @MainActor
     static func applyAppKitAppearance(_ raw: String?) {
         let mode = AppearanceMode(rawValue: raw ?? "") ?? .system
         NSApplication.shared.appearance = mode.appKitAppearanceName.flatMap { NSAppearance(named: $0) }
@@ -283,10 +286,12 @@ enum DS {
         static let bodyMDStrong = SwiftUI.Font.system(size: 14, weight: .medium)
         static let bodyBase = SwiftUI.Font.system(size: 15, weight: .regular)
         static let bodyBaseStrong = SwiftUI.Font.system(size: 15, weight: .medium)
-        /// 对话阅读字号（2026-09-12 用户反馈 15 长读疲劳 → +2 层级至 17）：
-        /// 对话流正文（AI 回答 Markdown / 用户气泡）专用，与正文排版节奏配套。
-        static let chatBase = SwiftUI.Font.system(size: 17, weight: .regular)
-        static let chatBaseStrong = SwiftUI.Font.system(size: 17, weight: .medium)
+        /// 对话阅读字号（2026-09-13 方案 B「清晰梯度」：17 → 15 收敛正文——
+        /// 17 与表格 15 并置是「忽大忽小」的根源之一；层级改由导语 / 章节 /
+        /// 表格的收敛阶梯承担，见 DS.Typography 对话令牌组与 MarkdownText 映射。
+        /// 对话流正文（AI 回答 Markdown / 用户气泡 / 输入框）专用）。
+        static let chatBase = SwiftUI.Font.system(size: 15, weight: .regular)
+        static let chatBaseStrong = SwiftUI.Font.system(size: 15, weight: .medium)
         static let bodyLG = SwiftUI.Font.system(size: 20, weight: .regular)
 
         // heading 系（600）
@@ -301,13 +306,17 @@ enum DS {
         /// 与 SF Pro 正文形成杂志排版对比（Craft/Mela 式高级感）。
         static let displayMD = SwiftUI.Font.system(size: 21, weight: .semibold, design: .serif)
         static let displayLG = SwiftUI.Font.system(size: 34, weight: .semibold, design: .serif)
+        /// 档案索引衬线小号（侧栏任务列表项目行 · 档案方案）：display 系最小档。
+        static let display2XS = SwiftUI.Font.system(size: 15, weight: .semibold, design: .serif)
 
         /// 等宽（--code-editor：JetBrains Mono 打包进 bundle · OFL 许可 ·
         /// pm_workerApp.init 显式注册；非拉丁字符自动级联系统字体（中文回落苹方））。
         static let mono = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 13)
-        /// 对话代码块字号（随 chatBase 17 同步上移一档）。
-        static let monoLG = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 14)
+        /// 对话代码块字号（随 chatBase 15 同档：14 → 13，压缩与正文 15 的落差）。
+        static let monoLG = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 13)
         static let monoSM = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 12)
+        /// 档案索引 mono 小标签（01 索引 / VER / SEALED · 档案方案）。
+        static let mono2XS = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 11)
     }
 
     /// 动效令牌（高级感升级：spring 物理取代 ease 曲线——机械感是廉价感来源之一）。
@@ -341,6 +350,24 @@ enum DS {
         /// 列表行间距。
         static let listRowSpacing: CGFloat = DS.Spacing.s8
 
+        // 对话 Markdown 排版（2026-09-13 方案 B「清晰梯度」）：
+        // 层级 = 收敛字号阶梯 + 样式差协同，替代旧六级 1px 微差梯度——
+        // 16 导语（首段加粗 / h1·h2）/ 15 正文与章节（h3·h4 带品牌刻度线）/
+        // 13 小节标签（h5·h6 次级色）/ 13.5 表格 / 12.5 行内代码 / 13 代码块。
+        // 规则：相邻可见级差 ≥1px 且必伴一样样式差（刻度线 / 颜色 / 字重）。
+        /// 对话正文行高比例（比全局 body 1.45 宽松一档，15pt 长读舒适线）。
+        static let chatRatio: CGFloat = 1.62
+        /// 导语 / 结论行（消息首段含加粗，或 h1 / h2）。
+        static let chatLeadSize: CGFloat = 16
+        /// 章节标题（h3 / h4，前置 3×13 品牌刻度线）。
+        static let chatSectionSize: CGFloat = 15
+        /// 小节标签（h5 / h6，次级色）。
+        static let chatLabelSize: CGFloat = 13
+        /// 表格单元格字号（表头再小一档）。
+        static let chatTableSize: CGFloat = 13.5
+        /// 表格表头字号（semibold + 小号 = 小标签气质）。
+        static let chatTableHeaderSize: CGFloat = 12.5
+
         /// 行间距换算：目标行高比例 → SwiftUI lineSpacing 值。
         static func leading(for size: CGFloat, ratio: CGFloat = bodyRatio) -> CGFloat {
             max(0, (ratio - 1.2) * size)
@@ -351,11 +378,12 @@ enum DS {
 // MARK: - 排版修饰符（行高 / 字距令牌出口）
 
 extension Text {
-    /// 编辑级正文排版：行高 1.8 + 中文微字距。须在 textSelection 等 View 修饰符之前链
+    /// 编辑级正文排版：中文微字距 + 行高比例（默认全局 1.45；对话流传
+    /// DS.Typography.chatRatio）。须在 textSelection 等 View 修饰符之前链
     ///（tracking 是 Text 专有方法）。
-    func dsBodyType(size: CGFloat) -> some View {
+    func dsBodyType(size: CGFloat, ratio: CGFloat = DS.Typography.bodyRatio) -> some View {
         tracking(DS.Typography.bodyTracking)
-            .lineSpacing(DS.Typography.leading(for: size))
+            .lineSpacing(DS.Typography.leading(for: size, ratio: ratio))
     }
 
     /// 辅助 / 说明文字排版：行高 1.6、零字距（多行 caption 场景）。

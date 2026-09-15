@@ -4,8 +4,9 @@
 //
 //  「这条记下来」弹窗（Task 4.4，E10）：归属分流——
 //  方法论卡片（全局卡片库，跨项目直接用不降级）/
-//  经验记忆（记忆层「经验」，跨项目假设态注入），
-//  默认判定可改 + 置信度滑杆。
+//  经验记忆（记忆层「经验」，跨项目假设态注入）。
+//  不暴露置信度控件：经验一律按假设态沉淀（初始置信度 0.7），
+//  置信度由使用校准自动升降（MemoryStore.applyExperienceCalibration）。
 //  视觉还原 Wave 3-B：.ds-dialog 质感（白底 r12 大软阴影 + overlay 背板）、
 //  DSTabs 胶囊分流、DS 按钮。
 //
@@ -31,7 +32,7 @@ struct BookmarkCapture: Equatable {
             case .card:
                 return "可跨项目复用的「怎么做事」→ 全局卡片库（cards/），跨项目直接用不降级"
             case .experience:
-                return "带项目出处的个人使用倾向 → 记忆层「经验」，使用方法论时按假设态注入校准"
+                return "带项目出处的个人使用倾向 → 记忆层「经验」，假设态沉淀；使用方法论时注入校准，随使用结果自动升降置信度"
             }
         }
     }
@@ -40,8 +41,6 @@ struct BookmarkCapture: Equatable {
     var text: String
     /// 归属分流目标（默认判定可改）
     var destination: Destination
-    /// 置信度 0-1
-    var confidence: Double
 
     /// 默认归属判定（确定性规则，弹窗中可改）：
     /// 出现个人化倾向词（踩坑 / 教训 / 下次…）→ 经验记忆；其余 → 方法论卡片。
@@ -51,7 +50,7 @@ struct BookmarkCapture: Equatable {
     }
 }
 
-/// 「这条记下来」归属分流弹窗（E10：含归属分流、默认判定可改、置信度）。
+/// 「这条记下来」归属分流弹窗（E10：含归属分流、默认判定可改；置信度由使用校准）。
 struct KnowledgeCaptureSheet: View {
     @Binding var isPresented: Bool
 
@@ -63,7 +62,6 @@ struct KnowledgeCaptureSheet: View {
 
     @State private var text: String
     @State private var destination: BookmarkCapture.Destination
-    @State private var confidence: Double = 0.8
     @FocusState private var textFocused: Bool
 
     init(
@@ -106,11 +104,10 @@ struct KnowledgeCaptureSheet: View {
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(DS.Spacing.s16)
-        .presentationBackground(Color.overlayL4)
+        .dsDismissOnOutsideTap { isPresented = false }  // 点击面板外关闭（与关闭钮/取消钮同动作）
     }
 
-    /// 对话框 body：捕获文本 + 归属分流 + 置信度。
+    /// 对话框 body：捕获文本 + 归属分流。
     private var dialogContent: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s16) {
             // 捕获文本（.ds-textarea：白底聚焦黑边）
@@ -135,20 +132,6 @@ struct KnowledgeCaptureSheet: View {
                     .foregroundStyle(Color.ink500)
                     .fixedSize(horizontal: false, vertical: true)
             }
-
-            // 置信度
-            VStack(alignment: .leading, spacing: DS.Spacing.s4) {
-                HStack {
-                    Text("置信度")
-                        .font(DS.Font.bodySM)
-                        .foregroundStyle(Color.ink700)
-                    Spacer()
-                    Text(String(format: "%.1f", confidence))
-                        .font(DS.Font.monoSM)
-                        .foregroundStyle(Color.ink500)
-                }
-                DSSlider(value: $confidence, range: 0...1, step: 0.1)
-            }
         }
     }
 
@@ -160,9 +143,7 @@ struct KnowledgeCaptureSheet: View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         onSave(
-            BookmarkCapture(
-                text: trimmed, destination: destination, confidence: confidence
-            )
+            BookmarkCapture(text: trimmed, destination: destination)
         )
         isPresented = false
     }

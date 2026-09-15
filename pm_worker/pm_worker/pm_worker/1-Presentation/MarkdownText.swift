@@ -9,8 +9,11 @@
 //  · 行内富文本 MarkdownParser.inline——Foundation 原生 AttributedString(markdown:)
 //    （CommonMark 语义：**粗体** / __粗体__ / *斜体* / `行内代码` / ~~删除~~ /
 //    [链接](url)，含嵌套与转义），解析失败回退纯文本保证渲染稳定
-//  · 渲染 MarkdownText——DS 令牌排版：标题 20/17/15/14/13/12 semibold 拉开层级，
-//    代码块带语言标签 + 复制钮（复制后 ✓ 反馈），表格 overlayL1 表头 + 行分隔线。
+//  · 渲染 MarkdownText——DS 令牌排版（2026-09-13 方案 B「清晰梯度」，见
+//    DS.Typography 对话令牌组）：层级 = 收敛字号阶梯 + 样式差协同——
+//    导语 16（首段含加粗 / h1·h2）、正文与章节 15（h3·h4 带品牌刻度线）、
+//    小节标签 13（h5·h6 次级色）、表格 13.5（表头 12.5 semibold）、
+//    行内代码 12.5、代码块 mono 13。代码块带语言标签 + 复制钮（复制后 ✓ 反馈）。
 //    全部颜色走 DS 动态令牌，深浅色模式自适应。
 //
 
@@ -190,6 +193,8 @@ nonisolated enum MarkdownParser {
 
     /// 行内 Markdown → AttributedString（DS 排版：粗体 semibold、
     /// 行内代码 mono 品牌色 + overlayL1 底、链接品牌色下划线可点、删除线）。
+    /// 每个 run 都显式带字体（含无行内标记的纯文本 run）——调用方（dsBodyType
+    /// 等）只设行距不设字体，漏带会让 Text 退回系统默认字号、字号阶梯失效。
     /// - Parameters:
     ///   - size: 基准字号（行内代码等比缩小）
     ///   - weight: 基础字重（标题传 semibold 时正文继承）
@@ -212,23 +217,23 @@ nonisolated enum MarkdownParser {
         } catch {
             // 解析失败（如未闭合的 [链接）→ 纯文本兜底，保证渲染永不崩
             var plain = AttributedString(text)
+            plain.font = Font.system(size: size, weight: weight)
             if let textColor { plain.foregroundColor = textColor }
             return plain
         }
 
-        let runs = Array(attr.runs)
-        for run in runs {
+        for run in attr.runs {
             let range = run.range
-            guard let intent = run.inlinePresentationIntent else { continue }
-            let isBold = intent.contains(.stronglyEmphasized)
-            let isItalic = intent.contains(.emphasized)
-            let isCode = intent.contains(.code)
-            let isStrike = intent.contains(.strikethrough)
+            let intent = run.inlinePresentationIntent
+            let isBold = intent?.contains(.stronglyEmphasized) ?? false
+            let isItalic = intent?.contains(.emphasized) ?? false
+            let isCode = intent?.contains(.code) ?? false
+            let isStrike = intent?.contains(.strikethrough) ?? false
 
-            // 字体：代码 mono（缩小一档）/ 文本按粗斜组合出字重
+            // 字体：代码 mono（缩小两档半，随正文 15 → 12.5）/ 文本按粗斜组合出字重
             let font: Font
             if isCode {
-                font = Font.custom("JetBrainsMono-Regular", size: max(size - 1.5, 10))
+                font = Font.custom("JetBrainsMono-Regular", size: max(size - 2.5, 10))
             } else {
                 var f = Font.system(size: size, weight: isBold ? .semibold : weight)
                 if isItalic { f = f.italic() }
@@ -377,45 +382,231 @@ nonisolated enum MarkdownParser {
 
 // MARK: - 渲染视图
 
-/// 对话内容 Markdown 渲染。块级 VStack，正文 chatBase 17（行距 1.45×），
-/// 标题 20/18/17/16/15/14 semibold（聊天语境梯度，层级靠字重+间距协同），
-/// 代码块 / 表格 / 引用 / 列表独立样式。
+/// 对话内容 Markdown 渲染（方案 B「清晰梯度」）：块级 VStack，正文 chatBase 15
+/// （行距 1.62×），导语 16、章节 15 + 刻度线、小节标签 13、表格 13.5、
+/// 行内代码 12.5、代码块 mono 13——收敛阶梯 + 样式差协同承担层级。
+/// 跨块连续选取：相邻正文块（标题/段落/列表）聚合为 ProseTextView 合并渲染成
+/// 单个 Text——SwiftUI textSelection 只在单个 Text 内生效，逐块独立 Text 时
+/// macOS 拖选跨行即断（只能一块一块选，见 ThinkingCard 同款教训）；块间间距
+/// 以排版空行近似。表格 / 代码块 / mermaid / 引用仍为独立块（Text 无法表达）。
+/// 块级视图以 block 值做等价短路（.equatable()）：流式正文增长是 append-only
+/// 的，稳定前缀段（含其 AttributedString 构建）在每次 tick 重渲染时全部跳过，
+/// 只有尾部生长中的段重算。
 struct MarkdownText: View {
     let text: String
-    /// 段落基准字号（默认 chatBase 17）。
-    var bodySize: CGFloat = 17
+    /// 段落基准字号（默认 chatBase 15）。
+    var bodySize: CGFloat = 15
+    /// true = mermaid 围栏直接内联渲染；false（流式期间）= 降级为代码块——
+    /// 流式中的 mermaid 源未闭合、逐 tick 变化，内联渲染会让 WKWebView
+    /// 每次快照都整页重载，等流结束（正式条目）再渲染图表。
+    var liveMermaid: Bool = true
 
-    init(_ text: String, bodySize: CGFloat = 17) {
+    init(_ text: String, bodySize: CGFloat = 15, liveMermaid: Bool = true) {
         self.text = text
         self.bodySize = bodySize
+        self.liveMermaid = liveMermaid
     }
 
     var body: some View {
         let blocks = MarkdownParser.parseBlocks(text)
+        let segments = Self.segments(from: blocks)
         VStack(alignment: .leading, spacing: DS.Typography.paragraphSpacing) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                blockView(block, isFirst: index == 0)
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
+                switch segment {
+                case .prose(let blocks, let firstIndex):
+                    ProseTextView(blocks: blocks, firstIndex: firstIndex, bodySize: bodySize)
+                        .equatable()
+                case .single(let block):
+                    MarkdownBlockView(block: block, bodySize: bodySize, liveMermaid: liveMermaid)
+                        .equatable()
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func blockView(_ block: MarkdownParser.Block, isFirst: Bool) -> some View {
+    /// 渲染段：连续正文块聚合（合并选取），结构块（表格/代码/mermaid/引用/
+    /// 分隔线）逐块独立渲染。
+    private enum Segment {
+        case prose(blocks: [MarkdownParser.Block], firstIndex: Int)
+        case single(MarkdownParser.Block)
+    }
+
+    private static func segments(from blocks: [MarkdownParser.Block]) -> [Segment] {
+        var segments: [Segment] = []
+        var prose: [MarkdownParser.Block] = []
+        var proseStart = 0
+
+        func flush() {
+            guard !prose.isEmpty else { return }
+            segments.append(.prose(blocks: prose, firstIndex: proseStart))
+            prose = []
+        }
+
+        for (index, block) in blocks.enumerated() {
+            switch block {
+            case .heading, .paragraph, .list:
+                if prose.isEmpty { proseStart = index }
+                prose.append(block)
+            case .quote, .code, .divider, .table:
+                flush()
+                segments.append(.single(block))
+            }
+        }
+        flush()
+        return segments
+    }
+}
+
+// MARK: - 合并正文段（跨块连续选取的关键）
+
+/// 连续正文块（标题 / 段落 / 列表）合并为单个 Text 渲染。层级信息全部内联进
+/// run：标题字号 / 字重 / 颜色、h3·h4 品牌刻度线（▏字符近似原 Capsule）、
+/// 导语升档、列表标记与缩进；块间间距以「空行 run」近似原 VStack spacing
+/// （SwiftUI Text 表达不了段落间距，单 \n 的可视间距只有行距附加量）。
+private struct ProseTextView: View, Equatable {
+    let blocks: [MarkdownParser.Block]
+    /// 首块在整条消息中的 index（0 = 消息开头 → 首段含加粗升导语）。
+    let firstIndex: Int
+    let bodySize: CGFloat
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.blocks == rhs.blocks
+            && lhs.firstIndex == rhs.firstIndex
+            && lhs.bodySize == rhs.bodySize
+    }
+
+    var body: some View {
+        Text(attributed)
+            .dsBodyType(size: bodySize, ratio: DS.Typography.chatRatio)
+            .foregroundStyle(Color.ink900)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var attributed: AttributedString {
+        var out = AttributedString()
+        for (offset, block) in blocks.enumerated() {
+            if offset > 0 {
+                let target: CGFloat = if case .heading = block {
+                    DS.Typography.paragraphSpacing + DS.Typography.headingTop
+                } else {
+                    DS.Typography.paragraphSpacing
+                }
+                out += Self.gap(target, bodySize: bodySize)
+            }
+            out += Self.blockRun(
+                block,
+                isMessageFirst: firstIndex == 0 && offset == 0,
+                bodySize: bodySize
+            )
+        }
+        return out
+    }
+
+    /// 块间 / 列表项间空行：单 \n 的可视间距 = 行距附加量 leading(for:chatRatio)
+    /// （≈6.3@15pt）；目标间距更大时插入一行以字号撑高的空行（行高 ≈1.21×字号）
+    /// 抬到原 VStack 间距节奏（段间 14、标题前 26）。列表行间距 8 小于
+    /// 2×leading → 单 \n 即可（6.3，与原值差 1.7pt）。
+    private static func gap(_ target: CGFloat, bodySize: CGFloat) -> AttributedString {
+        let leading = DS.Typography.leading(for: bodySize, ratio: DS.Typography.chatRatio)
+        let spacer = (target - 2 * leading) / 1.21
+        var g = AttributedString("\n")
+        if spacer > 1 {
+            var line = AttributedString("\n")
+            line.font = Font.system(size: spacer)
+            g += line
+        }
+        return g
+    }
+
+    /// 单个正文块 → 内联富文本 run。
+    private static func blockRun(
+        _ block: MarkdownParser.Block,
+        isMessageFirst: Bool,
+        bodySize: CGFloat
+    ) -> AttributedString {
         switch block {
         case .heading(let level, let text):
-            heading(level, text, isFirst: isFirst)
+            let size: CGFloat = switch level {
+            case 1, 2: DS.Typography.chatLeadSize
+            case 3, 4: DS.Typography.chatSectionSize
+            default: DS.Typography.chatLabelSize
+            }
+            var attr = MarkdownParser.inline(
+                text, size: size, weight: .semibold,
+                textColor: level >= 5 ? Color.ink700 : Color.ink900
+            )
+            // 品牌刻度线（原 3×13 Capsule）：文本字符近似，保住正文合并选取
+            if level == 3 || level == 4 {
+                var tick = AttributedString("▏ ")
+                tick.font = Font.system(size: size)
+                tick.foregroundColor = Color.brandAccent
+                attr = tick + attr
+            }
+            return attr
 
         case .paragraph(let text):
-            Text(MarkdownParser.inline(text, size: bodySize))
-                .dsBodyType(size: bodySize)
-                .foregroundStyle(Color.ink900)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            // 导语 / 结论行：消息首个段落且含加粗 → 升半档（16）。
+            let isLead = isMessageFirst && text.contains("**")
+            let size: CGFloat = isLead
+                ? min(bodySize + 1, DS.Typography.chatLeadSize)
+                : bodySize
+            return MarkdownParser.inline(text, size: size, textColor: Color.ink900)
 
+        case .list(let items):
+            var out = AttributedString()
+            for (index, item) in items.enumerated() {
+                if index > 0 {
+                    out += Self.gap(DS.Typography.listRowSpacing, bodySize: bodySize)
+                }
+                // 嵌套缩进：原 18pt/层 ≈ 全角空格宽度（字号级），用 em space 近似
+                var indent = AttributedString(
+                    String(repeating: "\u{2003}", count: item.level)
+                )
+                indent.font = Font.system(size: bodySize)
+                out += indent
+                var marker = AttributedString(item.ordered ? "\(item.number). " : "•  ")
+                marker.font = Font.system(size: bodySize)
+                marker.foregroundColor = Color.ink500
+                out += marker
+                out += MarkdownParser.inline(item.text, size: bodySize, textColor: Color.ink900)
+            }
+            return out
+
+        case .quote, .code, .divider, .table:
+            // 正文聚合只含标题 / 段落 / 列表，其余块走 MarkdownBlockView
+            return AttributedString()
+        }
+    }
+}
+
+// MARK: - 结构块（表格 / 代码 / mermaid / 引用 / 分隔线）
+
+/// 单个结构块的渲染：Equatable + .equatable() 让未变块在流式 tick 间跳过重渲染。
+/// 标题 / 段落 / 列表已并入 ProseTextView（跨块连续选取），此处不再处理。
+private struct MarkdownBlockView: View, Equatable {
+    let block: MarkdownParser.Block
+    let bodySize: CGFloat
+    let liveMermaid: Bool
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.block == rhs.block
+            && lhs.bodySize == rhs.bodySize
+            && lhs.liveMermaid == rhs.liveMermaid
+    }
+
+    @ViewBuilder
+    var body: some View {
+        switch block {
         case .code(let language, let code) where language?.lowercased() == "mermaid":
-            // mermaid 围栏块 → 图表直接内联渲染（本地 mermaid.min.js，无需点击预览）
-            MermaidFigureCard(source: code)
+            // mermaid 围栏块 → 图表直接内联渲染（本地 mermaid.min.js，无需点击预览）；
+            // 流式期间（liveMermaid = false）降级为代码块，见 MarkdownText.liveMermaid
+            if liveMermaid {
+                MermaidFigureCard(source: code)
+            } else {
+                MarkdownCodeBlock(language: language, code: code)
+            }
 
         case .code(let language, let code):
             MarkdownCodeBlock(language: language, code: code)
@@ -426,7 +617,7 @@ struct MarkdownText: View {
                     .fill(Color.borderL3)
                     .frame(width: 3)
                 Text(MarkdownParser.inline(text, size: bodySize - 1))
-                    .dsBodyType(size: bodySize - 1)
+                    .dsBodyType(size: bodySize - 1, ratio: DS.Typography.chatRatio)
                     .foregroundStyle(Color.ink700)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -436,65 +627,20 @@ struct MarkdownText: View {
             DSDivider()
                 .padding(.vertical, DS.Spacing.s2)
 
-        case .list(let items):
-            VStack(alignment: .leading, spacing: DS.Typography.listRowSpacing) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    listItemRow(item)
-                }
-            }
-
         case .table(let header, let rows, let aligns):
-            MarkdownTableView(header: header, rows: rows, aligns: aligns, bodySize: bodySize - 2)
-        }
-    }
+            MarkdownTableView(header: header, rows: rows, aligns: aligns, bodySize: bodySize - 1.5)
 
-    /// 标题：字号按层级递减（20/18/17/16/15/14，聊天语境收敛梯度），1-2 级紧字距；
-    /// 非首个 block 时上方额外间距（headingTop）与正文断开分层。
-    private func heading(_ level: Int, _ text: String, isFirst: Bool) -> some View {
-        let size: CGFloat = switch level {
-        case 1: 20
-        case 2: 18
-        case 3: 17
-        case 4: 16
-        case 5: 15
-        default: 14
+        case .heading, .paragraph, .list:
+            // 已并入 ProseTextView（见 segments 聚合），不会到达
+            EmptyView()
         }
-        let attr = MarkdownParser.inline(text, size: size, weight: .semibold)
-        return Group {
-            // tracking 是 Text 专有方法——须在 View 修饰符之前链
-            if level <= 2 {
-                Text(attr).tracking(-0.3)
-            } else {
-                Text(attr)
-            }
-        }
-        .foregroundStyle(Color.ink900)
-        .textSelection(.enabled)
-        .fixedSize(horizontal: false, vertical: true)
-        .padding(.top, isFirst ? 0 : DS.Typography.headingTop)
-    }
-
-    /// 列表项：标记列右对齐（• / 1.），嵌套按 level 缩进 18/层。
-    private func listItemRow(_ item: MarkdownParser.ListItem) -> some View {
-        HStack(alignment: .top, spacing: DS.Spacing.s6) {
-            Text(item.ordered ? "\(item.number)." : "•")
-                .font(.system(size: bodySize))
-                .foregroundStyle(Color.ink500)
-                .frame(minWidth: item.ordered ? 20 : 10, alignment: .trailing)
-            Text(MarkdownParser.inline(item.text, size: bodySize))
-                .dsBodyType(size: bodySize)
-                .foregroundStyle(Color.ink900)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.leading, CGFloat(item.level) * 18)
     }
 }
 
 // MARK: - 代码块（语言标签 + 复制钮 + mono 源码）
 
 /// 对话内围栏代码块：surfaceTertiary 凹槽底（深浅色均比助手卡深一档）、
-/// 头部语言标签 + 复制钮（复制后 ✓ 1.4s）、mono 14 正文可选中（随正文 17 同步上移）。
+/// 头部语言标签 + 复制钮（复制后 ✓ 1.4s）、mono 13 正文可选中（随正文 15 同档收敛）。
 /// 不内滚——长行折行，overflow 由外层消息 ScrollView 承担。
 struct MarkdownCodeBlock: View {
     let language: String?
@@ -569,23 +715,27 @@ struct MarkdownCodeBlock: View {
 
 // MARK: - 表格（表头浅底 + 行分隔线）
 
-/// 管道表格：surfaceBase 底（助手卡上的凹进白盘）、表头 overlayL1 浅底 +
-/// 行分隔线、列按 :---: 对齐。Grid 保证跨行列宽对齐。
+/// 管道表格：surfaceBase 底（助手卡上的凹进白盘）、表头 overlayL1 浅底小号
+/// semibold（12.5 小标签气质）+ 行分隔线、列按 :---: 对齐。Grid 保证跨行列宽对齐。
 struct MarkdownTableView: View {
     let header: [String]
     let rows: [[String]]
     let aligns: [MarkdownParser.TableAlign]
-    var bodySize: CGFloat = 13
+    var bodySize: CGFloat = 13.5
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
             GridRow {
                 ForEach(Array(header.enumerated()), id: \.offset) { index, cell in
-                    cellText(cell, index: index, weight: .medium)
-                        .background(Color.overlayL1)
-                        .overlay(alignment: .bottom) {
-                            dividerLine
-                        }
+                    cellText(
+                        cell, index: index,
+                        weight: .semibold,
+                        size: DS.Typography.chatTableHeaderSize
+                    )
+                    .background(Color.overlayL1)
+                    .overlay(alignment: .bottom) {
+                        dividerLine
+                    }
                 }
             }
             ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
@@ -601,14 +751,14 @@ struct MarkdownTableView: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: DS.Radius.md)
+            RoundedRectangle(cornerRadius: DS.Radius.lg)
                 .fill(Color.surfaceBase)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.md)
+            RoundedRectangle(cornerRadius: DS.Radius.lg)
                 .strokeBorder(Color.borderL1, lineWidth: 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.md))
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
     }
 
     private var dividerLine: some View {
@@ -618,21 +768,23 @@ struct MarkdownTableView: View {
     }
 
     /// 单元格：列对齐（aligns 缺失按左对齐）、行内 Markdown 生效。
+    /// 表头传小号字号（chatTableHeaderSize）+ semibold。
     private func cellText(
-        _ text: String, index: Int, weight: Font.Weight
+        _ text: String, index: Int, weight: Font.Weight, size: CGFloat? = nil
     ) -> some View {
         let align: Alignment = switch (index < aligns.count ? aligns[index] : .left) {
         case .center: .center
         case .right: .trailing
         case .left: .leading
         }
-        return Text(MarkdownParser.inline(text, size: bodySize, weight: weight))
-            .lineSpacing(DS.Typography.leading(for: bodySize, ratio: DS.Typography.tableRatio))
+        let fontSize = size ?? bodySize
+        return Text(MarkdownParser.inline(text, size: fontSize, weight: weight))
+            .lineSpacing(DS.Typography.leading(for: fontSize, ratio: DS.Typography.tableRatio))
             .foregroundStyle(Color.ink900)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, minHeight: 26, alignment: align)
-            .padding(.horizontal, DS.Spacing.s10)
-            .padding(.vertical, DS.Spacing.s6)
+            .frame(maxWidth: .infinity, minHeight: 28, alignment: align)
+            .padding(.horizontal, DS.Spacing.s12)
+            .padding(.vertical, DS.Spacing.s8)
     }
 }

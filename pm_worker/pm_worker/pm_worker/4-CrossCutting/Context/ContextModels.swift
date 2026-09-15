@@ -75,6 +75,9 @@ nonisolated struct ContextAssembly: Codable, Equatable {
     var pitfalls: [PitfallsRouter.Entry]
     /// 组装时间戳。
     var createdAt: String
+    /// 本次实际注入的技能 id（按相关度降序、过预算裁剪后的口径）——
+    /// 思考卡「引用技能」展示的数据源；默认空兼容既有构造点。
+    var skillIds: [String] = []
 }
 
 /// 分支触发记录（检查器「分支技能触发记录」：竞品分析/毒舌评审等）。

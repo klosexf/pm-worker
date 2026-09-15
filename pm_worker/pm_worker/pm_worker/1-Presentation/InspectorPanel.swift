@@ -3,24 +3,27 @@
 //  pm_worker
 //
 //  右栏四 Tab 面板（design.md §6.4 v0.9.2）：产物 / 决策日志 / 漏项雷达 / 知识点。
-//  产物 Tab 预览项目文件树，点击 .html 用 HTMLPreviewView 预搭组件打开（E21）；
-//  决策日志 / 漏项雷达读 decisions.jsonl / risks.jsonl 真实数据
-//  （DecisionLogTab / RiskRadarTab）；知识点为检索 + 命中卡 + 主动推荐完整版
+//  方案 A 分区台账容器：「产物」台账（01~07 编号目录内的 .md/.html/.mmd
+//  按类归档 + 筛选 chips + hover 预览/定位）与「工作空间文件」档案树
+//  （版本目录全量内容，含产物目录与产物文件，面包屑标注磁盘目录，
+//  文件夹可展开折叠）上下双区布局，中间可拖分隔条调整高度占比（比例持久化，
+//  双击复位）。
+//  决策日志 / 风险读 decisions.jsonl / risks.jsonl 真实数据
+//  （DecisionLogTab / RiskRadarTab 风险台账）；知识点为检索 + 命中卡 + 主动推荐完整版
 //  （Task 4.6，KnowledgeTab）。底部常驻 ⌘D 入口打开开发者检查器窗口。
 //
 
 import SwiftUI
+import Combine
 
 struct InspectorPanel: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @State private var tab: InspectorTab = .artifacts
-    @State private var previewTarget: FileNode?
 
     enum InspectorTab: String, CaseIterable, Identifiable {
-        case artifacts = "产物"
+        case artifacts = "文件"
         case decisions = "决策日志"
-        case radar = "漏项雷达"
+        case radar = "风险"
         case knowledge = "知识点"
 
         var id: String { rawValue }
@@ -38,7 +41,7 @@ struct InspectorPanel: View {
                         DSTabItem(InspectorTab.radar, InspectorTab.radar.rawValue),
                         DSTabItem(InspectorTab.knowledge, InspectorTab.knowledge.rawValue),
                     ],
-                    selection: $tab
+                    selection: $model.inspectorTab
                 )
 
                 TopBarIconButton(name: .panelRight, flipX: false) {
@@ -55,13 +58,13 @@ struct InspectorPanel: View {
             // 每个 Tab 内容统一撑满剩余高度（空态 DSEmptyState 居中不塌缩，
             // 底部工具条恒定贴底——消除切换 Tab 时面板高度跳动）。
             Group {
-                switch tab {
+                switch model.inspectorTab {
                 case .artifacts:
                     artifactsTab
                 case .decisions:
                     DecisionLogTab()
                 case .radar:
-                    RiskRadarTab()
+                    RiskLedgerTab()
                 case .knowledge:
                     KnowledgeTab()
                 }
@@ -95,27 +98,16 @@ struct InspectorPanel: View {
             .padding(.vertical, DS.Spacing.s6)
         }
         .frame(minWidth: 240)
-        .sheet(item: $previewTarget) { node in
-            if node.url.pathExtension.lowercased() == "html" {
-                HTMLPreviewSheet(title: node.name, fileURL: node.url)
-            } else {
-                MermaidPreviewSheet(title: node.name, fileURL: node.url)
-            }
-        }
     }
 
-    // MARK: - 产物 Tab（项目文件树只读预览）
+    // MARK: - 产物 Tab（方案 A 分区台账：产物在上 / 工作空间文件在下）
 
     private var artifactsTab: some View {
         Group {
             if let ctx = model.selection.inspectorProject {
                 // 「默认」兜底容器同样可浏览：产物落了盘就该能看（文件树只读
                 // 该项目自己的目录，不回退显示其他项目，无 scope 串味）。
-                ArtifactTreeView(
-                    project: ctx.project,
-                    version: ctx.version,
-                    onOpenFile: { previewTarget = $0 }
-                )
+                ArtifactsPanelView(project: ctx.project, version: ctx.version)
             } else {
                 // 未定位到任何项目上下文（新任务页等）：空态。
                 DSEmptyState(
@@ -164,65 +156,241 @@ struct InspectorExpandButton: View {
     }
 }
 
-/// 文件树节点（只读投影）。
-struct FileNode: Identifiable, Hashable {
+/// 文件树节点（只读投影；nonisolated 纯数据，供扫描纯函数与测试共用）。
+nonisolated struct FileNode: Identifiable, Hashable {
     var name: String
     var url: URL
     var isDirectory: Bool
     var children: [FileNode]?
+    /// 文件体量（目录为 nil），工作空间行 hover 元信息用。
+    var sizeBytes: Int?
 
     var id: String { url.path }
+
+    init(
+        name: String, url: URL, isDirectory: Bool,
+        children: [FileNode]? = nil, sizeBytes: Int? = nil
+    ) {
+        self.name = name
+        self.url = url
+        self.isDirectory = isDirectory
+        self.children = children
+        self.sizeBytes = sizeBytes
+    }
 }
 
-// MARK: - 文件树
+// MARK: - 产物面板（双分区容器）
 
-struct ArtifactTreeView: View {
+/// 方案 A 分区台账容器：「产物」台账与「工作空间文件」档案树上下双区布局，
+/// 中间夹一条可拖分隔条（拖动实时调整两区高度占比，双击复位，比例持久化）。
+/// 预览 sheet（html → HTMLPreview，其余 → Mermaid）由本视图持有。
+struct ArtifactsPanelView: View {
+
     let project: String
     let version: String
-    let onOpenFile: (FileNode) -> Void
 
-    @State private var root: FileNode?
+    private static let ratioKey = "pm.worker.inspector.ledgerRatio"
+    private static let minRatio: CGFloat = 0.15
+    private static let maxRatio: CGFloat = 0.85
+    private static let defaultRatio: CGFloat = 0.55
+    /// 分隔条抓取条带高度：肉眼可瞄准的宽度（1pt 发丝线居中，整条可按）。
+    private static let handleHeight: CGFloat = 22
+
+    @State private var entries: [ArtifactEntry] = []
+    @State private var workspace: FileNode?
     @State private var selectedID: String?
+    @State private var previewTarget: FileNode?
+    @State private var reloadToken = 0
+
+    /// 台账区占可用高度的比例（拖动 1:1 跟踪，不参与动画，避免拖拽闪烁）。
+    @State private var ratio: CGFloat = {
+        let stored = UserDefaults.standard.object(
+            forKey: "pm.worker.inspector.ledgerRatio"
+        ) as? Double ?? 0.55
+        return CGFloat(min(max(stored, 0.15), 0.85))
+    }()
+    @State private var dragStartRatio: CGFloat = 0
+    @State private var isDragging = false
+    @State private var handleHovered = false
+
+    private var clampedRatio: CGFloat {
+        min(max(ratio, Self.minRatio), Self.maxRatio)
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 项目路径面包屑（原型 .ds-breadcrumb：段可点 → Finder · 末段 current 高亮）
-            DSBreadcrumb(segments: Self.pathSegments(project: project, version: version))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, DS.Spacing.s12)
-                .padding(.top, DS.Spacing.s3)
-                .padding(.bottom, DS.Spacing.s6)
-
-            Group {
-                if let root {
-                    ScrollView {
-                        FileOutlineNodes(
-                            nodes: root.children ?? [],
-                            depth: 0,
-                            selectedID: selectedID,
-                            onSelect: { selectedID = $0.id },
-                            onOpenFile: onOpenFile
-                        )
-                        .padding(.horizontal, DS.Spacing.s8)
-                        .padding(.vertical, DS.Spacing.s8)
-                    }
-                } else {
-                    // 目录树加载占位（原型 .ds-skeleton）
-                    VStack(alignment: .leading, spacing: DS.Spacing.s10) {
-                        DSSkeletonLine(width: 140)
-                        DSSkeletonLine(width: 200)
-                        DSSkeletonLine(width: 180)
-                        DSSkeletonLine(width: 160)
-                    }
-                    .padding(DS.Spacing.s16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                }
+        Group {
+            if entries.isEmpty && workspace == nil {
+                // 版本目录尚不存在（新容器未落盘）：空态。
+                DSEmptyState(
+                    icon: .folder,
+                    title: "产物 · 0",
+                    description: "开始任务并产生落盘产物后，在此预览该容器的文件树。"
+                )
+                .padding(.horizontal, DS.Spacing.s16)
+                .padding(.vertical, DS.Spacing.s12)
+            } else {
+                splitLayout
             }
         }
-        .onAppear {
-            root = Self.buildTree(
-                at: PMAgentStore.versionURL(project: project, version: version)
+        .onAppear { reloadToken += 1 }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSNotification.Name("pm.worker.artifacts.changed")
+            // 发帖侧可能是后台线程（MCP 无头写入等），归位主线程再改 @State
+        ).receive(on: DispatchQueue.main)) { _ in reloadToken += 1 }
+        .task(id: reloadToken) { reload() }
+        .sheet(item: $previewTarget) { node in
+            if node.url.pathExtension.lowercased() == "html" {
+                HTMLPreviewSheet(title: node.name, fileURL: node.url)
+            } else {
+                MermaidPreviewSheet(title: node.name, fileURL: node.url)
+            }
+        }
+    }
+
+    // MARK: 双区布局（上：产物台账 · 下：工作空间文件 · 中：可拖分隔条）
+
+    private var splitLayout: some View {
+        GeometryReader { geo in
+            let available = max(geo.size.height - Self.handleHeight, 0)
+            let topHeight = available * clampedRatio
+            VStack(spacing: 0) {
+                ScrollView {
+                    ArtifactsLedgerView(
+                        entries: entries,
+                        onOpen: { openPreview($0) },
+                        onReveal: { revealInFinder($0.url) }
+                    )
+                }
+                .frame(height: topHeight)
+
+                splitHandle(availableHeight: available)
+
+                ScrollView {
+                    workspaceSection
+                }
+                .frame(maxHeight: .infinity)
+            }
+        }
+    }
+
+    /// 可拖分隔条：22pt 可抓取条带（1pt 发丝线居中）。视觉由 SwiftUI 绘制，
+    /// 鼠标跟踪下沉 AppKit（DividerHandle）——SwiftUI DragGesture 在 macOS 上
+    /// 与鼠标配合不可靠（按下偶发丢失、hover 动画期间 hit-test miss、布局
+    /// 重建打断手势），AppKit mouseDown/mouseDragged 跟踪独立于 SwiftUI
+    /// 渲染，按下即抓、1:1 跟踪不丢事件；双击复位由 clickCount 原生判定
+    /// （跟随系统双击速度），光标由 resetCursorRects 提供。
+    /// 高度变化 1:1 跟踪不参与动画（防闪烁），视觉态变化走 spring。
+    private func splitHandle(availableHeight: CGFloat) -> some View {
+        ZStack {
+            // 可抓取区域可视化：常态透明，hover 微亮，拖动品牌色水洗
+            Rectangle()
+                .fill(isDragging ? Color.brand100.opacity(0.6) : Color.surfaceSecondary)
+                .opacity(handleHovered || isDragging ? 1 : 0)
+            Rectangle()
+                .fill(lineColor)
+                .frame(height: 1)
+            Capsule()
+                .fill(isDragging ? Color.brandAccent : Color.ink300)
+                .frame(width: 32, height: 4)
+                .scaleEffect(isDragging ? 1.2 : 1)
+                .opacity(handleHovered || isDragging ? 1 : 0)
+        }
+        .frame(height: Self.handleHeight)
+        .contentShape(Rectangle())
+        .overlay {
+            DividerHandle(
+                onStart: {
+                    isDragging = true
+                    dragStartRatio = ratio
+                },
+                onDrag: { translationY in
+                    // translationY：相对按下点的纵向位移，向下为正（窗口坐标取反）
+                    let delta = translationY / max(availableHeight, 1)
+                    ratio = min(max(dragStartRatio + delta, Self.minRatio), Self.maxRatio)
+                },
+                onEnd: { moved, doubleClicked in
+                    isDragging = false
+                    if doubleClicked {
+                        // 双击复位：程序化变化走 spring
+                        withAnimation(DS.Motion.spring) {
+                            ratio = Self.defaultRatio
+                            UserDefaults.standard.set(
+                                Double(Self.defaultRatio), forKey: Self.ratioKey
+                            )
+                        }
+                    } else if moved {
+                        UserDefaults.standard.set(Double(clampedRatio), forKey: Self.ratioKey)
+                    }
+                },
+                onHover: { inside in handleHovered = inside }
             )
+        }
+        .animation(DS.Motion.springFast, value: isDragging)
+        .animation(DS.Motion.springFast, value: handleHovered)
+        .onDisappear { handleHovered = false }
+        .help("上下拖动调整分区高度 · 双击复位")
+    }
+
+    /// 分隔条发丝线颜色：常态 borderL1（与 DSDivider 同视觉），hover 提阶，拖动中品牌色。
+    private var lineColor: Color {
+        isDragging ? Color.brandAccent : (handleHovered ? Color.ink300 : Color.borderL1)
+    }
+
+    private func reload() {
+        let root = PMAgentStore.versionURL(project: project, version: version)
+        entries = ArtifactCatalog.scanArtifacts(in: root)
+        workspace = ArtifactCatalog.workspaceTree(in: root)
+    }
+
+    private func openPreview(_ entry: ArtifactEntry) {
+        previewTarget = FileNode(
+            name: entry.name, url: entry.url, isDirectory: false, children: nil
+        )
+    }
+
+    private func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    // MARK: 工作空间文件分区
+
+    private var workspaceSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 节头：只留衬线标题（计数与口径提示按评审结论移除）
+            // 分区与上方台账的间隔由可拖分隔条承担，此处不再放 DSDivider。
+            Text("工作空间文件")
+                .font(DS.Font.display2XS)
+                .foregroundStyle(Color.ink900)
+                .padding(.horizontal, DS.Spacing.s16)
+                .padding(.top, DS.Spacing.s12)
+                .padding(.bottom, DS.Spacing.s8)
+
+            // 面包屑紧贴节头之下：先声明磁盘目录，再列目录内容
+            DSBreadcrumb(segments: Self.pathSegments(project: project, version: version))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, DS.Spacing.s16)
+                .padding(.bottom, DS.Spacing.s6)
+
+            if let workspace {
+                FileOutlineNodes(
+                    nodes: workspace.children ?? [],
+                    depth: 0,
+                    selectedID: selectedID,
+                    onSelect: { selectedID = $0.id },
+                    onOpenFile: { previewTarget = $0 }
+                )
+                .padding(.horizontal, DS.Spacing.s8)
+                .padding(.bottom, DS.Spacing.s12)
+            } else {
+                // 目录树加载占位（原型 .ds-skeleton）
+                VStack(alignment: .leading, spacing: DS.Spacing.s10) {
+                    DSSkeletonLine(width: 140)
+                    DSSkeletonLine(width: 200)
+                    DSSkeletonLine(width: 180)
+                    DSSkeletonLine(width: 160)
+                }
+                .padding(DS.Spacing.s16)
+            }
         }
     }
 
@@ -243,36 +411,106 @@ struct ArtifactTreeView: View {
             DSBreadcrumb.Segment(title: version),
         ]
     }
+}
 
-    /// 深度与数量上限，防超大目录卡 UI。
-    private static func buildTree(at url: URL, depth: Int = 0) -> FileNode {
-        let fm = FileManager.default
-        let children = (try? fm.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: [.isDirectoryKey]
-        ))?
-            .filter { !$0.lastPathComponent.hasPrefix(".") }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            .prefix(200)
-            .map { child in
-                let isDir =
-                    (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-                return FileNode(
-                    name: child.lastPathComponent,
-                    url: child,
-                    isDirectory: isDir,
-                    children: (isDir && depth < 4)
-                        ? buildTree(at: child, depth: depth + 1).children : []
-                )
-            }
-        return FileNode(
-            name: url.lastPathComponent,
-            url: url,
-            isDirectory: true,
-            children: Array(children ?? [])
-        )
+// MARK: - 分隔条鼠标跟踪层（AppKit）
+
+/// 透明 NSView，只做分隔条的鼠标事件捕获：mouseDown 即抓取、mouseDragged
+/// 1:1 回传相对按下点的位移、mouseUp 结算；hover 光标由 resetCursorRects
+/// 原生提供，拖动全程 push resize 光标（甩出条带不丢）。视图自身零绘制，
+/// 视觉由 SwiftUI 层（splitHandle 的 ZStack）负责。
+/// 位移用 event.locationInWindow 窗口坐标做差——拖动中布局变化（上区变高、
+/// 分隔条自身下移）不影响窗口坐标基准，1:1 跟手不粘滞；勿用 convert 到
+/// 视图自身坐标（视图在动，反馈回路会让位移只跟一半）。
+private struct DividerHandle: NSViewRepresentable {
+    var onStart: () -> Void
+    var onDrag: (_ translationY: CGFloat) -> Void
+    var onEnd: (_ moved: Bool, _ doubleClicked: Bool) -> Void
+    var onHover: (Bool) -> Void
+
+    func makeNSView(context: Context) -> HandleView {
+        let view = HandleView()
+        view.onStart = onStart
+        view.onDrag = onDrag
+        view.onEnd = onEnd
+        view.onHover = onHover
+        return view
     }
 
+    func updateNSView(_ nsView: HandleView, context: Context) {
+        // 每次 SwiftUI 渲染刷新闭包，捕获的 available/ratio 保持最新
+        nsView.onStart = onStart
+        nsView.onDrag = onDrag
+        nsView.onEnd = onEnd
+        nsView.onHover = onHover
+    }
+
+    final class HandleView: NSView {
+        var onStart: (() -> Void)?
+        var onDrag: ((CGFloat) -> Void)?
+        var onEnd: ((Bool, Bool) -> Void)?
+        var onHover: ((Bool) -> Void)?
+
+        /// 按下点的窗口坐标 y（窗口原点在左下、y 向上，鼠标下移差值为负）。
+        private var startLocationY: CGFloat = 0
+        private var dragMoved = false
+        private var trackingArea: NSTrackingArea?
+        private var dragCursorPushed = false
+
+        /// 关键：hiddenTitleBar（全尺寸内容区）下，透明视图默认允许把按下
+        /// 事件让给窗口拖动——不显式拒绝，按下分隔条会变成拖动整个窗口。
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                owner: self
+            )
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func resetCursorRects() {
+            addCursorRect(bounds, cursor: .resizeUpDown)
+        }
+
+        override func mouseEntered(with event: NSEvent) { onHover?(true) }
+        override func mouseExited(with event: NSEvent) { onHover?(false) }
+
+        override func mouseDown(with event: NSEvent) {
+            startLocationY = event.locationInWindow.y
+            dragMoved = false
+            if !dragCursorPushed { NSCursor.resizeUpDown.push(); dragCursorPushed = true }
+            if event.clickCount == 2 {
+                // 双击第二击：clickCount 原生判定（跟随系统双击速度），立即结算复位
+                onEnd?(false, true)
+                // 复位后重抓基底——双击后不松手继续拖，以默认档为起点
+                onStart?()
+            } else {
+                onStart?()
+            }
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            // 窗口坐标差取反：鼠标下移 → y 减小 → translation 为正（向下分给上区）
+            let translation = startLocationY - event.locationInWindow.y
+            if abs(translation) > 2 { dragMoved = true }
+            onDrag?(translation)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            if dragCursorPushed { NSCursor.pop(); dragCursorPushed = false }
+            // 双击已在 mouseDown 结算复位；此处再结算一次无害（moved=false 不持久化）
+            onEnd?(dragMoved, false)
+        }
+    }
 }
+
+// MARK: - 档案树（工作空间文件区递归视图）
 
 /// 文件树递归节点视图（View 结构体递归，规避 opaque 类型自引用）。
 private struct FileOutlineNodes: View {
@@ -354,7 +592,7 @@ private struct FileOutlineLeaf: View {
 
     private var previewable: Bool {
         switch ext {
-        case "html", "md": true
+        case "html", "md", "mmd": true
         default: false
         }
     }
@@ -367,7 +605,8 @@ private struct FileOutlineLeaf: View {
             icon: iconFor(ext),
             iconColor: iconColorFor(ext),
             isFolder: false,
-            isExpanded: false
+            isExpanded: false,
+            metaText: node.sizeBytes.map { ArtifactEntry.byteCount($0) }
         ) {
             onSelect(node)
             if previewable { onOpenFile(node) }
@@ -376,7 +615,7 @@ private struct FileOutlineLeaf: View {
 }
 
 /// Trae 式资源管理器行：箭头/圆点槽 + 类型彩色图标 + 文件名，
-/// 整行 hover / 选中圆角高亮，逐层缩进 16pt。
+/// 整行 hover / 选中圆角高亮，逐层缩进 16pt；hover 浮现右侧体量元信息。
 private struct FileTreeRow: View {
     let name: String
     let depth: Int
@@ -385,6 +624,7 @@ private struct FileTreeRow: View {
     let iconColor: Color
     let isFolder: Bool
     let isExpanded: Bool
+    var metaText: String? = nil
     let action: () -> Void
 
     @State private var hovered = false
@@ -413,6 +653,15 @@ private struct FileTreeRow: View {
                     .lineLimit(1)
 
                 Spacer(minLength: 0)
+
+                // hover 浮现体量（文件行）；文件夹行由树组件在 hover 时显示条目数
+                if let metaText, !isFolder {
+                    Text(metaText)
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink300)
+                        .lineLimit(1)
+                        .opacity(hovered ? 1 : 0)
+                }
             }
             .padding(.leading, CGFloat(depth) * 16 + 6)
             .padding(.trailing, DS.Spacing.s8)

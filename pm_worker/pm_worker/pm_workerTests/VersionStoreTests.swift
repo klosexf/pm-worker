@@ -43,7 +43,7 @@ final class VersionStoreTests: XCTestCase {
         let dir = PMAgentStore.versionURL(project: project, version: version)
         try PMAgentStore.writeVerified(
             "# 澄清要点",
-            to: dir.appendingPathComponent("01-requirements/clarification.md")
+            to: dir.appendingPathComponent(ArtifactPath.clarification)
         )
         return (project, version)
     }
@@ -72,9 +72,9 @@ final class VersionStoreTests: XCTestCase {
         XCTAssertEqual(doc.releasedAt, ISO8601.dayString())
         XCTAssertEqual(doc.version, "v1.0")
 
-        // release-notes.md 落盘且可逐字回读
+        // 发布说明.md 落盘且可逐字回读
         let notesURL = PMAgentStore.versionURL(project: ctx.project, version: ctx.version)
-            .appendingPathComponent("07-reports/release-notes.md")
+            .appendingPathComponent(ArtifactPath.releaseNotes)
         XCTAssertEqual(
             try String(contentsOf: notesURL, encoding: .utf8),
             "# v1.0 发布说明\n\n- 完成：澄清与结构"
@@ -99,13 +99,13 @@ final class VersionStoreTests: XCTestCase {
         XCTAssertTrue(VersionStore.isImmutable(at: dir.appendingPathComponent("01-requirements")))
         XCTAssertTrue(VersionStore.isImmutable(at: dir.appendingPathComponent("version.json")))
         XCTAssertTrue(
-            VersionStore.isImmutable(at: dir.appendingPathComponent("07-reports/release-notes.md"))
+            VersionStore.isImmutable(at: dir.appendingPathComponent(ArtifactPath.releaseNotes))
         )
 
         // 写文件抛错：覆盖既有文件（write-then-verify）与新建文件均被拦截
         XCTAssertThrowsError(try PMAgentStore.writeVerified(
             "x",
-            to: dir.appendingPathComponent("01-requirements/clarification.md")
+            to: dir.appendingPathComponent(ArtifactPath.clarification)
         ))
         XCTAssertThrowsError(try "y".write(
             to: dir.appendingPathComponent("01-requirements/new.md"),
@@ -168,7 +168,7 @@ final class VersionStoreTests: XCTestCase {
 
         let projectDir = PMAgentStore.projectURL("快照校验项目")
         let target = PMAgentStore.versionURL(project: "快照校验项目", version: "v1.0")
-            .appendingPathComponent("01-requirements/clarification.md")
+            .appendingPathComponent(ArtifactPath.clarification)
         try PMAgentStore.writeVerified("# 要点\n- 用户：健身小白", to: target)
         let before = try String(contentsOf: target, encoding: .utf8)
 
@@ -180,6 +180,52 @@ final class VersionStoreTests: XCTestCase {
         XCTAssertEqual(
             try String(contentsOf: target, encoding: .utf8), before,
             "Git 快照后文件应逐字一致"
+        )
+    }
+
+    // MARK: - 旧英文产物名迁移（中文文件名升级）
+
+    func testEnsureWorkspaceMigratesLegacyArtifactNames() throws {
+        try PMAgentStore.bootstrap()
+        try PMAgentStore.createProject(named: "迁移项目")
+        try PMAgentStore.createVersion("v1.0", in: "迁移项目")
+        let dir = PMAgentStore.versionURL(project: "迁移项目", version: "v1.0")
+        let fm = FileManager.default
+
+        // 盘上预置旧英文名产物
+        let legacyRels = [
+            "01-requirements/clarification.md",
+            "02-structure/architecture.md",
+            "03-prototypes/prototype-v1.html",
+            "04-prd/prd-v1.md",
+        ]
+        for rel in legacyRels {
+            try PMAgentStore.writeVerified("# 旧内容 \(rel)", to: dir.appendingPathComponent(rel))
+        }
+
+        // ensureWorkspace 触发幂等迁移：旧名消失、新名承载原内容
+        try PMAgentStore.ensureWorkspace(project: "迁移项目", version: "v1.0")
+        for (legacy, _) in ArtifactPath.legacyRenames {
+            XCTAssertFalse(
+                fm.fileExists(atPath: dir.appendingPathComponent(legacy).path),
+                "旧名应已迁移：\(legacy)"
+            )
+        }
+        XCTAssertEqual(
+            try String(contentsOf: dir.appendingPathComponent(ArtifactPath.prd), encoding: .utf8),
+            "# 旧内容 04-prd/prd-v1.md"
+        )
+
+        // 幂等：再跑一次不报错不覆盖；新名已存在时旧名（若重新出现）不搬运
+        try PMAgentStore.ensureWorkspace(project: "迁移项目", version: "v1.0")
+        try PMAgentStore.writeVerified(
+            "# 重新出现的旧名", to: dir.appendingPathComponent("04-prd/prd-v1.md")
+        )
+        try PMAgentStore.ensureWorkspace(project: "迁移项目", version: "v1.0")
+        XCTAssertEqual(
+            try String(contentsOf: dir.appendingPathComponent(ArtifactPath.prd), encoding: .utf8),
+            "# 旧内容 04-prd/prd-v1.md",
+            "新名已存在时不得被旧名覆盖"
         )
     }
 

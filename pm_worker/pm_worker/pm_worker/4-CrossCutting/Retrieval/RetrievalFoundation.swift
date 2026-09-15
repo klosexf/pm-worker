@@ -135,4 +135,8 @@ nonisolated struct RetrievalTrace: Codable, Equatable {
     var unmatchedSkills: [String]
     /// 检索耗时（毫秒）
     var durationMs: Int
+    /// 技能检索独立查询（意图优先路由：技能命中由消息语义 query 决定，卡片仍走
+    /// stage query）；nil = 未分流（技能与卡片同 query）。Optional 缺键解码为 nil，
+    /// 旧 trace 数据可继续解码。
+    var skillQuery: String? = nil
 }

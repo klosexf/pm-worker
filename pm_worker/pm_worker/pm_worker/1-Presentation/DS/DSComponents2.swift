@@ -234,10 +234,15 @@ struct DSNotifMessage: Equatable, Identifiable {
 }
 
 extension View {
-    /// 右上角瞬态通知浮现层（原型 .ds-notif 的容器行为）：
+    /// 瞬态通知浮现层（原型 .ds-notif 的容器行为）：
     /// 滑入 → 2.4s 自动消失；手动关闭即时收起。
-    func dsNotifCenter(_ message: Binding<DSNotifMessage?>) -> some View {
-        overlay(alignment: .topTrailing) {
+    /// 默认 `.topTrailing`（pane 内右上角）；`.top` 用于窗口级顶部居中
+    /// （ContentView 根部挂载），滑入方向随对齐边切换（顶入 vs 右入）。
+    func dsNotifCenter(
+        _ message: Binding<DSNotifMessage?>,
+        alignment: Alignment = .topTrailing
+    ) -> some View {
+        overlay(alignment: alignment) {
             if let msg = message.wrappedValue {
                 DSNotif(
                     variant: msg.variant,
@@ -249,7 +254,9 @@ extension View {
                     }
                 }
                 .padding(DS.Spacing.s16)
-                .transition(.move(edge: .trailing).combined(with: .opacity))
+                .transition(alignment == .top
+                    ? .move(edge: .top).combined(with: .opacity)
+                    : .move(edge: .trailing).combined(with: .opacity))
                 .onAppear {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
                         withAnimation(DS.Motion.springFast) {

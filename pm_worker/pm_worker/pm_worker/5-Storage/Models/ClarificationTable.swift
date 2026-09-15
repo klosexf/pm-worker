@@ -4,7 +4,7 @@
 //
 //  澄清要点表（Task 2.1，design.md §6.2 ① JSON Schema）：
 //  target_user / core_scenario / core_value / constraints / open_questions。
-//  落盘到 01-requirements/clarification.md，是 ①→② 的推进依据。
+//  落盘到 01-requirements/澄清要点表.md，是 ①→② 的推进依据。
 //
 
 import Foundation
@@ -24,7 +24,7 @@ nonisolated struct ClarificationTable: Codable, Equatable {
         case openQuestions = "open_questions"
     }
 
-    /// clarification.md 全文（Markdown，人可读、Finder 手改合法）。
+    /// 澄清要点表.md 全文（Markdown，人可读、Finder 手改合法）。
     var markdown: String {
         var lines: [String] = []
         lines.append("# 澄清要点表")

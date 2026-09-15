@@ -1,11 +1,15 @@
 # PM Copilot · 技能库初始内容清单
 
-> 版本：v1.2 · 日期：2026-09-12 · 状态：待用户评审
+> 版本：v1.4 · 日期：2026-09-14 · 状态：V2 P1 已落地
+>
+> **v1.4 变更**：V2 P1 批次落地（2026-09-14 用户裁决启动）——追加 3 个 skill（S19 OST / S20-S21 调研链，见 §4.3 P1 标注），当前总量 **21**；`incoming-request-advisor` 裁决为**内建澄清 prompt**（确定性注入，不独立成卡，见 §5 已裁决）。
 >
 > 对应 [design.md](design.md) §15 开放问题 1「技能库初始内容边界」的裁决稿。
 > 原则：首批 **14 个 skill**，覆盖五阶段流水线各环节；E11（未命中 skill 的正文不进上下文）的演示效果优先于数量。
 >
-> **v1.2 变更**：追加 3 个流程型 skill（S15-S17，改写自 obra/superpowers，MIT ✅）——想法打磨对话 / 任务拆解与验收 / 证据先行门控，补齐「澄清对话收敛、里程碑任务拆解、完成判定口径」三类缺口，当前总量 **17**，见 §2.6（2026-09-12 用户确认）。
+> **v1.3 变更**：追加 1 个设计型 skill（S18，改写自 touchine-ojo/OJO-Design-Skills、Leonxlnx/taste-skill、oil-oil/draw-ui，均 MIT ✅）——高保真原型设计，配套原型阶段提示词升级（灰盒线框 → 彩色真实效果图），当前总量 **18**，见 §2.7（2026-09-13 用户确认）。
+>
+> **v1.2 变更**：追加 3 个流程型 skill（S15-S17，改写自 obra/superpowers，MIT ✅）——想法打磨对话 / 任务拆解与验收 / 证据先行门控，补齐「澄清对话收敛、里程碑任务拆解、完成判定口径」三类缺口，见 §2.6（2026-09-12 用户确认）。
 >
 > **v1.1 变更**：① front-matter 新增 `type`（component/interactive，决定命中后生效形态）与 `pitfalls`（结构化反模式，雷达规则确定性读取）两字段（2026-09-10 用户确认）；② §4.3 V2 候选池由平铺清单升级为**分级候选池**（基于 deanpeters 库 77 个 skill 全量内容审计：P1 补池 3 项 / P2 约 11 项 / 机制层 4 项 / 明确不进组）；③ §5 待确认 2（`best_for` 入 design.md §5.2）裁决通过，design.md v0.9.11 已同步（§5.2 schema + §5.3 skills 表 + §6.2 清单实例化）。
 
@@ -16,7 +20,9 @@
 | 决策项 | 结论 |
 |---|---|
 | 首批数量 | 14 个（11 个方法论 + 3 个流程型）；原 S15「PRD 质量清单」已裁决移入**规范路由**（见 §2.5） |
-| 追加批（v1.2） | +3 个流程型（S15-S17，改写自 obra/superpowers，MIT），当前总量 17，见 §2.6 |
+| 追加批（v1.4） | V2 P1 落地：+3 个（S19-S21，OST + 调研链），当前总量 21；`incoming-request-advisor` 内建澄清 prompt（见 §4.3 P1 / §5） |
+| 追加批（v1.2） | +3 个流程型（S15-S17，改写自 obra/superpowers，MIT），见 §2.6 |
+| 追加批（v1.3） | +1 个设计型（S18，改写自 OJO-Design-Skills / taste-skill / draw-ui，MIT），当前总量 18，见 §2.7 |
 | 来源策略 | 公知方法论**自写**（KANO/RICE/JTBD 等不受版权保护）；流程型 skill 参照 anthropics（Apache-2.0）与 tarunccet/pm-skills（MIT）**改写**；deanpeters 库**只借鉴结构、不搬内容**（CC BY-NC-SA 4.0，与 MIT 不兼容） |
 | front-matter 格式 | 六字段：`name / type / when_to_use / best_for / tags / pitfalls`——`best_for`（3-5 个典型场景短句，借鉴 deanpeters 检索友好设计）；`type` 与 `pitfalls` 为 v1.1 新增（机制见 §3.1） |
 | 语言 | 中文正文 + 英文 tags（tags 同时编码进 embedding，双语提升中英 query 命中） |
@@ -93,6 +99,14 @@
 | S16 | `task-decomposition` 任务拆解与验收 | 流程 | ③ PRD | 假设执行者零上下文：结构先行 → 依赖排序 → 单动作粒度 → 每任务自带验收与验证步骤。补「里程碑/实施计划章节写法」缺口 | obra/superpowers#writing-plans（MIT），改写 |
 | S17 | `evidence-gated-completion` 证据先行门控 | 流程 | ⑤ 评审 | 没有新鲜验证证据不得宣称完成；验收标准须可判定；门控按证据不按叙述。与 prd-review-rubric（§2.5）互补：rubric 管审什么，本卡管完成的判定口径 | obra/superpowers#verification-before-completion（MIT），改写 |
 
+### 2.7 追加批（v1.3，2026-09-13：+1 个设计型，原型阶段升级配套）
+
+> 背景：用户裁决原型阶段输出从「灰盒线框风」升级为「高保真彩色 UI 效果图」（`AgentPrompts.prototype` 硬约束与 stageChecklist 已同步改）。本卡整合三个开源设计技能仓库的可执行规则（设计令牌先行、60/30/10 配色、中性色微染、AI 紫封禁、组件四态、真实数据感、「AI 味」五项自检），限定单文件 HTML 零外部依赖语境。落全局库（`~/PMAgent/skills/`）。
+
+| # | skill 名 | 类型 | 落点阶段 | 内容要点 | 来源 |
+|---|---|---|---|---|---|
+| S18 | `hi-fi-prototype` 高保真原型设计 | 流程 | ④ 原型 | 设计令牌先行 → 60/30/10 配色与中性色微染 → 排印纪律与组件四态 → 真实感素材（内联 SVG 场景块/有机数据）→「AI 味」五项自检。与 S13 形态选择互补：S13 管画到什么精度，本卡管高保真档怎么画好 | touchine-ojo/OJO-Design-Skills、Leonxlnx/taste-skill、oil-oil/draw-ui（均 MIT），改写 |
+
 ---
 
 ## 3. 统一 front-matter 模板
@@ -146,13 +160,13 @@ pitfalls:                        # 结构化反模式：命名失败模式（命
 
 > 审计前提：仅**参照自写**（CC BY-NC-SA 4.0 不搬内容）；同类方法论有 MIT / Apache-2.0 来源（tarunccet / anthropics）优先参照那边，deanpeters 只作为结构与方法参照。原 v1.0 平铺候选池已并入下列分级。
 
-**P1 · V2 第一批补池（真实缺口，3 项）**
+**P1 · V2 第一批补池（真实缺口，3 项）——✅ 已落地（2026-09-14，v1.4）**
 
-| skill | 补的缺口 | 落点 |
-|---|---|---|
-| `opportunity-solution-tree` | 首批与候选池均无 OST（Teresa Torres）：「诉求 → 机会 → 方案 → 验证」树，澄清阶段最缺的主干框架，JTBD（S3）的自然下游 | 澄清阶段 |
-| `competitive-research-snapshot` + `battle-card-builder` | **调研链**：前者产物 schema 被后者消费，「调研变节奏而非一次性 deck」——FR3 从 competitive-brief 单点升级为链 | 调研分支（FR3） |
-| `incoming-request-advisor` | 含混请求 → 「字面诉求 vs 真实 JTBD」结构化拆解——澄清 Agent 每轮行为的知识底座；**可内建进澄清 prompt 而非独立 skill**，V2 时二选一 | 澄清阶段（FR2） |
+| skill | 补的缺口 | 落点 | 落地状态 |
+|---|---|---|---|
+| `opportunity-solution-tree`（S19） | 首批与候选池均无 OST（Teresa Torres）：「诉求 → 机会 → 方案 → 验证」树，澄清阶段最缺的主干框架，JTBD（S3）的自然下游 | 澄清阶段 | ✅ `Resources/skills/opportunity-solution-tree.md` |
+| `competitive-research-snapshot`（S20）+ `battle-card-builder`（S21） | **调研链**：前者产物 schema 被后者消费，「调研变节奏而非一次性 deck」——FR3 从 competitive-brief 单点升级为链 | 调研分支（FR3） | ✅ `Resources/skills/competitive-research-snapshot.md` + `battle-card-builder.md` |
+| `incoming-request-advisor` | 含混请求 → 「字面诉求 vs 真实 JTBD」结构化拆解——澄清 Agent 每轮行为的知识底座；**可内建进澄清 prompt 而非独立 skill**，V2 时二选一 | 澄清阶段（FR2） | ✅ 裁决内建：`AgentPrompts.clarify` 约束 7「含混请求拆解」，每轮确定性注入 |
 
 **P2 · V2 第二批（按需补池，约 11 项）**
 
@@ -194,3 +208,4 @@ pitfalls:                        # 结构化反模式：命名失败模式（命
 **已裁决**：
 - ~~S15 评审清单归属~~ → **规范路由**（`templates/prd-review-rubric.md`，确定性读取；理由见 §2.5，2026-09-09 用户确认）
 - ~~`best_for` 字段入 design.md §5.2~~ → **采纳**，与 `type` / `pitfalls` 一并写入（design.md v0.9.11：§5.2 技能 schema + §5.3 skills 表 embedding 扩为四字段 + §6.2 清单实例化扩展；2026-09-10 用户确认）
+- ~~`incoming-request-advisor` 二选一~~ → **内建澄清 prompt**（`AgentPrompts.clarify` 约束 7；理由：每轮必读、不能漏——语义检索「可能不命中」与「每轮行为的知识底座」天然冲突，与 §2.5 prd-review-rubric 同一原则；2026-09-14 用户确认）

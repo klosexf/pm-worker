@@ -12,12 +12,13 @@ import SwiftUI
 
 // MARK: - 页定义
 
-/// 弹框左导航六页（通用置首，对应系统设置惯例）。
+/// 弹框左导航七页（通用置首，对应系统设置惯例）。
 enum SettingsDialogPage: String, CaseIterable, Identifiable {
     case general
     case model
     case usage
     case data
+    case memory
     case mcp
     case about
 
@@ -29,6 +30,7 @@ enum SettingsDialogPage: String, CaseIterable, Identifiable {
         case .model: "模型"
         case .usage: "用量"
         case .data: "数据"
+        case .memory: "记忆"
         case .mcp: "MCP 服务"
         case .about: "关于"
         }
@@ -37,9 +39,10 @@ enum SettingsDialogPage: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .general: "外观模式 · 界面偏好"
-        case .model: "BYOK · 统一模型配置 · Key 存 Keychain"
+        case .model: "BYOK · 多模型管理 · Key 存 Keychain"
         case .usage: "本次 / 本月 token 与费用估算"
         case .data: "文件系统是唯一事实源 · 索引可随时重建"
+        case .memory: "有效条目管理 · 手动新增 · 整理收纳"
         case .mcp: "服务开关 · 工具列表 · 调用日志 · 接入配置"
         case .about: "本地优先的 AI 产品经理 Agent"
         }
@@ -51,10 +54,19 @@ enum SettingsDialogPage: String, CaseIterable, Identifiable {
         case .model: .agent
         case .usage: .qps
         case .data: .folder
+        case .memory: .mem
         case .mcp: .connector
         case .about: .question
         }
     }
+}
+
+// MARK: - 模型编辑器弹框目标（新增 = 全新草稿档案；编辑 = 既有档案副本）
+
+/// 模型编辑器弹框的编辑对象：新增走草稿档案，编辑持既有档案副本（保存才落）。
+nonisolated struct ModelEditorTarget: Equatable {
+    var profile: ModelProfile
+    var isNew: Bool
 }
 
 // MARK: - 遮罩层（全窗口暗底 + 居中弹框；Esc / 点遮罩关闭）
@@ -84,28 +96,47 @@ struct SettingsDialog: View {
     @EnvironmentObject private var model: AppModel
 
     @State private var settings: LLMSettings = .default
+    /// Keychain 槽位 → Key 值（槽位 = profile.keychainKey / embedding / search 各自独立，
+    /// 多模型下同一 provider 的多个模型可各持一把 Key）。
     @State private var apiKeys: [String: String] = [:]
+    /// Keychain 读取失败的槽位（byok.*）：失败 ≠ 未配置——此时字段空不代表 Key 丢，
+    /// 且空值提交不得触发 delete（见 2026-09-13 Key「消失」事故）。
+    @State private var keyReadFailures: Set<String> = []
     /// 竞品联网搜索的 Tavily Key（Keychain byok.search；SearXNG 源不用）。
     @State private var searchAPIKey: String = ""
+    /// 模型编辑器弹框：nil = 收起；非 nil = 正在新增（profile 为草稿）或编辑（含原档案）。
+    @State private var modelEditor: ModelEditorTarget?
     @State private var rebuildResult: String?
     /// 外观模式（通用页）：@AppStorage 直写 UserDefaults，四窗口 appAppearance 即时联动。
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw: String = AppearanceMode.system.rawValue
 
     var body: some View {
-        HStack(spacing: 0) {
-            navColumn
-            contentColumn
+        ZStack {
+            HStack(spacing: 0) {
+                navColumn
+                contentColumn
+            }
+
+            // 模型编辑器（独立弹框，浮于设置弹框之上）：新增 / 编辑共用一套配置表单
+            if let editor = modelEditor {
+                ModelEditorSheet(
+                    draft: editorDraftBinding,
+                    target: editor,
+                    keyReadFailures: keyReadFailures,
+                    initialKey: apiKeys[editor.profile.keychainKey] ?? "",
+                    onCancel: { modelEditor = nil },
+                    onSave: { saveModelEditor($0, $1) }
+                )
+                .dsFadeIn()
+            }
         }
         .frame(width: 880, height: 560)
         .background(
             Color.surfaceBase,
             in: RoundedRectangle(cornerRadius: DS.Radius.big)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.big)
-                .strokeBorder(Color.borderL2, lineWidth: 1)
-        )
-        // 原型对话框阴影：0 24/64 14% + 0 4/16 8%
+        // 「无框纯影」：零描边，边界由明度差 + 双层大软阴影承担
+        // （原型对话框阴影：0 24/64 14% + 0 4/16 8%）
         .shadow(color: Color.shadowInk.opacity(0.14), radius: 32, y: 12)
         .shadow(color: Color.shadowInk.opacity(0.08), radius: 16, y: 4)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.big))
@@ -182,6 +213,7 @@ struct SettingsDialog: View {
                 case .model: modelPage
                 case .usage: usagePage
                 case .data: dataPage
+                case .memory: MemorySettingsTab()
                 case .mcp: MCPStatusTab()
                 case .about: aboutPage
                 }
@@ -317,93 +349,184 @@ struct SettingsDialog: View {
         }
     }
 
-    // MARK: - 模型页分区
+    // MARK: - 模型页分区（多模型管理，2026-09-14）
 
-    /// AI 模型区：每行单一职责（供应商 / 模型 / baseURL / 生效端点 / 图片开关 / Key），
-    /// Keychain 说明走区脚注；配置状态由 Key 行状态标签承载（原 hero 卡就绪标冗余，已删）。
+    /// AI 模型区（多模型列表，对齐参考图一）：每行 = 供应商标识 + 模型名 + 供应商名
+    /// + 使用中标记 + 编辑 / 删除 + 启用开关；点击行主体切换「使用中」。
+    /// 添加 / 编辑均弹独立编辑器弹框（ModelEditorSheet），列表保持纯管理视图。
     private var modelSection: some View {
         section(
             "AI 模型",
-            footer: "OpenAI 兼容端点 · 意图分类 → 毒舌评审 8 个对话阶段共用这一份配置。仅存 macOS Keychain（com.xiaofengchen.pm-worker.byok）· 不落明文 · 不入 Git。"
+            footer: "OpenAI 兼容端点 · 对话阶段共用「使用中」模型的配置。点击行切换使用中模型（即时生效），开关控制是否出现在输入栏切换器；每个模型的 Key 独立存 macOS Keychain（com.xiaofengchen.pm-worker.byok）· 不落明文 · 不入 Git。"
         ) {
-            settingsRow("供应商") {
-                DSSelect(
-                    options: DSProviderOption.selectOptions,
-                    selection: chatProviderBinding
-                )
-                .frame(width: 170)
+            ForEach(settings.models) { profile in
+                modelRow(profile)
+
+                if profile.id != settings.models.last?.id {
+                    settingsDivider()
+                }
             }
 
-            settingsDivider()
-
-            settingsRow("模型") {
-                TextField("model", text: chatModelBinding)
-                    .textFieldStyle(.plain)
-                    .dsInput()
-                    .frame(width: 260)
-            }
-
-            settingsDivider()
-
-            settingsRow("baseURL · 可选") {
-                TextField("覆盖预设端点", text: chatBaseURLBinding)
-                    .textFieldStyle(.plain)
-                    .dsInput()
-                    .frame(width: 300)
-            }
-
-            settingsDivider()
-
-            settingsRow("生效端点", detail: "实际请求的端点——预设值或上方覆盖值") {
-                EndpointLine(
-                    baseURL: settings.chatConfig.baseURL,
-                    provider: settings.chatConfig.provider
-                )
-                .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-
-            settingsDivider()
-
-            settingsRow("支持图片输入", detail: imageSupportHint) {
-                DSSwitch(isOn: chatSupportsImagesBinding)
-            }
-
-            settingsDivider()
-
-            chatKeyRow
+            addModelButton
         }
     }
 
-    /// 图片输入的动态说明（跟随开关状态）。
-    private var imageSupportHint: String {
-        chatSupportsImagesBinding.wrappedValue
-            ? "已开启——对话输入区可添加图片，随消息发给模型识别（需模型本身具备视觉能力）"
-            : "开启后对话可发送图片（截图 / 竞品界面 / 原型稿），模型将识别图片内容"
+    /// 单个模型行：主体按钮（标识 + 名称 + 供应商 + 使用中标记）与右侧控件
+    /// （编辑 / 删除 / 启用开关）分离——点主体切换使用中，控件各自独立响应。
+    private func modelRow(_ profile: ModelProfile) -> some View {
+        let isActive = settings.activeModelID == profile.id
+        return HStack(spacing: DS.Spacing.s10) {
+            Button {
+                withAnimation(DS.Motion.springFast) {
+                    settings.setActiveModel(id: profile.id)
+                    persistSoon()
+                }
+            } label: {
+                HStack(spacing: DS.Spacing.s10) {
+                    providerBadge(profile.provider)
+                    VStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                        Text(profile.model)
+                            .font(DS.Font.monoSM)
+                            .foregroundStyle(Color.ink900)
+                            .lineLimit(1)
+                        Text(DSProviderOption.title(for: profile.provider))
+                            .font(DS.Font.bodyXS)
+                            .foregroundStyle(Color.ink500)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: DS.Spacing.s8)
+                    if isActive {
+                        DSTag(title: "使用中", variant: .brand)
+                    }
+                }
+                .padding(.vertical, DS.Spacing.s8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("使用 \(profile.model)（\(DSProviderOption.title(for: profile.provider))）")
+
+            rowIconButton(.pencil, help: "编辑模型配置") {
+                openModelEditor(profile)
+            }
+
+            rowIconButton(
+                .delete,
+                help: settings.models.count > 1 ? "删除该模型" : "至少保留一个模型",
+                disabled: settings.models.count <= 1
+            ) {
+                removeModel(profile)
+            }
+
+            DSSwitch(isOn: enabledBinding(for: profile))
+        }
+        .padding(.vertical, DS.Spacing.s6)
     }
 
-    /// API Key 行：状态标签 + 密钥输入；格式可疑时行内警示（不阻断保存）。
-    private var chatKeyRow: some View {
-        VStack(spacing: 0) {
-            settingsRow("API Key") {
-                HStack(spacing: DS.Spacing.s8) {
-                    keyTag(configured: chatKeyConfigured, optional: false)
-                    SecureField("粘贴 API Key", text: chatKeyBinding)
-                        .textFieldStyle(.plain)
-                        .dsInput()
-                        .frame(width: 240)
-                }
+    /// 供应商标识（20×20 圆角方块 + 首字母 mono）：DS 中性徽标语义，不引入品牌色噪声。
+    private func providerBadge(_ provider: String) -> some View {
+        Text(String(DSProviderOption.title(for: provider).prefix(1)).uppercased())
+            .font(DS.Font.mono2XS)
+            .foregroundStyle(Color.ink700)
+            .frame(width: 22, height: 22)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.sm)
+                    .fill(Color.overlayL2)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.sm)
+                    .strokeBorder(Color.borderL1, lineWidth: 1)
+            )
+    }
+
+    /// 行内图标按钮（编辑 / 删除）：hover overlayL2，禁用 45% 透明。
+    private func rowIconButton(
+        _ icon: DSIcon.Name,
+        help: String,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        ModelRowIconButton(icon: icon, help: help, disabled: disabled, action: action)
+    }
+
+    /// 添加模型行（对齐参考图三底部入口）：虚线边框弱主行动，点击弹独立编辑器弹框。
+    private var addModelButton: some View {
+        Button {
+            openModelEditor(nil)
+        } label: {
+            HStack(spacing: DS.Spacing.s6) {
+                DSIcon(.plus, size: 12)
+                Text("添加模型")
+                    .font(DS.Font.bodySM)
             }
-            if let warning = Self.keyFormatWarning(chatKeyBinding.wrappedValue, provider: settings.chatConfig.provider) {
-                HStack(spacing: DS.Spacing.s4) {
-                    DSIcon(.warningFill, size: 12)
-                        .foregroundStyle(Color.statusWarning)
-                    Text(warning)
-                        .font(DS.Font.bodyXS)
-                        .foregroundStyle(Color.statusWarning)
-                }
-                .padding(.bottom, DS.Spacing.s10)
-            }
+            .foregroundStyle(Color.ink700)
+            .frame(maxWidth: .infinity, minHeight: 36, alignment: .center)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
+                    .fill(Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
+                    .strokeBorder(
+                        Color.borderL1,
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
         }
+        .buttonStyle(.plain)
+        .padding(.top, DS.Spacing.s8)
+        .help("添加一个新的 AI 模型（OpenAI 兼容端点）")
+    }
+
+    // MARK: - 模型编辑器弹框（新增 / 编辑共用，独立于列表；保存才落盘）
+
+    /// 打开编辑器：nil = 新增（草稿档案跟随最近供应商带出预设），否则编辑既有档案副本。
+    private func openModelEditor(_ profile: ModelProfile?) {
+        let target: ModelEditorTarget
+        if let profile {
+            target = ModelEditorTarget(profile: profile, isNew: false)
+        } else {
+            target = ModelEditorTarget(
+                profile: ModelProfile.newProfile(
+                    defaultProvider: settings.models.last?.provider ?? "deepseek"
+                ),
+                isNew: true
+            )
+        }
+        modelEditor = target
+    }
+
+    /// 编辑器草稿双向绑定（弹框内逐字段编辑；保存才写 settings / Keychain）。
+    private var editorDraftBinding: Binding<ModelProfile> {
+        Binding(
+            get: {
+                modelEditor?.profile ?? ModelProfile(provider: "deepseek", model: "")
+            },
+            set: { newValue in
+                modelEditor?.profile = newValue
+            }
+        )
+    }
+
+    /// 保存编辑器：Key 按最终槽位写 / 删（读取失败时空值不删，防误清真 Key），
+    /// 档案 upsert 即写透 stages（使用中档案即时生效），关闭弹框。
+    private func saveModelEditor(_ profile: ModelProfile, _ keyValue: String) {
+        let profile = profile
+        let slot = profile.keychainKey
+        let trimmed = keyValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            if !keyReadFailures.contains(slot) {
+                KeychainStore.delete(slot)
+            }
+            apiKeys[slot] = ""
+        } else {
+            try? KeychainStore.set(trimmed, forKey: slot)
+            apiKeys[slot] = trimmed
+        }
+        // 供应商切换导致槽位迁移时，旧共享槽不动（embedding / 其他档案可能仍引用）
+        settings.upsertModel(profile)
+        modelEditor = nil
+        persistSoon()
     }
 
     /// 单行预算控制区：档位语义提示随选择联动。
@@ -519,6 +642,10 @@ struct SettingsDialog: View {
     }
 
     private var embeddingStatusTag: DSTag {
+        if let config = settings.stages[.embedding],
+           keyReadFailures.contains(config.apiKeyKeychainKey) {
+            return DSTag(title: "Keychain 读取失败", variant: .warning, icon: .warningFill)
+        }
         if embeddingKeyConfigured {
             return DSTag(title: "已配置", variant: .success, icon: .circleCheck)
         }
@@ -531,6 +658,9 @@ struct SettingsDialog: View {
             return DSTag(title: "未启用 · 可选", variant: .neutral)
         }
         // Tavily 源必须配 Key（SearXNG 无 Key）：缺 Key 给警示，避免运行时静默回退离线分析
+        if keyReadFailures.contains(WebTool.searchAPIKeyKeychainKey) {
+            return DSTag(title: "Keychain 读取失败", variant: .warning, icon: .warningFill)
+        }
         if WebTool.isTavilyEndpoint(endpoint)
             && searchAPIKey.trimmingCharacters(in: .whitespaces).isEmpty {
             return DSTag(title: "已启用 · 缺 Key", variant: .warning)
@@ -538,17 +668,13 @@ struct SettingsDialog: View {
         return DSTag(title: "已启用", variant: .success, icon: .circleCheck)
     }
 
-    private var chatKeyConfigured: Bool {
-        apiKeys[settings.chatConfig.provider]?.isEmpty == false
-    }
-
     private var embeddingKeyConfigured: Bool {
         guard let config = settings.stages[.embedding] else { return false }
-        return apiKeys[config.provider]?.isEmpty == false
+        return apiKeys[config.apiKeyKeychainKey]?.isEmpty == false
     }
 
     /// 粘贴错误的常见形态（URL / 含空白 / 前缀不对）——非阻断，仅提示。
-    nonisolated private static func keyFormatWarning(_ key: String, provider: String) -> String? {
+    nonisolated static func keyFormatWarning(_ key: String, provider: String) -> String? {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         if trimmed.contains("://") || trimmed.lowercased().hasPrefix("http") || trimmed.hasSuffix(".com") {
@@ -563,7 +689,11 @@ struct SettingsDialog: View {
         return nil
     }
 
-    private func keyTag(configured: Bool, optional: Bool) -> DSTag {
+    /// 状态标签：Key 配置三态（已存 / 未配置 / 读取失败）。
+    nonisolated static func keyTag(configured: Bool, optional: Bool, readFailed: Bool = false) -> DSTag {
+        if readFailed {
+            return DSTag(title: "Keychain 读取失败", variant: .warning, icon: .warningFill)
+        }
         if configured {
             return DSTag(title: "已存入 Keychain", variant: .success, icon: .circleCheck)
         }
@@ -748,7 +878,7 @@ struct SettingsDialog: View {
         DSDivider()
     }
 
-    // MARK: - 绑定（统一入口写 chatConfig，向量编码写 .embedding）
+    // MARK: - 绑定（多模型档案逐档案绑定；向量编码写 .embedding）
 
     private var searchEndpointBinding: Binding<String> {
         Binding(
@@ -767,6 +897,7 @@ struct SettingsDialog: View {
             set: { newValue in
                 searchAPIKey = newValue
                 if newValue.isEmpty {
+                    guard !keyReadFailures.contains(WebTool.searchAPIKeyKeychainKey) else { return }
                     KeychainStore.delete(WebTool.searchAPIKeyKeychainKey)
                 } else {
                     try? KeychainStore.set(newValue, forKey: WebTool.searchAPIKeyKeychainKey)
@@ -775,70 +906,42 @@ struct SettingsDialog: View {
         )
     }
 
-    // 切 provider = 换一家供应商：model/baseURL 重置为该 provider 缺省，避免残留旧端点
-    private var chatProviderBinding: Binding<String> {
+    // MARK: 模型档案绑定（编辑即存 + 使用中档案写透 stages 即时生效）
+
+    /// 档案整体绑定：按 id 定位（ForEach 行内表单共用）。
+    private func profileBinding(for profile: ModelProfile) -> Binding<ModelProfile> {
         Binding(
-            get: { settings.chatConfig.provider },
+            get: {
+                settings.models.first(where: { $0.id == profile.id }) ?? profile
+            },
             set: { newValue in
-                var config = settings.chatConfig
-                guard config.provider != newValue else { return }
-                config.provider = newValue
-                config.model = StageModelConfig.defaultModel(for: newValue)
-                config.baseURL = nil
-                // 视觉能力按供应商预设带出（gpt-4o / claude 系默认支持）
-                config.supportsImages = StageModelConfig.defaultSupportsImages(for: newValue)
-                settings.chatConfig = config
+                settings.upsertModel(newValue)
                 persistSoon()
             }
         )
     }
 
-    /// 图片输入开关（写全部对话阶段；向量编码无视觉语义不涉及）。
-    private var chatSupportsImagesBinding: Binding<Bool> {
+    /// 启用开关：停用使用中档案时 setActiveModel 兜底链自动迁移（数据层保证）。
+    private func enabledBinding(for profile: ModelProfile) -> Binding<Bool> {
         Binding(
-            get: { settings.chatConfig.supportsImages },
+            get: { profileBinding(for: profile).wrappedValue.enabled },
             set: { newValue in
-                var config = settings.chatConfig
-                config.supportsImages = newValue
-                settings.chatConfig = config
+                settings.setModelEnabled(id: profile.id, enabled: newValue)
                 persistSoon()
             }
         )
     }
 
-    private var chatModelBinding: Binding<String> {
-        Binding(
-            get: { settings.chatConfig.model },
-            set: { newValue in
-                settings.chatConfig.model = newValue
-                persistSoon()
-            }
-        )
-    }
-
-    private var chatBaseURLBinding: Binding<String> {
-        Binding(
-            get: { settings.chatConfig.baseURL ?? "" },
-            set: { newValue in
-                settings.chatConfig.baseURL = newValue.isEmpty ? nil : newValue
-                persistSoon()
-            }
-        )
-    }
-
-    private var chatKeyBinding: Binding<String> {
-        Binding(
-            get: { apiKeys[settings.chatConfig.provider] ?? "" },
-            set: { newValue in
-                let keychainKey = settings.chatConfig.apiKeyKeychainKey
-                apiKeys[settings.chatConfig.provider] = newValue
-                if newValue.isEmpty {
-                    KeychainStore.delete(keychainKey)
-                } else {
-                    try? KeychainStore.set(newValue, forKey: keychainKey)
-                }
-            }
-        )
+    /// 删除模型（至少保留一个；档案私有 Key 槽一并清理——旧存量共享槽不删，
+    /// embedding / 其他档案可能仍引用）。
+    private func removeModel(_ profile: ModelProfile) {
+        guard settings.models.count > 1 else { return }
+        if profile.ownsKeychainSlot, !keyReadFailures.contains(profile.keychainKey) {
+            KeychainStore.delete(profile.keychainKey)
+        }
+        apiKeys[profile.keychainKey] = nil
+        settings.removeModel(id: profile.id)
+        persistSoon()
     }
 
     private var embeddingProviderBinding: Binding<String> {
@@ -883,30 +986,46 @@ struct SettingsDialog: View {
         Binding(
             get: {
                 guard let config = settings.stages[.embedding] else { return "" }
-                return apiKeys[config.provider] ?? ""
+                return apiKeys[config.apiKeyKeychainKey] ?? ""
             },
             set: { newValue in
                 guard let config = settings.stages[.embedding] else { return }
-                apiKeys[config.provider] = newValue
+                let slot = config.apiKeyKeychainKey
+                apiKeys[slot] = newValue
                 if newValue.isEmpty {
-                    KeychainStore.delete(config.apiKeyKeychainKey)
+                    guard !keyReadFailures.contains(slot) else { return }
+                    KeychainStore.delete(slot)
                 } else {
-                    try? KeychainStore.set(newValue, forKey: config.apiKeyKeychainKey)
+                    try? KeychainStore.set(newValue, forKey: slot)
                 }
             }
         )
     }
 
     private func reloadKeys() {
+        // 按槽位读取（多模型下每个档案独立槽位；embedding / search 各自独立）
         var keys: [String: String] = [:]
-        for stage in LLMStage.allCases {
-            guard let config = settings.stages[stage] else { continue }
-            if keys[config.provider] == nil {
-                keys[config.provider] = KeychainStore.get(config.apiKeyKeychainKey) ?? ""
+        var failures: Set<String> = []
+        var slots: [String] = settings.models.map(\.keychainKey)
+        if let embedding = settings.stages[.embedding] {
+            slots.append(embedding.apiKeyKeychainKey)
+        }
+        for slot in slots where keys[slot] == nil {
+            switch KeychainStore.read(slot) {
+            case .found(let value): keys[slot] = value
+            case .notFound: keys[slot] = ""
+            case .accessFailed: failures.insert(slot)
             }
         }
         apiKeys = keys
-        searchAPIKey = KeychainStore.get(WebTool.searchAPIKeyKeychainKey) ?? ""
+        keyReadFailures = failures
+        switch KeychainStore.read(WebTool.searchAPIKeyKeychainKey) {
+        case .found(let value): searchAPIKey = value
+        case .notFound: searchAPIKey = ""
+        case .accessFailed:
+            searchAPIKey = ""
+            keyReadFailures.insert(WebTool.searchAPIKeyKeychainKey)
+        }
     }
 
     // MARK: - 持久化与索引
@@ -934,16 +1053,17 @@ struct SettingsDialog: View {
     }
 }
 
-// MARK: - 模型页组件（文件私有）
+// MARK: - 模型页组件（internal：对话输入栏的模型切换器 ComposerModelButton 复用供应商名）
 
 /// 供应商选项（value = settings 存储值；title = 展示名）。
-private struct DSProviderOption {
+struct DSProviderOption {
     let value: String
     let title: String
 
     static let all: [DSProviderOption] = [
         DSProviderOption(value: "deepseek", title: "DeepSeek"),
         DSProviderOption(value: "zhipu", title: "智谱"),
+        DSProviderOption(value: "volcengine", title: "火山引擎"),
         DSProviderOption(value: "openai", title: "OpenAI"),
         DSProviderOption(value: "anthropic-compat", title: "Anthropic 网关"),
         DSProviderOption(value: "ollama", title: "Ollama 本地"),
@@ -952,6 +1072,290 @@ private struct DSProviderOption {
     /// DSSelect 用的选项映射。
     static var selectOptions: [DSSelectOption<String>] {
         all.map { DSSelectOption($0.value, $0.title) }
+    }
+
+    /// provider 存储值 → 展示名（未知值原样回显，自定义网关不丢名）。
+    static func title(for provider: String) -> String {
+        all.first(where: { $0.value == provider })?.title ?? provider
+    }
+}
+
+/// 模型行内图标按钮（编辑 / 删除）：24×24 hover overlayL2，禁用降透明。
+private struct ModelRowIconButton: View {
+    let icon: DSIcon.Name
+    var help: String
+    var disabled: Bool = false
+    let action: () -> Void
+
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            DSIcon(icon, size: 13)
+                .foregroundStyle(disabled ? Color.ink300 : Color.ink500)
+                .frame(width: 24, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.md)
+                        .fill(hovered && !disabled ? Color.overlayL2 : Color.clear)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: DS.Radius.md))
+                .opacity(disabled ? 0.45 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .onHover { hovered = $0 }
+        .animation(DS.Motion.springFast, value: hovered)
+        .help(help)
+    }
+}
+
+/// 模型编辑器弹框（2026-09-14，浮于设置弹框之上的独立模态）：
+/// 新增 / 编辑共用一套配置表单——草稿在弹框内逐字段编辑，点「添加 / 保存」
+/// 才写 settings + Keychain（写透 stages 即时生效），取消 / Esc / 关闭钮全部丢弃草稿。
+/// 点遮罩不关闭（防误触丢配置），Esc 优先关闭本弹框而非设置弹框。
+private struct ModelEditorSheet: View {
+    @Binding var draft: ModelProfile
+    let target: ModelEditorTarget
+    let keyReadFailures: Set<String>
+    /// 打开时槽位已存的 Key（编辑态回显；新增态槽位全新恒为空串）。
+    let initialKey: String
+    let onCancel: () -> Void
+    let onSave: (ModelProfile, String) -> Void
+
+    @State private var keyValue: String = ""
+
+    private var title: String { target.isNew ? "添加模型" : "编辑模型" }
+    private var saveButtonTitle: String { target.isNew ? "添加" : "保存" }
+
+    var body: some View {
+        ZStack {
+            // 遮罩：阻断与底层设置页的交互；刻意不响应点击关闭（防误触丢草稿）
+            Color.scrim
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+
+            VStack(spacing: 0) {
+                header
+                DSDivider()
+                ScrollView {
+                    form
+                        .padding(.horizontal, DS.Spacing.s24)
+                        .padding(.vertical, DS.Spacing.s20)
+                }
+                DSDivider()
+                footer
+            }
+            .frame(width: 620, height: 540)
+            .background(
+                Color.surfaceBase,
+                in: RoundedRectangle(cornerRadius: DS.Radius.big)
+            )
+            // 与设置弹框同款「无框纯影」：0 24/64 14% + 0 4/16 8%
+            .shadow(color: Color.shadowInk.opacity(0.14), radius: 32, y: 12)
+            .shadow(color: Color.shadowInk.opacity(0.08), radius: 16, y: 4)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.big))
+        }
+        .onAppear { keyValue = initialKey }
+        .onExitCommand { onCancel() }  // Esc 先关本弹框，不穿透到设置弹框
+    }
+
+    // MARK: 头部（标题 + 副标题 + 关闭钮，与设置弹框同形制）
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: DS.Spacing.s12) {
+            VStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                Text(title)
+                    .font(DS.Font.headingMD)
+                    .foregroundStyle(Color.ink900)
+                Text("OpenAI 兼容端点 · 保存后即时生效，对话阶段共用该配置")
+                    .font(DS.Font.bodySM)
+                    .foregroundStyle(Color.ink500)
+            }
+            Spacer(minLength: 0)
+            DSDialogCloseButton { onCancel() }
+        }
+        .padding(.horizontal, DS.Spacing.s24)
+        .padding(.top, DS.Spacing.s16)
+        .padding(.bottom, DS.Spacing.s12)
+    }
+
+    // MARK: 表单（行形制与设置页同款：左标签 + 右控件 + 发丝分隔）
+
+    private var form: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            editorRow("供应商") {
+                DSSelect(options: DSProviderOption.selectOptions, selection: providerBinding)
+                    .frame(width: 170)
+            }
+
+            editorDivider
+
+            editorRow("模型") {
+                TextField("model", text: modelBinding)
+                    .textFieldStyle(.plain)
+                    .dsInput()
+                    .frame(width: 260)
+            }
+
+            editorDivider
+
+            editorRow("baseURL · 可选") {
+                TextField("覆盖预设端点", text: baseURLBinding)
+                    .textFieldStyle(.plain)
+                    .dsInput()
+                    .frame(width: 300)
+            }
+
+            editorDivider
+
+            editorRow("生效端点", detail: "实际请求的端点——预设值或上方覆盖值") {
+                EndpointLine(baseURL: draft.baseURL, provider: draft.provider)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+
+            editorDivider
+
+            editorRow("支持图片输入", detail: imageSupportHint) {
+                DSSwitch(isOn: supportsImagesBinding)
+            }
+
+            editorDivider
+
+            keyRow
+        }
+    }
+
+    /// 图片输入的动态说明（跟随开关状态）。
+    private var imageSupportHint: String {
+        draft.supportsImages
+            ? "已开启——对话输入区可添加图片，随消息发给模型识别（需模型本身具备视觉能力）"
+            : "开启后对话可发送图片（截图 / 竞品界面 / 原型稿），模型将识别图片内容"
+    }
+
+    /// API Key 行（草稿槽位独立持钥）：状态标签 + 密钥输入；格式可疑时行内警示。
+    private var keyRow: some View {
+        VStack(spacing: 0) {
+            editorRow("API Key") {
+                HStack(spacing: DS.Spacing.s8) {
+                    SettingsDialog.keyTag(
+                        configured: !keyValue.trimmingCharacters(in: .whitespaces).isEmpty,
+                        optional: false,
+                        readFailed: keyReadFailures.contains(draft.keychainKey)
+                    )
+                    SecureField("粘贴 API Key", text: $keyValue)
+                        .textFieldStyle(.plain)
+                        .dsInput()
+                        .frame(width: 240)
+                }
+            }
+            if let warning = SettingsDialog.keyFormatWarning(keyValue, provider: draft.provider) {
+                keyWarningLine(warning)
+            } else if keyReadFailures.contains(draft.keychainKey) {
+                // 读取失败 ≠ 未配置：Key 很可能仍在，此时清空输入不会删 Key
+                keyWarningLine(
+                    "Keychain 暂时读不出来（常见于并行构建 / 沙盒启动后）——重启 App 即可恢复，已存的 Key 不会因此丢失"
+                )
+            }
+        }
+    }
+
+    private func keyWarningLine(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: DS.Spacing.s4) {
+            DSIcon(.warningFill, size: 12)
+                .foregroundStyle(Color.statusWarning)
+            Text(text)
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.statusWarning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, DS.Spacing.s2)
+        .padding(.bottom, DS.Spacing.s10)
+    }
+
+    // MARK: 底部操作区（取消丢弃草稿 · 添加/保存提交）
+
+    private var footer: some View {
+        HStack(spacing: DS.Spacing.s10) {
+            Spacer(minLength: 0)
+            Button("取消") { onCancel() }
+                .buttonStyle(.ds(.secondary, size: .sm))
+            Button(saveButtonTitle) { onSave(draft, keyValue) }
+                .buttonStyle(.ds(.primary, size: .sm))
+        }
+        .padding(.horizontal, DS.Spacing.s24)
+        .padding(.vertical, DS.Spacing.s12)
+    }
+
+    // MARK: 草稿绑定（换供应商重置缺省；共享槽跨供应商迁移见 openModelEditor 侧说明）
+
+    /// 切供应商 = 换一家：model/baseURL 重置为该 provider 缺省，视觉能力按预设带出；
+    /// 旧存量沿用的 `byok.<provider>` 共享槽不跨供应商复用——迁到档案私有槽，Key 重新粘贴。
+    private var providerBinding: Binding<String> {
+        Binding(
+            get: { draft.provider },
+            set: { newValue in
+                guard draft.provider != newValue else { return }
+                draft.provider = newValue
+                draft.model = StageModelConfig.defaultModel(for: newValue)
+                draft.baseURL = nil
+                draft.supportsImages = StageModelConfig.defaultSupportsImages(for: newValue)
+                if !draft.ownsKeychainSlot {
+                    draft.keychainKey = "byok.model.\(draft.id)"
+                    keyValue = ""
+                }
+            }
+        )
+    }
+
+    private var modelBinding: Binding<String> {
+        Binding(
+            get: { draft.model },
+            set: { draft.model = $0 }
+        )
+    }
+
+    private var baseURLBinding: Binding<String> {
+        Binding(
+            get: { draft.baseURL ?? "" },
+            set: { draft.baseURL = $0.isEmpty ? nil : $0 }
+        )
+    }
+
+    private var supportsImagesBinding: Binding<Bool> {
+        Binding(
+            get: { draft.supportsImages },
+            set: { draft.supportsImages = $0 }
+        )
+    }
+
+    // MARK: 行助手（弹框自含，避免扩大 SettingsDialog 的私有 API 面）
+
+    private func editorRow<Content: View>(
+        _ label: String,
+        detail: String? = nil,
+        @ViewBuilder trailing: () -> Content
+    ) -> some View {
+        HStack(alignment: .center, spacing: DS.Spacing.s16) {
+            VStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                Text(label)
+                    .font(DS.Font.bodyMD)
+                    .foregroundStyle(Color.ink900)
+                if let detail {
+                    Text(detail)
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink500)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: DS.Spacing.s16)
+            trailing()
+        }
+        .padding(.vertical, DS.Spacing.s10)
+    }
+
+    private var editorDivider: some View {
+        DSDivider()
     }
 }
 

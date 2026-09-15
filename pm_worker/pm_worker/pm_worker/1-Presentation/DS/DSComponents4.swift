@@ -25,15 +25,19 @@ nonisolated struct DSSelectOption<Value: Hashable>: Identifiable {
     }
 }
 
-/// 原型 .ds-select：32 高 · 白底 · neutral-l1 边框 r8 · 右缘下拉箭头 ·
-/// 聚焦黑边（以 Menu 打开态近似）；disabled = 灰底 disabled 字色。
-/// 弹层用原生 Menu——NSMenu 毛玻璃卡即原型 ds-menu 质感的 macOS 对应物，
-/// 自带键盘导航 / 长列表滚动 / 点击外部关闭，且无父级 ScrollView 裁剪问题。
+/// 原型 .ds-select：32 高下拉触发器 + 原生 Menu 弹层。可点击感知三件套：
+/// ① 底色抬亮一档（surfaceSecondary，与 surfaceBase 页底拉开层次）；
+/// ② neutral-l2 描边（深色下 borderL1 仅 8% 白不可见，已弃）；
+/// ③ hover 反馈——底色再叠 overlayL2、描边加深、箭头提亮。
+/// disabled = 同底降字色。弹层用原生 Menu——NSMenu 毛玻璃卡即原型 ds-menu
+/// 质感的 macOS 对应物，自带键盘导航 / 长列表滚动 / 点击外部关闭，
+/// 且无父级 ScrollView 裁剪问题。
 struct DSSelect<Value: Hashable>: View {
     let options: [DSSelectOption<Value>]
     @Binding var selection: Value
 
     @Environment(\.isEnabled) private var isEnabled
+    @State private var hovered = false
 
     init(options: [DSSelectOption<Value>], selection: Binding<Value>) {
         self.options = options
@@ -58,25 +62,39 @@ struct DSSelect<Value: Hashable>: View {
                     .truncationMode(.tail)
                 Spacer(minLength: 0)
                 DSIcon(.down, size: 14)
-                    .foregroundStyle(isEnabled ? Color.ink500 : Color.ink300)
+                    .foregroundStyle(chevronColor)
             }
             .padding(.leading, DS.Spacing.s12)
             .padding(.trailing, DS.Spacing.s10)
             .frame(height: 32)
             .frame(maxWidth: .infinity)
             .background(
-                RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .fill(isEnabled ? Color.surfaceBase : Color.surfaceSecondary)
+                ZStack {
+                    RoundedRectangle(cornerRadius: DS.Radius.lg)
+                        .fill(Color.surfaceSecondary)
+                    if isEnabled && hovered {
+                        RoundedRectangle(cornerRadius: DS.Radius.lg)
+                            .fill(Color.overlayL2)
+                    }
+                }
             )
             .overlay(
                 RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .strokeBorder(Color.borderL1, lineWidth: 1)
+                    .strokeBorder(isEnabled && hovered ? Color.borderL3 : Color.borderL2, lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
             .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
+            .onHover { hovered = $0 }
+            .animation(DS.Motion.springFast, value: hovered)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+    }
+
+    /// 箭头即「可点开」的视觉锚：hover / enabled 提亮一档，禁用降灰。
+    private var chevronColor: Color {
+        if !isEnabled { return Color.ink300 }
+        return hovered ? Color.ink900 : Color.ink700
     }
 }
 

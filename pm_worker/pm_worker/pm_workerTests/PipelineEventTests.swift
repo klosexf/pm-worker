@@ -13,9 +13,15 @@ final class PipelineEventTests: XCTestCase {
 
     private let project = "事件流测试项目"
     private let version = "v1.0"
+    /// 磁盘隔离：rootOverride 指向临时目录，绝不触碰真实 ~/PMAgent/。
+    private var tempRoot: URL!
 
     override func setUp() {
         super.setUp()
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pmagent-tests-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        PMAgentStore.rootOverride = tempRoot
         try? PMAgentStore.bootstrap()
         try? PMAgentStore.createProject(named: project)
         try? PMAgentStore.createVersion(version, in: project)
@@ -23,6 +29,13 @@ final class PipelineEventTests: XCTestCase {
         try? FileManager.default.removeItem(
             at: PipelineEventLog.url(project: project, version: version)
         )
+    }
+
+    override func tearDown() {
+        if let root = tempRoot { try? FileManager.default.removeItem(at: root) }
+        PMAgentStore.rootOverride = nil
+        tempRoot = nil
+        super.tearDown()
     }
 
     // MARK: - ① 事件流读写
@@ -152,6 +165,28 @@ final class PipelineEventTests: XCTestCase {
             prdPrompt.range(of: "## 注入区")!.lowerBound,
             prdPrompt.range(of: "内建自评审")!.lowerBound
         )
+    }
+
+    // MARK: - 歧义处理段（②③④ 注入；① 澄清自身即提问阶段不重复注入）
+
+    func testAmbiguitySectionInjectedInLaterStages() {
+        let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
+        XCTAssertTrue(structurePrompt.contains("歧义处理"))
+        XCTAssertTrue(structurePrompt.contains("「A) 选项文本」"))
+
+        let prototypePrompt = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "A --> B", injection: ""
+        )
+        XCTAssertTrue(prototypePrompt.contains("歧义处理"))
+
+        let prdPrompt = AgentPrompts.prd(
+            tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            prototypePages: ["首页"], analysisNotes: "", injection: ""
+        )
+        XCTAssertTrue(prdPrompt.contains("歧义处理"))
+
+        let clarifyPrompt = AgentPrompts.clarify(rounds: 1, limit: 5, injection: "")
+        XCTAssertFalse(clarifyPrompt.contains("歧义处理"))
     }
 
     // MARK: - Private

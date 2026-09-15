@@ -2,12 +2,12 @@
 //  RiskStore.swift
 //  pm_worker
 //
-//  💀 风险登记闭环运行时（design.md §6.2 四步 / E16a）：
-//  ① 追加（落盘必带触发信号；软上限 3 条，超限提示收敛而非拒收）
-//  ② 状态机事件结算（命中 → triggered + 回写决策日志 risk_hit）
-//  ③ 封板终态（全部 open 统一结算 closed_unfired，悬空口径闭合）
-//  ④ 收敛动作（证伪关闭 / 降级为 open_question / 合并同源）。
-//  risks.jsonl append-only：结算与收敛不改写旧行，而是 append 同 id 新行，
+//  风险登记闭环运行时（方案 A 四态版）：
+//  ① 追加（自评审 fatal → risks.jsonl，带影响与建议方案；登记不设上限）
+//  ② 采纳 / 接受（open → mitigating + 决策日志；或 accepted 自留）
+//  ③ 验证解除 / 重开（mitigating → resolved + 决策日志；没解决 → 重开回 open）
+//  ④ 封板兜底（未闭合的统一 accepted 自留，带入 PRD 已知风险；命中走 risk_hit 对照）。
+//  risks.jsonl append-only：状态流转不改写旧行，而是 append 同 id 新行，
 //  读取侧按「同 id 取最后一行」折叠（collapse）。
 //
 
@@ -17,9 +17,6 @@ import Combine
 @MainActor
 final class RiskStore: ObservableObject {
     @Published private(set) var risks: [RiskRecord]
-
-    /// 活跃（open + triggered）软上限（§6.2 ③：工作集限制，类比 WIP limit）。
-    static let activeLimit = 3
 
     /// Xcode 26 / Swift 6.2 isolated-deinit 运行时 bug 规避：显式退出隔离销毁路径
     /// （本实例会在切换上下文时被替换销毁，默认隔离 deinit 会触发 malloc 崩溃）。
@@ -48,7 +45,7 @@ final class RiskStore: ObservableObject {
             .sorted { $0.createdAt < $1.createdAt }
     }
 
-    /// 同 id 多行（原始行 + 结算 / 收敛行）→ 保留最后一条（按首次出现顺序）。
+    /// 同 id 多行（原始行 + 状态流转行）→ 保留最后一条（按首次出现顺序）。
     nonisolated static func collapse(_ records: [RiskRecord]) -> [RiskRecord] {
         var latest: [String: RiskRecord] = [:]
         var order: [String] = []
@@ -59,31 +56,107 @@ final class RiskStore: ObservableObject {
         return order.compactMap { latest[$0] }
     }
 
-    // MARK: - 活跃口径（§6.2 ③）
+    // MARK: - 分区口径（台账三分区）
 
-    /// 活跃 = open + triggered（未闭合条目）。
+    /// 待处理（自评审登记，等用户决定）。
+    var pendingRisks: [RiskRecord] {
+        risks.filter { $0.status == .open }
+    }
+
+    /// 已挂方案（采纳后等验证；跨确认门时批量核验）。
+    var mitigatingRisks: [RiskRecord] {
+        risks.filter { $0.status == .mitigating }
+    }
+
+    /// 未闭合（待处理 + 已挂方案）——封板兜底与 PRD 注入口径。
     var activeRisks: [RiskRecord] {
-        risks.filter { $0.status == .open || $0.status == .triggered }
+        risks.filter(\.isActive)
     }
 
-    var needsConvergence: Bool {
-        activeRisks.count > Self.activeLimit
-    }
+    // MARK: - ① 追加
 
-    // MARK: - ① 追加（软上限：超限提示收敛，不拒收）
-
-    /// - Returns: 需收敛时的建议文案；nil 表示未超限。
-    @discardableResult
-    func append(_ risk: RiskRecord) throws -> String? {
+    func append(_ risk: RiskRecord) throws {
         try PMAgentStore.appendLine(risk, to: risksURL)
         risks.append(risk)
         risks.sort { $0.createdAt < $1.createdAt }
-        guard needsConvergence else { return nil }
-        return "活跃 💀 已达 \(activeRisks.count) 条（软上限 \(Self.activeLimit) 条）："
-            + "建议先收敛（证伪关闭 / 降级为 open_question / 合并同源）再继续登记。"
     }
 
-    // MARK: - ② 状态机事件结算（§6.2 ②：事件驱动，非每轮轮询）
+    // MARK: - ② 采纳 / 接受
+
+    /// 采纳方案：open → mitigating（挂起等验证，≠ 解除）。
+    /// 同步回写一条决策日志（待验证态——方案落地验证通过后由 resolve 补一条解除决策）。
+    /// - Returns: 回写的决策记录（含 id，供台账行展示「→ 决策日志 d_xx」）。
+    @discardableResult
+    func adopt(id: String) throws -> DecisionRecord {
+        guard let index = risks.firstIndex(where: { $0.id == id }) else {
+            throw RiskStore.notFound(id)
+        }
+        guard risks[index].status == .open else {
+            throw RiskStore.wrongState(id, from: risks[index].status, expect: .open)
+        }
+        var record = risks[index]
+        record.status = .mitigating
+        let decision = Self.mitigationDecision(for: record)
+        record.resolution = "决策日志 \(decision.id)"
+        record.closedAt = nil
+        try PMAgentStore.appendLine(record, to: risksURL)
+        try PMAgentStore.appendLine(DecisionLogEntry.decision(decision), to: decisionsURL)
+        risks[index] = record
+        return decision
+    }
+
+    /// 接受风险：open → accepted（风险自留，封板时带入 PRD 已知风险）。
+    func accept(id: String) throws {
+        guard let index = risks.firstIndex(where: { $0.id == id }) else {
+            throw RiskStore.notFound(id)
+        }
+        guard risks[index].status == .open else {
+            throw RiskStore.wrongState(id, from: risks[index].status, expect: .open)
+        }
+        risks[index].status = .accepted
+        risks[index].resolution = "风险自留 · 封板时带入 PRD 已知风险"
+        risks[index].closedAt = ISO8601.timestamp()
+        try PMAgentStore.appendLine(risks[index], to: risksURL)
+    }
+
+    // MARK: - ③ 验证解除 / 重开
+
+    /// 验证通过：mitigating → resolved（风险真的没了——方案落地且确认没出事）。
+    /// 回写一条解除决策（闭环上一条待验证的采纳决策）。
+    @discardableResult
+    func resolve(id: String) throws -> DecisionRecord {
+        guard let index = risks.firstIndex(where: { $0.id == id }) else {
+            throw RiskStore.notFound(id)
+        }
+        guard risks[index].status == .mitigating else {
+            throw RiskStore.wrongState(id, from: risks[index].status, expect: .mitigating)
+        }
+        var record = risks[index]
+        record.status = .resolved
+        let decision = Self.resolutionDecision(for: record)
+        record.resolution = "决策日志 \(decision.id)"
+        record.closedAt = ISO8601.timestamp()
+        try PMAgentStore.appendLine(record, to: risksURL)
+        try PMAgentStore.appendLine(DecisionLogEntry.decision(decision), to: decisionsURL)
+        risks[index] = record
+        return decision
+    }
+
+    /// 没解决：mitigating → open（重开回待处理，方案需升级；留痕「验证未过」）。
+    func reopen(id: String) throws {
+        guard let index = risks.firstIndex(where: { $0.id == id }) else {
+            throw RiskStore.notFound(id)
+        }
+        guard risks[index].status == .mitigating else {
+            throw RiskStore.wrongState(id, from: risks[index].status, expect: .mitigating)
+        }
+        risks[index].status = .open
+        risks[index].resolution = "验证未过 · 已重开（方案需升级）"
+        risks[index].closedAt = nil
+        try PMAgentStore.appendLine(risks[index], to: risksURL)
+    }
+
+    // MARK: - 状态机事件结算（风险炸了：上游产物重做撞上未处理风险）
 
     /// 把所有 triggerSignal == trigger 且 status == .open 的条目结算为 .triggered，
     /// 并为每条回写一条决策日志（risk_hit：当初预测 vs 实际发生——复盘最值钱资产）。
@@ -116,71 +189,61 @@ final class RiskStore: ObservableObject {
         return settled
     }
 
-    // MARK: - ③ 封板终态（§6.2 ④：每条 💀 有始有终）
+    // MARK: - ④ 封板兜底（每条风险有始有终）
 
-    /// 所有 open 统一结算为 .closedUnfired；triggered 不动（已闭合为命中）。
+    /// 未闭合（open + mitigating）统一 accepted 自留——带入 PRD 已知风险章节；
+    /// resolved / triggered 不动（已闭合）。
     func settleAllForRelease() throws {
         let now = ISO8601.timestamp()
-        for index in risks.indices where risks[index].status == .open {
-            risks[index].status = .closedUnfired
+        for index in risks.indices where risks[index].isActive {
+            risks[index].status = .accepted
+            risks[index].resolution = "封板收尾 · 风险自留（带入 PRD 已知风险）"
             risks[index].closedAt = now
             try PMAgentStore.appendLine(risks[index], to: risksURL)
         }
     }
 
-    // MARK: - ④ 收敛动作（软上限超限时调用；全部 append-only）
+    // MARK: - Private
 
-    /// 关闭（已证伪）。
-    func closeAsFalsified(id: String) throws {
-        try converge(id: id, status: .closedFalsified, resolution: "已证伪关闭")
-    }
-
-    /// 降级为 open_question（实为 ❓ 非 💀；不新增模型字段，resolution 记录去向）。
-    func downgradeToOpenQuestion(id: String) throws {
-        guard let record = risks.first(where: { $0.id == id }) else {
-            throw RiskStore.notFound(id)
-        }
-        try converge(
-            id: id,
-            status: .closedFalsified,
-            resolution: "降级为 open_question：\(record.hypothesis)"
+    /// 采纳决策（决策日志五要素；toBeVerified=true，解除时补闭环决策）。
+    private static func mitigationDecision(for record: RiskRecord) -> DecisionRecord {
+        var why = "风险：\(record.hypothesis)"
+        if let impact = record.impact, !impact.isEmpty { why += "（炸了会怎样：\(impact)）" }
+        return DecisionRecord(
+            version: record.version,
+            decision: "【风险应对】\(record.plan ?? "挂上应对方案，等验证")",
+            why: why,
+            confidence: 1.0,
+            toBeVerified: true
         )
     }
 
-    /// 合并同源 💀：source 关闭为 .merged，target 保留不动。
-    func merge(into targetId: String, from sourceId: String) throws {
-        guard targetId != sourceId else {
-            throw NSError(
-                domain: "RiskStore", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "风险不能合并到自身：\(sourceId)"]
-            )
-        }
-        guard risks.contains(where: { $0.id == targetId }) else {
-            throw NSError(
-                domain: "RiskStore", code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "合并目标不存在：\(targetId)"]
-            )
-        }
-        try converge(id: sourceId, status: .merged, resolution: "合并到 \(targetId)")
-    }
-
-    // MARK: - Private
-
-    /// 收敛通用路径：append 同 id 新行（status / closedAt / resolution），内存同步。
-    private func converge(id: String, status: RiskRecord.Status, resolution: String) throws {
-        guard let index = risks.firstIndex(where: { $0.id == id }) else {
-            throw RiskStore.notFound(id)
-        }
-        risks[index].status = status
-        risks[index].closedAt = ISO8601.timestamp()
-        risks[index].resolution = resolution
-        try PMAgentStore.appendLine(risks[index], to: risksURL)
+    /// 解除决策（闭环：验证通过，方案有效）。
+    private static func resolutionDecision(for record: RiskRecord) -> DecisionRecord {
+        DecisionRecord(
+            version: record.version,
+            decision: "【风险解除】\(record.hypothesis)——方案验证通过",
+            why: "方案「\(record.plan ?? "见风险条目")」落地后确认风险未发生",
+            confidence: 1.0,
+            toBeVerified: false
+        )
     }
 
     private static func notFound(_ id: String) -> NSError {
         NSError(
             domain: "RiskStore", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "风险不存在：\(id)"]
+        )
+    }
+
+    private static func wrongState(
+        _ id: String, from status: RiskRecord.Status, expect: RiskRecord.Status
+    ) -> NSError {
+        NSError(
+            domain: "RiskStore", code: 4,
+            userInfo: [NSLocalizedDescriptionKey:
+                "风险 \(id) 当前状态为「\(RiskStatusPresentation.text(status))」，"
+                    + "该操作要求「\(RiskStatusPresentation.text(expect))」"]
         )
     }
 

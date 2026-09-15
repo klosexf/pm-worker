@@ -6,7 +6,8 @@
 //  去掉胶囊底/步骤区底框，对齐 Trae 对话「思考过程 ›」样式）：
 //  - 思考中：品牌色 pulse 圆点 + 「正在思考…」think-sweep 流光扫字（2.4s 循环，
 //    原型 .think-live/.run-dot，长静默期防假死感；减弱动态时降级纯文本）
-//  - 已完成：默认折叠摘要行「思考了 Ns · M 步 · 技能 ×K ›」，点击展开步骤
+//  - 已完成：默认折叠摘要行「思考了 Ns · M 步 · <技能名|技能 ×K> ›」，点击展开步骤
+//    （技能 ≤2 个摘要直接点名，≥3 显示计数；技能行带 ✦ 与推理行区分）
 //
 
 import SwiftUI
@@ -14,6 +15,9 @@ import SwiftUI
 struct ThinkingCard: View {
     /// nil → 思考中态；有值 → 完成态。
     let data: ThinkData?
+    /// 思考中态展示的引用技能 id（本轮 Context Builder 注入的技能；
+    /// 完成态由 data.steps 的技能步骤承载，此参数忽略）。
+    var skills: [String] = []
 
     @State private var expanded = false
 
@@ -28,9 +32,22 @@ struct ThinkingCard: View {
     // MARK: - 思考中（pulse 圆点 + 流光扫字，纯文字无底）
 
     private var streamingCard: some View {
-        HStack(spacing: DS.Spacing.s8) {
-            DSPulseDot()
-            ThinkSweepText("正在思考…")
+        VStack(alignment: .leading, spacing: DS.Spacing.s4) {
+            HStack(spacing: DS.Spacing.s8) {
+                DSPulseDot()
+                ThinkSweepText("正在思考…")
+            }
+            if !skills.isEmpty {
+                // 引用技能行：技能在组装期已确定注入，思考中即时可见（与完成态技能行同款图标）
+                HStack(alignment: .top, spacing: DS.Spacing.s6) {
+                    DSIcon(.aiStars, size: 11)
+                        .foregroundStyle(Color.statusPrimary)
+                    Text("引用技能：" + skills.joined(separator: " · "))
+                        .font(DS.Font.bodyXS)
+                        .dsCaptionType(size: 12)
+                        .foregroundStyle(Color.ink500)
+                }
+            }
         }
     }
 
@@ -55,67 +72,84 @@ struct ThinkingCard: View {
             .buttonStyle(.plain)
 
             if expanded {
-                // 步骤直接铺在页面上（无背景框），与正文左缘对齐
-                VStack(alignment: .leading, spacing: DS.Typography.listRowSpacing) {
-                    ForEach(Array(data.steps.enumerated()), id: \.offset) { _, step in
-                        stepRow(step)
-                    }
-                }
-                .padding(.top, DS.Spacing.s8)
-                .transition(.opacity)
+                // 步骤直接铺在页面上（无背景框），与正文左缘对齐。
+                // 必须合并为单个 Text：SwiftUI textSelection 只在单个 Text 内生效，
+                // 逐条独立 Text 时 macOS 拖选跨行即断（只能一行一行选）。
+                Text(Self.stepsAttributedString(data))
+                    .dsCaptionType(size: 13)
+                    .textSelection(.enabled)
+                    .padding(.top, DS.Spacing.s8)
+                    .transition(.opacity)
             }
         }
     }
 
-    @ViewBuilder
-    private func stepRow(_ step: ThinkData.Step) -> some View {
-        if let skill = step.skill {
-            // 技能调用行：命中了哪个技能 / 注入了什么 / 耗时
-            HStack(alignment: .top, spacing: DS.Spacing.s6) {
-                DSIcon(.aiStars, size: 11)
-                    .foregroundStyle(Color.statusPrimary)
-                VStack(alignment: .leading, spacing: DS.Spacing.s2) {
-                    Text(skill)
-                        .font(DS.Font.bodyXS)
-                        .dsCaptionType(size: 12)
-                        .foregroundStyle(Color.ink700)
-                    if let detail = step.detail {
-                        Text(detail)
-                            .font(DS.Font.bodyXS)
-                            .dsCaptionType(size: 12)
-                            .foregroundStyle(Color.ink500)
-                    }
-                }
+    // MARK: - 步骤合并文本（跨行连续选取的关键）
+
+    /// 全部步骤合并为单段 AttributedString：技能行（✦ + 名称 + 注入说明）与
+    /// 推理行（· + 要点）分 run 控制字号/颜色，视觉对齐原逐条渲染。
+    private static func stepsAttributedString(_ data: ThinkData) -> AttributedString {
+        var result = AttributedString()
+        for (index, step) in data.steps.enumerated() {
+            if let skill = step.skill {
+                // 技能调用行：命中了哪个技能 / 注入了什么 / 耗时
+                var star = AttributedString("✦ ")
+                star.font = DS.Font.bodyXS
+                star.foregroundColor = Color.statusPrimary
+                result += star
+
+                var name = AttributedString(skill)
+                name.font = DS.Font.bodyXS
+                name.foregroundColor = Color.ink700
+                result += name
+
                 if let dur = step.dur {
-                    Text(dur)
-                        .font(DS.Font.monoSM)
-                        .foregroundStyle(Color.ink500)
+                    var d = AttributedString("  " + dur)
+                    d.font = DS.Font.monoSM
+                    d.foregroundColor = Color.ink500
+                    result += d
                 }
+                if let detail = step.detail {
+                    var br = AttributedString("\n")
+                    br.font = DS.Font.bodyXS
+                    result += br
+                    var d = AttributedString("  " + detail)
+                    d.font = DS.Font.bodyXS
+                    d.foregroundColor = Color.ink500
+                    result += d
+                }
+            } else if let text = step.text {
+                var dot = AttributedString("· ")
+                dot.font = DS.Font.bodySM
+                dot.foregroundColor = Color.ink300
+                result += dot
+
+                var body = AttributedString(text)
+                body.font = DS.Font.bodySM
+                body.foregroundColor = Color.ink500
+                result += body
             }
-        } else if let text = step.text {
-            HStack(alignment: .top, spacing: DS.Spacing.s6) {
-                Text("·")
-                    .font(DS.Font.bodySM)
-                    .foregroundStyle(Color.ink300)
-                Text(text)
-                    .font(DS.Font.bodySM)
-                    .dsCaptionType(size: 13)
-                    .foregroundStyle(Color.ink500)
+            if index < data.steps.count - 1 {
+                var br = AttributedString("\n")
+                br.font = DS.Font.bodySM
+                result += br
             }
         }
+        return result
     }
 }
 
 // MARK: - pulse 圆点（原型 .run-dot：品牌实心 + 1.5s 呼吸）
 
-/// 品牌色呼吸点（本文件思考中态与产物进度卡共用）。
+/// 品牌色呼吸点（本文件思考中态、侧栏会话生成指示共用；tint 可覆盖默认色）。
 struct DSPulseDot: View {
+    var tint: Color = .brand600
     @State private var dimmed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Circle()
-            .fill(Color.brand600)
+            .fill(tint)
             .frame(width: 6, height: 6)
             .opacity(dimmed ? 0.3 : 1)
             .onAppear {

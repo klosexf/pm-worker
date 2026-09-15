@@ -267,13 +267,13 @@ final class StorageTests: XCTestCase {
             .appendingPathComponent("pm_worker", isDirectory: true)
             .appendingPathComponent("Resources", isDirectory: true)
 
-        // 17 个技能：六字段完整 + 反模式章节 + 正文 1500 字软上限
-        // （skills-inventory §2 首批 14 + §2.6 v1.2 追加 3）
+        // 21 个技能：六字段完整 + 反模式章节 + 正文 1500 字软上限
+        // （skills-inventory §2 首批 14 + §2.6 v1.2 追加 3 + §2.7 v1.3 追加 1 + §4.3 P1 v1.4 追加 3）
         let skillsDir = resources.appendingPathComponent("skills", isDirectory: true)
         let skillFiles = try FileManager.default.contentsOfDirectory(
             at: skillsDir, includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "md" }
-        XCTAssertEqual(skillFiles.count, 17, "技能数应为 17（skills-inventory §2 + §2.6）")
+        XCTAssertEqual(skillFiles.count, 21, "技能数应为 21（skills-inventory §2 + §2.6 + §2.7 + §4.3 P1）")
 
         for file in skillFiles {
             let markdown = try String(contentsOf: file, encoding: .utf8)
@@ -373,11 +373,11 @@ final class PipelineM2Tests: XCTestCase {
         // 空目录 → clarify
         XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .clarify)
 
-        // clarification.md → structure
+        // 澄清要点表 → structure
         try PMAgentStore.writeVerified(
             "要点表",
             to: PMAgentStore.versionURL(project: project, version: version)
-                .appendingPathComponent("01-requirements/clarification.md")
+                .appendingPathComponent(ArtifactPath.clarification)
         )
         XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .structure)
 
@@ -409,7 +409,7 @@ final class PipelineM2Tests: XCTestCase {
         // 手动补齐结构产物 + 确认 → 放行
         let dir = PMAgentStore.versionURL(project: "M2项目", version: "v1.0")
         try PMAgentStore.writeVerified(
-            "# 图", to: dir.appendingPathComponent("02-structure/architecture.md")
+            "# 图", to: dir.appendingPathComponent(ArtifactPath.architecture)
         )
         try engine.confirmStructure()
         XCTAssertTrue(engine.structureConfirmed)
@@ -469,11 +469,11 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertEqual(artifacts.modulePageMap, "| 模块 | 原型页面 | 页面说明 |\n|---|---|---|\n| 首页 | index | 入口 |")
         let dir = PMAgentStore.versionURL(project: "M2项目", version: "v1.0")
             .appendingPathComponent("02-structure")
-        for file in ["architecture.md", "core-flows.md", "module-page-map.md"] {
+        for file in ["功能架构图.md", "核心流程图.md", "模块-页面映射表.md"] {
             let content = try String(
                 contentsOf: dir.appendingPathComponent(file), encoding: .utf8
             )
-            XCTAssertTrue(content.contains("```mermaid") || file == "module-page-map.md")
+            XCTAssertTrue(content.contains("```mermaid") || file == "模块-页面映射表.md")
         }
 
         // 剥离产物块后的展示正文
@@ -543,10 +543,10 @@ final class PipelineM2Tests: XCTestCase {
             ),
             ArtifactParser.ArtifactBlock(name: "architecture", content: "非 HTML"),
         ]
-        let url = try ArtifactParser.writePrototypeArtifact(
+        let written = try ArtifactParser.writePrototypeArtifact(
             blocks: blocks, project: "M2项目", version: "v1.0"
         )
-        let saved = try XCTUnwrap(url)
+        let saved = try XCTUnwrap(written).url
         XCTAssertEqual(
             try String(contentsOf: saved, encoding: .utf8),
             "<!DOCTYPE html><html><body>灰盒原型</body></html>"
@@ -592,6 +592,31 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertNil(ArtifactParser.parseIncompleteArtifact(
             in: "```artifact: Hello World\n正文"
         ))
+    }
+
+    /// PRD 截断兜底（未闭合 artifact:prd 提取草稿；思考 token 撞 max_tokens 池场景）。
+    func testPRDTruncatedDraft() {
+        let longBody = String(repeating: "功能需求条目。\n", count: 80)  // >500 字符
+
+        // 未闭合 prd 块且正文够长 → 提取草稿
+        let truncated = "撰写说明。\n\n```artifact:prd\n# PRD\n\(longBody)"
+        XCTAssertEqual(
+            ArtifactParser.prdTruncatedDraft(from: truncated),
+            "# PRD\n\(longBody)"
+        )
+
+        // 残片过短（≤500 字符）→ 不落盘
+        XCTAssertNil(ArtifactParser.prdTruncatedDraft(
+            from: "```artifact:prd\n# PRD\n太短的残片"
+        ))
+
+        // prd 块完整闭合（截断的是后面的 decision）→ 非 prd 草稿
+        XCTAssertNil(ArtifactParser.prdTruncatedDraft(
+            from: "```artifact:prd\n完整正文\n```\n\n```artifact:decision\n[{\"decision\":"
+        ))
+
+        // 无产物标记 / 完整回复 → nil
+        XCTAssertNil(ArtifactParser.prdTruncatedDraft(from: "普通回复，无产物。"))
     }
 
     // MARK: 澄清选项行解析（E1：选项式提问点选）
@@ -655,7 +680,7 @@ final class PipelineM2Tests: XCTestCase {
     func testMemorySupersedeSemantics() {
         func entry(_ id: String, content: String, invalidated: Bool = false) -> MemoryEntry {
             MemoryEntry(
-                id: id, scope: .version, kind: .conclusion, content: content,
+                id: id, scope: .project, kind: .conclusion, content: content,
                 invalidated: invalidated)
         }
 
@@ -691,27 +716,39 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertNil(ThinkData.from(reasoning: "  \n ", duration: 1))
     }
 
-    // MARK: Mermaid 提取（E17：结构产物渲染源）
+    // MARK: 思考卡引用技能（技能注入在思考过程中可见）
 
-    func testMermaidExtractor() {
-        let markdown = """
-        # 功能架构图
+    func testThinkDataFromReasoningWithSkills() {
+        let data = ThinkData.from(
+            reasoning: "先分析目标用户\n再确认核心场景",
+            duration: 5,
+            skills: ["S18 hi-fi-prototype", "S13 poc-probe-selection"]
+        )
+        // 技能步骤置于推理步骤之前
+        XCTAssertEqual(data?.steps.count, 4)
+        XCTAssertEqual(data?.steps.prefix(2).compactMap(\.skill), [
+            "S18 hi-fi-prototype", "S13 poc-probe-selection",
+        ])
+        XCTAssertTrue(data?.steps.prefix(2).allSatisfy { $0.text == nil } == true)
+        // 摘要行：技能 ≤2 个直接点名（折叠态即可见所应用技能名）
+        XCTAssertTrue(data?.summary.contains("S18 hi-fi-prototype、S13 poc-probe-selection") == true)
+        XCTAssertFalse(data?.summary.contains("技能 ×") == true)
 
-        ```mermaid
-        graph TD
-          A --> B
-        ```
+        // 仅有技能、无 reasoning → 仍产出思考卡（技能行承载）
+        let skillOnly = ThinkData.from(reasoning: "", duration: 2, skills: ["技能X"])
+        XCTAssertEqual(skillOnly?.steps.count, 1)
+        XCTAssertEqual(skillOnly?.steps.first?.skill, "技能X")
+        XCTAssertEqual(skillOnly?.summary, "思考了 2s · 1 步 · 技能X")
 
-        # 模块-页面映射表
+        // ≥3 个技能收敛为计数（防摘要行过长）
+        let manySkills = ThinkData.from(
+            reasoning: "", duration: 2, skills: ["技能X", "技能Y", "技能Z"]
+        )
+        XCTAssertEqual(manySkills?.summary, "思考了 2s · 3 步 · 技能 ×3")
 
-        | 模块 | 页面 |
-        |---|---|
-        | 首页 | index |
-        """
-        let diagrams = MermaidExtractor.diagrams(in: markdown)
-        XCTAssertEqual(diagrams.count, 1)
-        XCTAssertEqual(diagrams[0].title, "功能架构图")
-        XCTAssertTrue(diagrams[0].source.contains("graph TD"))
+        // 无技能时行为不变（兼容旧调用）
+        let noSkills = ThinkData.from(reasoning: "  \n ", duration: 1)
+        XCTAssertNil(noSkills)
     }
 
     // MARK: 阶段推进意图识别（自由作答等价选①）
@@ -777,11 +814,10 @@ final class RiskStoreTests: XCTestCase {
         let store = RiskStore(project: "风险项目", version: "v1.0")
         let a = makeRisk("结构改动会导致返工", trigger: .structureRegen, stage: .structure)
         let b = makeRisk("原型页数超 5 难维护", trigger: .prototypeRegen)
-        XCTAssertNil(try store.append(a))
-        XCTAssertNil(try store.append(b))
+        try store.append(a)
+        try store.append(b)
         XCTAssertEqual(store.risks.count, 2)
         XCTAssertEqual(store.activeRisks.count, 2)
-        XCTAssertFalse(store.needsConvergence)
 
         // 同 id 结算行（append-only 不改写旧行）→ 折叠后该 id 仍 1 条且为终态
         var settled = a
@@ -834,95 +870,134 @@ final class RiskStoreTests: XCTestCase {
         XCTAssertEqual(proto1Hit.actual, "第 3 轮原型重做")
     }
 
-    // MARK: 软上限（超限不拒收，提示收敛）
+    // MARK: 四态闭环（采纳 → 挂起 → 解除 / 重开；接受自留）
 
-    func testSoftLimit() throws {
+    func testFourStateFlow() throws {
         try makeWorkspace()
-        let store = RiskStore(project: "风险项目", version: "v1.0")
-
-        for index in 1...3 {
-            let risk = makeRisk("假设\(index)", trigger: .decisionOverturned)
-            XCTAssertNil(try store.append(risk), "第 \(index) 条不应提示收敛")
-        }
-        XCTAssertFalse(store.needsConvergence)
-        XCTAssertEqual(store.activeRisks.count, 3)
-
-        // 第 4 条：仍收下（不抛错），返回收敛建议
-        let fourth = makeRisk("假设4", trigger: .decisionOverturned)
-        let suggestion = try XCTUnwrap(try store.append(fourth), "第 4 条应返回收敛建议")
-        XCTAssertFalse(suggestion.isEmpty)
-        XCTAssertTrue(store.needsConvergence)
-        XCTAssertEqual(store.activeRisks.count, 4, "软上限不拒收")
-
-        // 证伪关闭一条后回到限内
-        try store.closeAsFalsified(id: fourth.id)
-        XCTAssertFalse(store.needsConvergence)
-        XCTAssertEqual(store.activeRisks.count, 3)
-        XCTAssertEqual(store.risks.first { $0.id == fourth.id }?.status, .closedFalsified)
-    }
-
-    // MARK: 封板终态
-
-    func testReleaseSettlement() throws {
-        try makeWorkspace()
-        let store = RiskStore(project: "风险项目", version: "v1.0")
-        let open1 = makeRisk("未触发一", trigger: .decisionOverturned)
-        let open2 = makeRisk("未触发二", trigger: .prdStale, stage: .prd)
-        let fired = makeRisk("已命中", trigger: .structureRegen, stage: .structure)
-        try store.append(open1)
-        try store.append(open2)
-        try store.append(fired)
-        _ = try store.settle(trigger: .structureRegen, note: "结构被推翻")
-        XCTAssertEqual(store.risks.filter { $0.status == .open }.count, 2)
-
-        try store.settleAllForRelease()
-        XCTAssertEqual(store.risks.filter { $0.status == .closedUnfired }.count, 2)
-        XCTAssertEqual(store.risks.first { $0.id == fired.id }?.status, .triggered, "triggered 封板不动")
-        XCTAssertFalse(store.needsConvergence)
-
-        // 重开 store（append-only 折叠）：终态保持
-        let reloaded = RiskStore(project: "风险项目", version: "v1.0")
-        XCTAssertEqual(reloaded.risks.count, 3)
-        XCTAssertEqual(reloaded.risks.filter { $0.status == .closedUnfired }.count, 2)
-        XCTAssertEqual(reloaded.risks.first { $0.id == fired.id }?.status, .triggered)
-    }
-
-    // MARK: 收敛动作（合并 / 降级）
-
-    func testMergeAndDowngrade() throws {
-        try makeWorkspace()
+        let decisionsURL = PMAgentStore.jsonlURL(
+            project: "风险项目", version: "v1.0", file: "decisions.jsonl"
+        )
         let risksURL = PMAgentStore.jsonlURL(
             project: "风险项目", version: "v1.0", file: "risks.jsonl"
         )
 
         let store = RiskStore(project: "风险项目", version: "v1.0")
-        let target = makeRisk("同源风险（目标）", trigger: .structureRegen, stage: .structure)
-        let source = makeRisk("同源风险（来源）", trigger: .structureRegen, stage: .structure)
-        let downgraded = makeRisk("降级候选", trigger: .prdStale, stage: .prd)
-        try store.append(target)
-        try store.append(source)
-        try store.append(downgraded)
+        var risk = makeRisk("首页并入速记后信息密度超载", trigger: .structureRegen, stage: .structure)
+        risk.impact = "30 秒记不完一笔，核心场景失效"
+        risk.plan = "首页只留单行速记框，完整处理挪浮层"
+        try store.append(risk)
 
-        // 合并：source → target
-        try store.merge(into: target.id, from: source.id)
-        let merged = try XCTUnwrap(store.risks.first { $0.id == source.id })
-        XCTAssertEqual(merged.status, .merged)
-        XCTAssertEqual(merged.resolution, "合并到 \(target.id)")
-        XCTAssertNotNil(merged.closedAt)
-        XCTAssertEqual(store.risks.first { $0.id == target.id }?.status, .open, "target 保留")
+        // 采纳：open → mitigating（≠ 解除），回写待验证决策
+        let adopted = try store.adopt(id: risk.id)
+        XCTAssertEqual(store.risks.first { $0.id == risk.id }?.status, .mitigating)
+        XCTAssertTrue(adopted.toBeVerified)
+        XCTAssertTrue(adopted.decision.contains("单行速记框"))
+        XCTAssertEqual(store.risks.first { $0.id == risk.id }?.resolution, "决策日志 \(adopted.id)")
 
-        // 降级为 open_question
-        try store.downgradeToOpenQuestion(id: downgraded.id)
-        let degraded = try XCTUnwrap(store.risks.first { $0.id == downgraded.id })
-        XCTAssertEqual(degraded.status, .closedFalsified)
-        XCTAssertEqual(degraded.resolution, "降级为 open_question：降级候选")
+        // 解除：mitigating → resolved，回写闭环决策（toBeVerified=false）
+        let resolved = try store.resolve(id: risk.id)
+        XCTAssertEqual(store.risks.first { $0.id == risk.id }?.status, .resolved)
+        XCTAssertNotNil(store.risks.first { $0.id == risk.id }?.closedAt)
+        XCTAssertFalse(resolved.toBeVerified)
+        XCTAssertTrue(resolved.decision.contains("风险解除"))
 
-        // append-only：3 原始行 + 合并行 + 降级行 = 5 行
-        XCTAssertEqual(PMAgentStore.readLines(RiskRecord.self, from: risksURL).count, 5)
+        // decisions.jsonl：采纳 1 条 + 解除 1 条（均为 decision 条目）
+        let decisions = PMAgentStore.readLines(DecisionLogEntry.self, from: decisionsURL)
+        XCTAssertEqual(decisions.count, 2)
+        guard case .decision(let first)? = decisions.first,
+              case .decision(let second)? = decisions.last else {
+            return XCTFail("决策条目类型不符")
+        }
+        XCTAssertTrue(first.toBeVerified)
+        XCTAssertFalse(second.toBeVerified)
 
-        // 容错：不存在的 id 报错、自合并报错
-        XCTAssertThrowsError(try store.closeAsFalsified(id: "r_不存在"))
-        XCTAssertThrowsError(try store.merge(into: target.id, from: target.id))
+        // append-only：1 原始行 + 采纳行 + 解除行 = 3 行
+        XCTAssertEqual(PMAgentStore.readLines(RiskRecord.self, from: risksURL).count, 3)
+
+        // 接受路径：open → accepted（自留，不写决策日志）
+        let other = makeRisk("团队协作诉求打破单机假设", trigger: .decisionOverturned)
+        try store.append(other)
+        try store.accept(id: other.id)
+        let accepted = store.risks.first { $0.id == other.id }
+        XCTAssertEqual(accepted?.status, .accepted)
+        XCTAssertEqual(accepted?.resolution, "风险自留 · 封板时带入 PRD 已知风险")
+    }
+
+    func testReopenOnUnresolvedMitigation() throws {
+        try makeWorkspace()
+        let store = RiskStore(project: "风险项目", version: "v1.0")
+        let risk = makeRisk("迁移成本高导致新用户流失", trigger: .prototypeRegen)
+        try store.append(risk)
+
+        try store.adopt(id: risk.id)
+        try store.reopen(id: risk.id)
+        let reopened = store.risks.first { $0.id == risk.id }
+        XCTAssertEqual(reopened?.status, .open, "没解决 → 重开回待处理")
+        XCTAssertEqual(reopened?.resolution, "验证未过 · 已重开（方案需升级）")
+        XCTAssertNil(reopened?.closedAt)
+
+        // 重开后可再采纳（状态机回路）
+        XCTAssertNoThrow(try store.adopt(id: risk.id))
+        XCTAssertEqual(store.risks.first { $0.id == risk.id }?.status, .mitigating)
+
+        // 状态守卫：open 不能直接解除、mitigating 不能重复采纳
+        let fresh = makeRisk("未挂方案的风险", trigger: .release)
+        try store.append(fresh)
+        XCTAssertThrowsError(try store.resolve(id: fresh.id))
+        XCTAssertThrowsError(try store.adopt(id: risk.id))
+    }
+
+    // MARK: 封板兜底（未闭合统一自留；已闭合不动）
+
+    func testReleaseSettlement() throws {
+        try makeWorkspace()
+        let store = RiskStore(project: "风险项目", version: "v1.0")
+        let pending = makeRisk("未处理风险", trigger: .decisionOverturned)
+        let hanging = makeRisk("已挂方案风险", trigger: .prdStale, stage: .prd)
+        let fired = makeRisk("已命中", trigger: .structureRegen, stage: .structure)
+        try store.append(pending)
+        try store.append(hanging)
+        try store.append(fired)
+        try store.adopt(id: hanging.id)
+        _ = try store.settle(trigger: .structureRegen, note: "结构被推翻")
+        XCTAssertEqual(store.risks.filter { $0.status == .mitigating }.count, 1)
+
+        try store.settleAllForRelease()
+        // 未闭合（open + mitigating）→ accepted 自留；triggered 封板不动
+        XCTAssertEqual(store.risks.first { $0.id == pending.id }?.status, .accepted)
+        XCTAssertEqual(store.risks.first { $0.id == hanging.id }?.status, .accepted)
+        XCTAssertEqual(
+            store.risks.first { $0.id == pending.id }?.resolution,
+            "封板收尾 · 风险自留（带入 PRD 已知风险）"
+        )
+        XCTAssertEqual(store.risks.first { $0.id == fired.id }?.status, .triggered)
+        XCTAssertEqual(store.activeRisks.count, 0, "封板后无未闭合条目")
+
+        // 重开 store（append-only 折叠）：终态保持
+        let reloaded = RiskStore(project: "风险项目", version: "v1.0")
+        XCTAssertEqual(reloaded.risks.filter { $0.status == .accepted }.count, 2)
+        XCTAssertEqual(reloaded.risks.first { $0.id == fired.id }?.status, .triggered)
+    }
+
+    // MARK: 旧版 risks.jsonl 解码兼容（无 impact/plan、带 trigger_signal）
+
+    func testLegacyRecordDecodeCompat() throws {
+        try makeWorkspace()
+        let risksURL = PMAgentStore.jsonlURL(
+            project: "风险项目", version: "v1.0", file: "risks.jsonl"
+        )
+        // 旧版行格式：无 impact/plan，trigger_signal 必带，status 为旧终态
+        let legacyLine = #"{"id":"r_legacy1","version":"v1.0","stage":"prototype","hypothesis":"旧版假设","triggerSignal":"structure_regen","status":"closed_unfired","originRef":"自评审（prototype）","createdAt":"2026-01-01T00:00:00Z"}"#
+        try legacyLine.write(to: risksURL, atomically: true, encoding: .utf8)
+
+        let store = RiskStore(project: "风险项目", version: "v1.0")
+        XCTAssertEqual(store.risks.count, 1)
+        let legacy = try XCTUnwrap(store.risks.first)
+        XCTAssertEqual(legacy.id, "r_legacy1")
+        XCTAssertEqual(legacy.status, .closedUnfired)
+        XCTAssertEqual(legacy.triggerSignal, .structureRegen)
+        XCTAssertNil(legacy.impact)
+        XCTAssertNil(legacy.plan)
     }
 }
 
@@ -953,10 +1028,10 @@ final class PipelineM3Tests: XCTestCase {
         let project = "M3项目", version = "v1.0"
         let dir = PMAgentStore.versionURL(project: project, version: version)
         for rel in [
-            "01-requirements/clarification.md",
+            ArtifactPath.clarification,
             "02-structure/confirmed.json",
             "03-prototypes/confirmed.json",
-            "04-prd/prd-v1.md",
+            ArtifactPath.prd,
         ] {
             try PMAgentStore.writeVerified("x", to: dir.appendingPathComponent(rel))
         }
@@ -1032,19 +1107,458 @@ final class PipelineM3Tests: XCTestCase {
         XCTAssertTrue(engine.recordRadar(fixedCount: 0), "重新计满 3 轮再次告警")
     }
 
-    // MARK: ④ 意图识别（回退 / 档位切换）
+    // MARK: ④ 意图识别（回退块目标白名单 / 档位切换）
 
     func testPRDIntentHelpers() {
-        XCTAssertEqual(AppModel.prdBacktrackTarget("回退到结构阶段"), .structure)
-        XCTAssertEqual(AppModel.prdBacktrackTarget("帮我重新设计结构"), .structure)
-        XCTAssertEqual(AppModel.prdBacktrackTarget("改一下原型"), .prototype)
-        XCTAssertEqual(AppModel.prdBacktrackTarget("修改原型流程"), .prototype)
-        XCTAssertNil(AppModel.prdBacktrackTarget("帮我完善 PRD 的验收用例"))
+        // 回退意图改由 LLM 回退块（artifact:backtrack）承载：AppModel.backtrackStage
+        // 只做目标字段白名单校验，任意自然说法由模型识别，不再依赖固定话术正则。
+        XCTAssertEqual(AppModel.backtrackStage("prototype"), .prototype)
+        XCTAssertEqual(AppModel.backtrackStage(" structure "), .structure)
+        XCTAssertEqual(AppModel.backtrackStage("clarify"), .clarify, "新功能回①增补澄清")
+        XCTAssertNil(AppModel.backtrackStage("prd"), "当前阶段不是合法回退目标")
+        XCTAssertNil(AppModel.backtrackStage(""))
 
         XCTAssertEqual(AppModel.tierFromText("用 lean 档"), "lean")
         XCTAssertEqual(AppModel.tierFromText("切换到 Full"), "full")
         XCTAssertEqual(AppModel.tierFromText("标准档"), "standard")
         XCTAssertNil(AppModel.tierFromText("再补充一节数据指标"))
+    }
+
+    // MARK: 回退请求块解析（artifact:backtrack）
+
+    func testParseBacktrackRequest() {
+        // 无块 → nil
+        XCTAssertNil(ArtifactParser.parseBacktrack(
+            blocks: ArtifactParser.parseArtifactBlocks(in: "普通回复，没有回退")
+        ))
+
+        // 合法块 → 解析出目标与诉求（诉求原样透传；mode 缺省 nil = revise）
+        let reply = """
+        好的，这就回 ③ 重做原型。
+
+        ```artifact:backtrack
+        {"target": "prototype", "instruction": "配色太冷，换成暖色系，整体更精致"}
+        ```
+        """
+        let request = ArtifactParser.parseBacktrack(
+            blocks: ArtifactParser.parseArtifactBlocks(in: reply)
+        )
+        XCTAssertEqual(request?.target, "prototype")
+        XCTAssertEqual(request?.instruction, "配色太冷，换成暖色系，整体更精致")
+        XCTAssertNil(request?.mode, "mode 缺省按 revise 处理")
+
+        // redo 模式 → 解析出 mode（推翻重来，App 不注入旧版）
+        let redo = """
+        ```artifact:backtrack
+        {"target": "prototype", "instruction": "这版不要了", "mode": "redo"}
+        ```
+        """
+        XCTAssertEqual(
+            ArtifactParser.parseBacktrack(
+                blocks: ArtifactParser.parseArtifactBlocks(in: redo)
+            ),
+            ArtifactParser.BacktrackRequest(
+                target: "prototype", instruction: "这版不要了", mode: "redo"
+            )
+        )
+
+        // 无诉求（instruction 缺席）→ nil 诉求（走通用重做指令）
+        let bare = """
+        ```artifact:backtrack
+        {"target": "structure"}
+        ```
+        """
+        XCTAssertEqual(
+            ArtifactParser.parseBacktrack(
+                blocks: ArtifactParser.parseArtifactBlocks(in: bare)
+            ),
+            ArtifactParser.BacktrackRequest(target: "structure", instruction: nil, mode: nil)
+        )
+
+        // JSON 不合法 → nil（模型误判由白名单 + 容错双层兜底）
+        let broken = """
+        ```artifact:backtrack
+        不是 JSON
+        ```
+        """
+        XCTAssertNil(ArtifactParser.parseBacktrack(
+            blocks: ArtifactParser.parseArtifactBlocks(in: broken)
+        ))
+    }
+
+    // MARK: 回退协议注入（②③④ 提示词包含 backtrack 段；② 仅含 clarify 目标）
+
+    func testBacktrackSectionInPrompts() {
+        let prototypePrompt = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD", injection: ""
+        )
+        XCTAssertTrue(prototypePrompt.contains("artifact:backtrack"), "③ 提示词含回退协议")
+        XCTAssertTrue(prototypePrompt.contains("\"structure\""), "③ 可回退②结构")
+        XCTAssertTrue(prototypePrompt.contains("\"clarify\""), "③ 可回①澄清（新功能）")
+        XCTAssertTrue(prototypePrompt.contains("\"mode\""), "回退协议含 mode 字段（revise/redo）")
+
+        let prdPrompt = AgentPrompts.prd(
+            tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            prototypePages: ["首页"], analysisNotes: "", injection: ""
+        )
+        XCTAssertTrue(prdPrompt.contains("artifact:backtrack"), "④ 提示词含回退协议")
+        XCTAssertTrue(prdPrompt.contains("\"prototype\""), "④ 可回退③原型")
+        XCTAssertTrue(prdPrompt.contains("\"structure\""), "④ 可回退②结构")
+        XCTAssertTrue(prdPrompt.contains("\"clarify\""), "④ 可回①澄清（新功能）")
+
+        let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
+        XCTAssertTrue(structurePrompt.contains("artifact:backtrack"), "② 含回退协议（新功能回①增补澄清）")
+        // ② 的回退目标校验收窄到回退段内断言（快速通道段合法引入 prototype/prd 字样）
+        if let backtrackStart = structurePrompt.range(of: "━━ 回退请求"),
+           let ffStart = structurePrompt.range(of: "━━ 快速通道") {
+            let backtrackSection = structurePrompt[backtrackStart.lowerBound..<ffStart.lowerBound]
+            XCTAssertTrue(backtrackSection.contains("\"clarify\""), "② 只含 clarify 目标")
+            XCTAssertFalse(backtrackSection.contains("\"structure\""), "② 不可回自身")
+            XCTAssertFalse(backtrackSection.contains("\"prototype\""), "② 不可回下游")
+        } else {
+            XCTFail("② 提示词缺少回退/快速通道段落标记")
+        }
+        // ④ 是终点：不注入快速通道
+        XCTAssertFalse(prdPrompt.contains("artifact:fast-forward"), "④ 不含快速通道协议")
+    }
+
+    // MARK: 新功能增补澄清（回退协议 target=clarify：判断先行、表保留作基底）
+
+    func testBacktrackStageClarifyWhitelist() {
+        XCTAssertEqual(AppModel.backtrackStage("clarify"), .clarify, "白名单含 clarify")
+        XCTAssertEqual(AppModel.backtrackStage(" structure "), .structure, "前后空白容忍")
+        XCTAssertNil(AppModel.backtrackStage("prd"), "prd 不在白名单（④ 是终点）")
+        XCTAssertNil(AppModel.backtrackStage("bogus"), "未知目标拒绝")
+    }
+
+    func testClarifyPromptAmendBaseSection() {
+        // 增补模式：表 = 修订基底，判断先行 + 只问增量
+        let amend = AgentPrompts.clarify(
+            rounds: 0, limit: 5, previousTable: "# 既有表\n- target_user: 记录者",
+            amending: true, injection: ""
+        )
+        XCTAssertTrue(amend.contains("既有澄清要点表（增补基底）"), "增补段头")
+        XCTAssertTrue(amend.contains("判断先行"), "先判断能不能做/适不适合做")
+        XCTAssertTrue(amend.contains("只问增量"), "已覆盖字段不重问")
+        XCTAssertTrue(amend.contains("# 既有表"), "旧表全文注入")
+
+        // 参考模式（新版本开局）：跨版本表 = 背景参考，不得照抄
+        let reference = AgentPrompts.clarify(
+            rounds: 0, limit: 5, previousTable: "# 上一版表", amending: false, injection: ""
+        )
+        XCTAssertTrue(reference.contains("背景参考"), "参考段头")
+        XCTAssertTrue(reference.contains("不得照抄"), "参考非基底")
+        XCTAssertTrue(reference.contains("# 上一版表"))
+
+        // 无表 → 无基底段（首次澄清行为不变）
+        let fresh = AgentPrompts.clarify(rounds: 0, limit: 5, injection: "")
+        XCTAssertFalse(fresh.contains("增补基底"))
+        XCTAssertFalse(fresh.contains("背景参考"))
+    }
+
+    func testClarificationTableMergeRule() {
+        // 首次澄清：无合并段
+        let fresh = AgentPrompts.clarificationTable(transcript: "用户：想做个 App")
+        XCTAssertFalse(fresh.contains("合并规则"))
+
+        // 增补收束：注入旧表 + 合并规则（未波及字段保持原值）
+        let merged = AgentPrompts.clarificationTable(
+            transcript: "用户：加个消息通知", previous: "# 既有表"
+        )
+        XCTAssertTrue(merged.contains("既有澄清要点表（增补基底）"))
+        XCTAssertTrue(merged.contains("合并规则"))
+        XCTAssertTrue(merged.contains("保持原值原样"))
+        XCTAssertTrue(merged.contains("# 既有表"))
+    }
+
+    func testDeriveStageClarifyAmendMarker() throws {
+        let project = " amend-proj ", version = "v1"
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("01-requirements", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        // 无表 → clarify
+        XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .clarify)
+
+        // 有表无标记 → structure（要点表落盘即闸口）
+        try "# 表".write(
+            to: dir.appendingPathComponent(ArtifactPath.clarification),
+            atomically: true, encoding: .utf8
+        )
+        XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .structure)
+
+        // 有表 + amend 标记 → clarify（增补澄清进行中）
+        try "{}".write(
+            to: dir.appendingPathComponent(ArtifactPath.clarifyAmend),
+            atomically: true, encoding: .utf8
+        )
+        XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .clarify)
+
+        // 结构确认 → prototype（增补收束后闸口恢复推导）
+        let structConfirmed = dir.appendingPathComponent("02-structure/confirmed.json")
+        try FileManager.default.createDirectory(
+            at: structConfirmed.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try "{}".write(to: structConfirmed, atomically: true, encoding: .utf8)
+        XCTAssertEqual(PipelineEngine.deriveStage(project: project, version: version), .prototype)
+    }
+
+    func testInvalidateClarifyKeepsTableAndPropagates() throws {
+        let project = " amend-engine ", version = "v2"
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        let engine = PipelineEngine(project: project, version: version, database: nil)
+        for sub in ["01-requirements", "02-structure", "03-prototypes", "04-prd"] {
+            try FileManager.default.createDirectory(
+                at: dir.appendingPathComponent(sub, isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        // 盘面：表 + 结构产物 + 双确认 + PRD
+        try "# 表".write(to: dir.appendingPathComponent(ArtifactPath.clarification),
+                         atomically: true, encoding: .utf8)
+        try "# 架构图".write(to: dir.appendingPathComponent(ArtifactPath.architecture),
+                             atomically: true, encoding: .utf8)
+        try "{}".write(to: dir.appendingPathComponent("02-structure/confirmed.json"),
+                       atomically: true, encoding: .utf8)
+        try "{}".write(to: dir.appendingPathComponent("03-prototypes/confirmed.json"),
+                       atomically: true, encoding: .utf8)
+        try "# PRD".write(to: dir.appendingPathComponent(ArtifactPath.prd),
+                          atomically: true, encoding: .utf8)
+        engine.syncFromDisk()
+        XCTAssertEqual(engine.stage, .prd, "双确认齐备 → ④ PRD（新功能在下游任意阶段提出）")
+
+        // 回①：stage 推导回 clarify；表与产物文件保留；确认清除；PRD 标过期；轮次清零
+        engine.invalidateClarify()
+        XCTAssertEqual(engine.stage, .clarify)
+        XCTAssertTrue(engine.isAmendingClarify, "增补标记写入")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(ArtifactPath.clarification).path
+        ), "要点表保留作增补基底")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(ArtifactPath.architecture).path
+        ), "结构产物保留作修订基底")
+        XCTAssertFalse(engine.structureConfirmed, "下游确认清除（过期传播）")
+        XCTAssertFalse(engine.prototypeConfirmed)
+        XCTAssertTrue(engine.prdStale, "PRD 过期标记")
+        XCTAssertEqual(engine.clarifyRounds, 0, "新一轮澄清周期")
+
+        // 收束推进：增补标记清除 → 推导回 structure
+        engine.advanceFromClarify()
+        XCTAssertEqual(engine.stage, .structure)
+        XCTAssertFalse(engine.isAmendingClarify, "收束清标记")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(ArtifactPath.clarifyAmend).path
+        ))
+    }
+
+
+    // MARK: 澄清问题卡（artifact:question-card）
+
+    func testParseQuestionCard() {
+        // 无块 → nil
+        XCTAssertNil(ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: "普通澄清回复，没有问题卡")
+        ))
+
+        // 合法块 → 解析出问题集；id 缺省归一化补齐
+        let reply = """
+        下面几道题互相独立，集中一次答完——
+
+        ```artifact:question-card
+        {"questions":[
+          {"id":"platform","title":"这个产品主要面向哪个端？","options":["iOS App","Web 网页端"],"allow_custom":true},
+          {"title":"目标用户是谁？","options":["养宠新手","多宠家庭"]}
+        ]}
+        ```
+        """
+        let request = ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: reply)
+        )
+        XCTAssertEqual(request?.questions.count, 2)
+        XCTAssertEqual(request?.questions[0].id, "platform")
+        XCTAssertEqual(request?.questions[0].title, "这个产品主要面向哪个端？")
+        XCTAssertEqual(request?.questions[1].id, "q2", "id 缺省归一化补 q2")
+        XCTAssertEqual(request?.questions[1].options, ["养宠新手", "多宠家庭"])
+
+        // 病态输出 clamp：题数 >5 截前 5、选项 >4 截前 4
+        let manyJSON = (1...7).map { i in
+            "{\"id\":\"q\(i)\",\"title\":\"题\(i)\",\"options\":[\"a\",\"b\",\"c\",\"d\",\"e\"]}"
+        }.joined(separator: ",")
+        let many = """
+        ```artifact:question-card
+        {"questions":[\(manyJSON)]}
+        ```
+        """
+        let clamped = ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: many)
+        )
+        XCTAssertEqual(clamped?.questions.count, 5, "题数 clamp ≤5")
+        XCTAssertEqual(clamped?.questions[0].options?.count, 4, "选项数 clamp ≤4")
+
+        // 空标题题丢弃；空标题占位 id 归一化按过滤后序号补齐
+        let partial = """
+        ```artifact:question-card
+        {"questions":[{"title":"  "},{"title":"有效题"}]}
+        ```
+        """
+        let normalized = ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: partial)
+        )
+        XCTAssertEqual(normalized?.questions.count, 1, "空标题题丢弃")
+        XCTAssertEqual(normalized?.questions[0].id, "q1")
+
+        // 全部无效（无有效题）→ nil
+        let allEmpty = """
+        ```artifact:question-card
+        {"questions":[{"title":" "}]}
+        ```
+        """
+        XCTAssertNil(ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: allEmpty)
+        ))
+
+        // JSON 不合法 → nil
+        let broken = """
+        ```artifact:question-card
+        不是 JSON
+        ```
+        """
+        XCTAssertNil(ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: broken)
+        ))
+    }
+
+    // MARK: 问题卡题型判定（multiple 字段 + 题干启发式回退）
+
+    func testQuestionCardMultipleChoice() {
+        // LLM 显式标注 multiple:true → 多选
+        let explicit = """
+        ```artifact:question-card
+        {"questions":[{"title":"首版必须覆盖哪些能力？","options":["a","b"],"multiple":true}]}
+        ```
+        """
+        let explicitReq = ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: explicit)
+        )
+        XCTAssertEqual(explicitReq?.questions[0].isMultipleChoice, true, "显式 multiple:true → 多选")
+
+        // 显式 multiple:false 覆盖题干关键词（「哪些」）→ 单选
+        let overridden = """
+        ```artifact:question-card
+        {"questions":[{"title":"覆盖哪些能力？","options":["a","b"],"multiple":false}]}
+        ```
+        """
+        let overriddenReq = ArtifactParser.parseQuestionCard(
+            blocks: ArtifactParser.parseArtifactBlocks(in: overridden)
+        )
+        XCTAssertEqual(overriddenReq?.questions[0].isMultipleChoice, false, "显式 false 优先于启发式")
+
+        // 缺省字段 → 题干/说明启发式：并列诉求关键词 → 多选；单一取舍 → 单选
+        XCTAssertTrue(ArtifactParser.QuestionCardRequest.Question.inferMultipleChoice(
+            title: "首版必须覆盖哪几类核心场景？", detail: nil), "题干「哪几」→ 多选")
+        XCTAssertTrue(ArtifactParser.QuestionCardRequest.Question.inferMultipleChoice(
+            title: "目标用户是谁？", detail: "可选多个方向"), "说明含「多个」→ 多选")
+        XCTAssertFalse(ArtifactParser.QuestionCardRequest.Question.inferMultipleChoice(
+            title: "这个产品首要落在哪个端？", detail: "端决定了交互形态"), "单一取舍 → 单选")
+    }
+
+    // MARK: 问题卡协议注入（① 提示词包含 question-card 段；②③④ 不含）
+
+    func testQuestionCardSectionInPrompts() {
+        let clarifyPrompt = AgentPrompts.clarify(rounds: 0, limit: 5, injection: "")
+        XCTAssertTrue(clarifyPrompt.contains("artifact:question-card"), "① 提示词含问题卡协议")
+        XCTAssertTrue(clarifyPrompt.contains("allow_custom"), "协议含自定义输入字段")
+        XCTAssertTrue(clarifyPrompt.contains("\"multiple\""), "协议含题型标注字段")
+        XCTAssertTrue(clarifyPrompt.contains("首个问题卡必须包含平台题"), "平台未定时平台题必含")
+        XCTAssertTrue(clarifyPrompt.contains("【问题卡作答】"), "答案回传协议说明")
+        XCTAssertTrue(clarifyPrompt.contains("不再追加 A) 选项行"), "出卡轮免选项行")
+
+        let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
+        XCTAssertFalse(structurePrompt.contains("artifact:question-card"), "② 不含问题卡协议")
+
+        let prototypePrompt = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD", injection: ""
+        )
+        XCTAssertFalse(prototypePrompt.contains("artifact:question-card"), "③ 不含问题卡协议")
+
+        let prdPrompt = AgentPrompts.prd(
+            tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            prototypePages: ["首页"], analysisNotes: "", injection: ""
+        )
+        XCTAssertFalse(prdPrompt.contains("artifact:question-card"), "④ 不含问题卡协议")
+    }
+
+    // MARK: 问题卡答案拼装（提交消息格式 = 已提交判定依据）
+
+    func testQuestionCardAssembledAnswer() {
+        let assembled = QuestionCardAssembly.assemble(
+            titles: ["这个产品主要面向哪个端？", "目标用户是谁？", "v1 最核心的使用场景是？"],
+            answers: ["iOS App", nil, "健康档案与就医记录"]
+        )
+        XCTAssertTrue(assembled.hasPrefix(QuestionCardAssembly.marker), "提交消息带统一前缀")
+        XCTAssertTrue(assembled.contains("1. 这个产品主要面向哪个端？ → iOS App"))
+        XCTAssertTrue(assembled.contains("2. 目标用户是谁？ → （跳过）"), "跳过项显式标注，LLM 记入 open_questions")
+        XCTAssertTrue(assembled.contains("3. v1 最核心的使用场景是？ → 健康档案与就医记录"))
+        XCTAssertFalse(assembled.contains("nil"), "nil 不应泄漏进消息文本")
+    }
+
+    // MARK: 迭代基底（上一版产物全文注入：反馈驱动的修订，而非盲重画）
+
+    func testRevisionBaseSection() {
+        // nil / 空白 → 空串（首次生成无基底，行为不变）
+        XCTAssertEqual(AgentPrompts.revisionBaseSection(title: "原型", previous: nil), "")
+        XCTAssertEqual(AgentPrompts.revisionBaseSection(title: "原型", previous: "  \n  "), "")
+
+        // 有内容 → 基底段：段头标记 + 保留指令 + 全文（不折叠）
+        let section = AgentPrompts.revisionBaseSection(
+            title: "原型", previous: "<html>旧版</html>", fence: "html"
+        )
+        XCTAssertTrue(section.contains("上一版原型（修订基底）"))
+        XCTAssertTrue(section.contains("仅做反馈明确要求的变化"), "基底段明确「只改说的部分」")
+        XCTAssertTrue(section.contains("未提及的部分原样保留"))
+        XCTAssertTrue(section.contains("<html>旧版</html>"), "全文注入不折叠")
+
+        // fence：HTML 原型围栏包裹
+        XCTAssertTrue(section.contains("```html"))
+
+        // Markdown 产物裸放（防嵌套围栏错乱）
+        let mdSection = AgentPrompts.revisionBaseSection(title: "PRD", previous: "# PRD v1")
+        XCTAssertTrue(mdSection.contains("# PRD v1"))
+        XCTAssertFalse(mdSection.contains("```"))
+    }
+
+    func testIterativePromptInjectsPreviousBase() {
+        // 段头「上一版×（修订基底）」是注入段独有标记（backtrack 协议文案里的
+        // 「修订基底」字样不算——用完整段头断言防撞词）。
+        // ③ 有旧原型 → 注入基底；无 → 不含基底段（首次生成行为不变）
+        let iterative = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD",
+            previousPrototype: "<html><body>旧原型</body></html>", injection: ""
+        )
+        XCTAssertTrue(iterative.contains("上一版原型（修订基底）"))
+        XCTAssertTrue(iterative.contains("<html><body>旧原型</body></html>"))
+        XCTAssertLessThan(
+            iterative.range(of: "（修订基底）")!.lowerBound,
+            iterative.range(of: "任务：")!.lowerBound,
+            "基底段在任务指令之前（先见上一版再干活）"
+        )
+
+        let fresh = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD", injection: ""
+        )
+        XCTAssertFalse(fresh.contains("（修订基底）"), "首次生成无基底，不注入")
+
+        // ② 结构迭代同理
+        let structureIterative = AgentPrompts.structure(
+            clarification: "要点",
+            previousArtifacts: "### 功能架构图\n\ngraph TD", injection: ""
+        )
+        XCTAssertTrue(structureIterative.contains("上一版结构产物（修订基底）"))
+        XCTAssertTrue(structureIterative.contains("### 功能架构图"))
+        let structureFresh = AgentPrompts.structure(clarification: "要点", injection: "")
+        XCTAssertFalse(structureFresh.contains("（修订基底）"))
     }
 
     // MARK: 评分卡锚定数字（clarification 约束数 / 映射表行列）
@@ -1204,6 +1718,74 @@ final class SessionStoreIOTests: XCTestCase {
         XCTAssertEqual(reloaded.count, 3)
         XCTAssertEqual(reloaded.map(\.content), ["第一问", "第一答", "📦 落盘提示"])
     }
+
+    // MARK: - 流式回复归属（修复：生成途中切会话导致同答串会话）
+
+    /// 不属于当前会话的条目照常落盘但不得进入内存消息流（UI 渲染源隔离）。
+    @MainActor
+    func testAppendForeignSessionEntryNotInMemory() throws {
+        try PMAgentStore.bootstrap()
+        let store = SessionStore()
+        store.open(project: "默认", version: "unversioned", sessionId: "s1")
+        var foreign = store.makeEntry(role: .assistant, content: "别家的回答")
+        foreign.sessionId = "s999"
+
+        try store.append(foreign)
+
+        XCTAssertTrue(store.entries.isEmpty, "不属于当前会话的条目不得进入内存 entries")
+        let text = try String(contentsOf: PMAgentStore.jsonlURL(
+            project: "默认", version: "unversioned", file: "discussions.jsonl"
+        ), encoding: .utf8)
+        XCTAssertTrue(text.contains("别家的回答"), "磁盘照常落盘（数据不丢，按 sessionId 投影）")
+    }
+
+    /// 生成途中用户切到其他项目/会话：回复必须按 origin 落回发起会话的项目，
+    /// 不写进当前停留会话，也不串内存（串会话 bug 的核心回归）。
+    @MainActor
+    func testAppendPinnedRoutesToOriginWorkspace() throws {
+        try PMAgentStore.bootstrap()
+        let store = SessionStore()
+        store.open(project: "甲", version: "unversioned", sessionId: "s1")
+        var reply = store.makeEntry(role: .assistant, content: "发起会话的回答")
+        reply.sessionId = "s1"
+
+        store.open(project: "乙", version: "unversioned", sessionId: "s2")
+        XCTAssertEqual(store.streamingSessionID, nil, "空闲态无流归属")
+        try store.appendPinned(
+            reply,
+            origin: SessionStore.StreamOrigin(
+                project: "甲", version: "unversioned", sessionId: "s1"
+            )
+        )
+
+        let originText = try String(contentsOf: PMAgentStore.jsonlURL(
+            project: "甲", version: "unversioned", file: "discussions.jsonl"
+        ), encoding: .utf8)
+        XCTAssertTrue(originText.contains("发起会话的回答"), "回复必须落回发起会话的项目")
+        let currentText = try? String(contentsOf: PMAgentStore.jsonlURL(
+            project: "乙", version: "unversioned", file: "discussions.jsonl"
+        ), encoding: .utf8)
+        XCTAssertFalse(
+            currentText?.contains("发起会话的回答") ?? false,
+            "当前停留会话不得混入别家回复"
+        )
+        XCTAssertTrue(store.entries.isEmpty, "跨会话回复不得串进当前内存消息流")
+    }
+
+    /// 空闲态切换会话：流式增量必须清空（残留会让新会话显示上一场的生成尾巴）。
+    @MainActor
+    func testOpenClearsStreamingIncrementsWhenIdle() {
+        try? PMAgentStore.bootstrap()
+        let store = SessionStore()
+        store.open(project: "默认", version: "unversioned", sessionId: "s1")
+        store.streamingText = "生成中……"
+        store.streamingThink = "思考中"
+
+        store.open(project: "默认", version: "unversioned", sessionId: "s2")
+
+        XCTAssertEqual(store.streamingText, "")
+        XCTAssertEqual(store.streamingThink, "")
+    }
 }
 
 /// 图片输入链路（2026-09 追加）：存量兼容 + 引用落盘 + MIME 映射。
@@ -1356,6 +1938,23 @@ final class LLMLiveTests: XCTestCase {
         print("DIAG write-path: OK（写入/回读/删除全通过）")
     }
 
+    /// read 三态：空槽位 = notFound（不是 accessFailed）、写入后 = found——
+    /// 「不存在」与「读取失败」必须可区分（2026-09-13 Key「消失」事故）。
+    func testKeychainReadDistinguishesNotFoundFromFailure() throws {
+        let slot = "byok.unittest.\(UUID().uuidString)"
+        guard case .notFound = KeychainStore.read(slot) else {
+            XCTFail("未写入的随机槽位应返回 notFound")
+            return
+        }
+        try KeychainStore.set("sk-readtest-123", forKey: slot)
+        defer { KeychainStore.delete(slot) }
+        guard case .found(let value) = KeychainStore.read(slot) else {
+            XCTFail("写入后应返回 found")
+            return
+        }
+        XCTAssertEqual(value, "sk-readtest-123")
+    }
+
     /// 真实配置 + Keychain key → LLMClient 流式对话走通（DeepSeek）。
     func testDeepSeekLiveStreamChat() async throws {
         // 读用户真实设置（Application Support/pm-worker/settings.json）
@@ -1386,6 +1985,7 @@ final class LLMLiveTests: XCTestCase {
             switch delta {
             case .text(let text): full += text
             case .reasoning(let chunk): reasoning += chunk
+            case .truncated: break
             }
         }
         XCTAssertFalse(

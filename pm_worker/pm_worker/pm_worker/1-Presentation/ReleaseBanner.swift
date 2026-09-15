@@ -13,7 +13,7 @@ import SwiftUI
 struct ReleaseBanner: View {
     /// 已封板的版本号（如 v1.0）；nil → 不带版本副标题（一般用于项目级聚合提示）。
     let version: String?
-    /// 「查看 release-notes」动作（主 agent 接线：打开 07-reports/release-notes.md 预览）；nil → 不显示按钮。
+    /// 「查看 release-notes」动作（主 agent 接线：打开 07-reports/发布说明.md 预览）；nil → 不显示按钮。
     var onOpenNotes: (() -> Void)? = nil
 
     var body: some View {

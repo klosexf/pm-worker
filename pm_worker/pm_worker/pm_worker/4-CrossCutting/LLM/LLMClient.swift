@@ -52,6 +52,8 @@ nonisolated struct ChatImage: Codable, Equatable {
 nonisolated enum LLMDelta: Equatable {
     case text(String)
     case reasoning(String)
+    /// 流末 finish_reason == "length"：输出撞上 max_tokens 被截断（产物围栏可能未闭合）。
+    case truncated
 }
 
 /// 流式末 chunk 携带的 usage（OpenAI 兼容；M5 Task 5.4 成本统计）。
@@ -103,17 +105,82 @@ nonisolated enum LLMClient {
         }
     }
 
+    /// OpenAI 兼容请求体（提升到 enum 作用域：测试直测编码行为）。
+    nonisolated struct RequestBody: Codable {
+        /// content 双形态：纯文本消息用字符串（最大兼容）；
+        /// 带图消息用 parts 数组（text + image_url parts，OpenAI 多模态格式）。
+        enum MessageContent: Codable {
+            case text(String)
+            case parts([ContentPart])
+
+            struct ContentPart: Codable {
+                var type: String
+                var text: String?
+                var image_url: ImageURL?
+
+                struct ImageURL: Codable {
+                    var url: String
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.singleValueContainer()
+                switch self {
+                case .text(let s): try c.encode(s)
+                case .parts(let p): try c.encode(p)
+                }
+            }
+        }
+        struct Message: Codable {
+            var role: String
+            var content: MessageContent
+        }
+        struct StreamOptions: Codable {
+            var include_usage: Bool
+        }
+        var model: String
+        var messages: [Message]
+        var stream: Bool
+        var max_tokens: Int
+        // M5 Task 5.4：请求末 chunk 携带 usage（OpenAI 需显式开启；
+        // deepseek/zhipu 本身就在末 chunk 带，多余字段无害）
+        var stream_options: StreamOptions?
+        /// 思考强度（DeepSeek 思考模式）：nil = 不发送（synthesized Codable
+        /// 对 Optional 走 encodeIfPresent，字段整体缺席，走服务端默认档）。
+        var reasoning_effort: String? = nil
+
+        /// ChatMessage → 请求消息：无图保持纯字符串（兼容全部端点）；
+        /// 有图按 [text, image_url…] 顺序展开。
+        static func message(from m: ChatMessage) -> Message {
+            guard let images = m.images, !images.isEmpty else {
+                return Message(role: m.role.rawValue, content: .text(m.content))
+            }
+            var parts: [MessageContent.ContentPart] = [
+                .init(type: "text", text: m.content, image_url: nil)
+            ]
+            for image in images {
+                parts.append(.init(
+                    type: "image_url", text: nil,
+                    image_url: .init(url: image.dataURL)
+                ))
+            }
+            return Message(role: m.role.rawValue, content: .parts(parts))
+        }
+    }
+
     /// 流式对话：逐 token 吐出增量（正文 delta / 思考 reasoning）。
     /// - Parameters:
     ///   - stage: 阶段（取该阶段配置与 API Key）
     ///   - settings: BYOK 设置
     ///   - messages: 对话历史（含 system prompt）
     ///   - maxTokens: 单次回复上限
+    ///   - reasoningEffort: 思考强度（nil = 不发送，走服务端默认）
     static func streamChat(
         stage: LLMStage,
         settings: LLMSettings,
         messages: [ChatMessage],
-        maxTokens: Int = 4096
+        maxTokens: Int = 4096,
+        reasoningEffort: String? = nil
     ) throws -> AsyncThrowingStream<LLMDelta, Error> {
         guard let config = settings.stages[stage] else {
             throw LLMError.missingBaseURL
@@ -130,71 +197,13 @@ nonisolated enum LLMClient {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 120
 
-        // OpenAI 兼容请求体
-        struct Body: Codable {
-            /// content 双形态：纯文本消息用字符串（最大兼容）；
-            /// 带图消息用 parts 数组（text + image_url parts，OpenAI 多模态格式）。
-            enum MessageContent: Codable {
-                case text(String)
-                case parts([ContentPart])
-
-                struct ContentPart: Codable {
-                    var type: String
-                    var text: String?
-                    var image_url: ImageURL?
-
-                    struct ImageURL: Codable {
-                        var url: String
-                    }
-                }
-
-                func encode(to encoder: Encoder) throws {
-                    var c = encoder.singleValueContainer()
-                    switch self {
-                    case .text(let s): try c.encode(s)
-                    case .parts(let p): try c.encode(p)
-                    }
-                }
-            }
-            struct Message: Codable {
-                var role: String
-                var content: MessageContent
-            }
-            struct StreamOptions: Codable {
-                var include_usage: Bool
-            }
-            var model: String
-            var messages: [Message]
-            var stream: Bool
-            var max_tokens: Int
-            // M5 Task 5.4：请求末 chunk 携带 usage（OpenAI 需显式开启；
-            // deepseek/zhipu 本身就在末 chunk 带，多余字段无害）
-            var stream_options: StreamOptions?
-
-            /// ChatMessage → 请求消息：无图保持纯字符串（兼容全部端点）；
-            /// 有图按 [text, image_url…] 顺序展开。
-            static func message(from m: ChatMessage) -> Message {
-                guard let images = m.images, !images.isEmpty else {
-                    return Message(role: m.role.rawValue, content: .text(m.content))
-                }
-                var parts: [MessageContent.ContentPart] = [
-                    .init(type: "text", text: m.content, image_url: nil)
-                ]
-                for image in images {
-                    parts.append(.init(
-                        type: "image_url", text: nil,
-                        image_url: .init(url: image.dataURL)
-                    ))
-                }
-                return Message(role: m.role.rawValue, content: .parts(parts))
-            }
-        }
-        let body = Body(
+        let body = RequestBody(
             model: config.model,
-            messages: messages.map { Body.message(from: $0) },
+            messages: messages.map { RequestBody.message(from: $0) },
             stream: true,
             max_tokens: maxTokens,
-            stream_options: .init(include_usage: true)
+            stream_options: .init(include_usage: true),
+            reasoning_effort: reasoningEffort
         )
         request.httpBody = try JSONEncoder().encode(body)
 
@@ -209,6 +218,7 @@ nonisolated enum LLMClient {
                     }
 
                     var received = false
+                    var truncated = false   // finish_reason == "length"（撞 max_tokens 截断）
                     var fullText = ""      // 累计正文+思考（usage 缺失时估算 completion 用）
                     var usage: StreamUsage?  // 末 chunk usage（M5 Task 5.4）
                     // SSE 解析：每行 "data: {json}"，"[DONE]" 结束
@@ -230,6 +240,12 @@ nonisolated enum LLMClient {
                                     }
                                 }
                                 var delta: Delta?
+                                var finishReason: String?
+
+                                enum CodingKeys: String, CodingKey {
+                                    case delta
+                                    case finishReason = "finish_reason"
+                                }
                             }
                             var choices: [Choice]?
                             var usage: StreamUsage?
@@ -237,6 +253,10 @@ nonisolated enum LLMClient {
                         if let chunk = try? JSONDecoder().decode(Chunk.self, from: Data(payload.utf8)) {
                             // 末 chunk usage 捕获（含 choices 为空的收尾 chunk）
                             if let chunkUsage = chunk.usage { usage = chunkUsage }
+                            // finish_reason == "length" → 输出撞 max_tokens 被截断
+                            if chunk.choices?.first?.finishReason == "length" {
+                                truncated = true
+                            }
                             if let delta = chunk.choices?.first?.delta {
                                 if let text = delta.content, !text.isEmpty {
                                     received = true
@@ -251,6 +271,8 @@ nonisolated enum LLMClient {
                         }
                     }
                     guard received else { throw LLMError.emptyStream }
+                    // 截断信号在用量记录前透出（消费方据此决定是否续写）
+                    if truncated { continuation.yield(.truncated) }
                     // 成功路径记一笔用量（失败/空流不记；M5 Task 5.4）
                     CostTracker.shared.record(
                         Self.makeUsageRecord(
@@ -268,6 +290,7 @@ nonisolated enum LLMClient {
     }
 
     /// 非流式便捷封装（分类路由 / JSON 抽取等小请求用）。
+    /// 撞 max_tokens 截断时自动续写（MCP 无头生成原型 HTML 同样会截断），上限 2 次。
     static func complete(
         stage: LLMStage,
         settings: LLMSettings,
@@ -275,10 +298,30 @@ nonisolated enum LLMClient {
         maxTokens: Int = 1024
     ) async throws -> String {
         var result = ""
-        for try await delta in try streamChat(
-            stage: stage, settings: settings, messages: messages, maxTokens: maxTokens
-        ) {
-            if case .text(let text) = delta { result += text }
+        var messages = messages
+        var rounds = 0
+        while true {
+            var truncated = false
+            let roundStart = result.count
+            for try await delta in try streamChat(
+                stage: stage, settings: settings, messages: messages, maxTokens: maxTokens
+            ) {
+                switch delta {
+                case .text(let text): result += text
+                case .truncated: truncated = true
+                case .reasoning: break
+                }
+            }
+            guard truncated, rounds < 2 else { break }
+            rounds += 1
+            let roundText = String(result[result.index(result.startIndex, offsetBy: roundStart)...])
+            guard !roundText.isEmpty else { break }
+            messages.append(ChatMessage(role: .assistant, content: roundText))
+            messages.append(ChatMessage(
+                role: .user,
+                content: "你上一条回复在输出中途被截断了。请从断点处直接继续输出剩余内容，"
+                    + "不要重复已输出的部分，不要加任何前缀说明或道歉，接着上一个字符继续直到产物完整闭合。"
+            ))
         }
         return result
     }

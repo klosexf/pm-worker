@@ -2,10 +2,11 @@
 //  MemoryDrawerView.swift
 //  pm_worker
 //
-//  记忆抽屉（Task 4.7，ConversationView 头部 brain 按钮 → 右缘滑出 .ds-drawer 浮动卡）：
-//  当前上下文有效记忆按 scope 分组（版本 > 项目 > 全局，注入优先级序）+
-//  类型徽章 + 经验条目（假设态 · 置信度 / 出处）；失效记忆折叠区
-//  （覆盖链历史，不注入）+「被谁覆盖」跳转（滚动到取代条目并高亮）。
+//  记忆抽屉（ConversationView 头部 brain 按钮 → 右缘滑出 .ds-drawer 浮动卡）：
+//  方案 A 两档作用域（项目 > 全局，注入优先级序）；类型不显示——只留两个
+//  行为标记（⚑ 硬边界永不裁剪 / 假设未验证可裁剪）+ 版本溯源标签；注入后
+//  待校准条目带符合/不符确认；失效记忆折叠区（覆盖链历史，不注入）+
+//  「被谁覆盖」跳转（滚动到取代条目并高亮）。
 //
 
 import SwiftUI
@@ -15,7 +16,7 @@ struct MemoryDrawerView: View {
     /// 关闭回调（右缘滑出浮动卡形态，开合动画由宿主 overlay 驱动）。
     var onClose: () -> Void
 
-    /// 失效条目（discussions.jsonl 原始行投影：同 id 最后一行为准，invalidated）。
+    /// 失效条目（原始行投影：同 id 最后一行为准，invalidated）。
     @State private var invalidated: [MemoryEntry] = []
     @State private var showInvalidated = false
     /// 「被谁覆盖」跳转高亮 id（短暂高亮后清除）。
@@ -72,13 +73,19 @@ struct MemoryDrawerView: View {
         .padding(.vertical, DS.Spacing.s16)
     }
 
-    // MARK: - 有效条目（scope 分组：版本 > 项目 > 全局）
+    // MARK: - 有效条目（两档分组：项目 > 全局）
 
     private var effectiveSections: some View {
         ForEach(Array(Self.grouped(model.memory.effective).enumerated()), id: \.offset) { _, group in
             Section {
                 ForEach(group.entries, id: \.id) { entry in
-                    MemoryEntryRow(entry: entry, highlighted: highlightId == entry.id)
+                    MemoryEntryRow(
+                        entry: entry,
+                        highlighted: highlightId == entry.id,
+                        onCalibrate: { confirmed in
+                            model.confirmExperienceCalibration(id: entry.id, confirmed: confirmed)
+                        }
+                    )
                 }
             } header: {
                 MemoryScopeHeader(
@@ -91,17 +98,16 @@ struct MemoryDrawerView: View {
 
     private func scopeTitle(_ scope: MemoryEntry.Scope) -> String {
         switch scope {
-        case .version: "版本记忆（\(model.pipeline.version)）——随版本演进，注入当前对话"
-        case .project: "项目记忆（跨版本共享）"
+        case .project: "项目记忆（跨版本共享 · 版本只是溯源标签）"
         case .global: "全局记忆（跨项目）"
         }
     }
 
-    /// scope 分组（注入优先级序），组内按沉淀时间升序（新覆盖旧语义下时间序即演化序）。
+    /// 两档分组（注入优先级序：项目 > 全局），组内按沉淀时间升序（演化序）。
     nonisolated private static func grouped(
         _ entries: [MemoryEntry]
     ) -> [(scope: MemoryEntry.Scope, entries: [MemoryEntry])] {
-        let order: [MemoryEntry.Scope] = [.version, .project, .global]
+        let order: [MemoryEntry.Scope] = [.project, .global]
         return order
             .map { scope in
                 (
@@ -194,31 +200,13 @@ struct MemoryDrawerView: View {
     }
 
     /// 同 id 最后一行为准（失效标记行追加在原行之后），取 invalidated == true 的条目。
+    /// 与 MemoryStore.reload 同一数据源（含项目级 memory.jsonl，碑文兜底行也在内）。
     nonisolated private static func readInvalidated(
         project: String, version: String
     ) -> [MemoryEntry] {
-        var entries = PMAgentStore.readLines(
-            DiscussionEntry.self,
-            from: PMAgentStore.jsonlURL(
-                project: project, version: version, file: "discussions.jsonl"
-            )
-        )
-        .compactMap(\.memory)
-
-        for otherVersion in PMAgentStore.listVersions(in: project)
-        where otherVersion != version && otherVersion != "knowledge" {
-            entries += PMAgentStore.readLines(
-                DiscussionEntry.self,
-                from: PMAgentStore.jsonlURL(
-                    project: project, version: otherVersion, file: "discussions.jsonl"
-                )
-            )
-            .compactMap(\.memory)
-        }
-
         var latest: [String: MemoryEntry] = [:]
         var order: [String] = []
-        for entry in entries {
+        for entry in MemoryStore.readAllMemoryLines(project: project, version: version) {
             if latest[entry.id] == nil { order.append(entry.id) }
             latest[entry.id] = entry
         }
@@ -229,44 +217,50 @@ struct MemoryDrawerView: View {
     }
 }
 
-// MARK: - 有效条目行（kind 徽章 + 内容 + 经验元数据）
+// MARK: - 有效条目行（行为标记 + 版本标签 + 内容 + 经验元数据）
 
 private struct MemoryEntryRow: View {
     let entry: MemoryEntry
     let highlighted: Bool
+    /// 校准确认回调（confirmed：true = 符合实际 +0.1 / false = 不符 −0.2）。
+    var onCalibrate: (Bool) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s4) {
+            Text(entry.content)
+                .font(DS.Font.bodyMD)
+                .foregroundStyle(Color.ink900)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: DS.Spacing.s6) {
-                MemoryKindBadge(kind: entry.kind)
-                if entry.kind == .experience {
-                    Text("假设态")
-                        .font(DS.Font.bodyXS)
+                MemoryNatureMark(kind: entry.kind)
+                if let versions = entry.versions, !versions.isEmpty {
+                    Text(versions)
+                        .font(DS.Font.monoSM)
                         .foregroundStyle(Color.ink300)
-                        .help("经验以假设态注入，随使用校准置信度")
+                        .padding(.horizontal, DS.Spacing.s4)
+                        .padding(.vertical, 1)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DS.Radius.sm)
+                                .strokeBorder(Color.overlayBorder, lineWidth: 1)
+                        )
+                        .help("版本溯源标签：此条经验/结论沉淀并适用于该版本区间")
                 }
                 Spacer()
                 Text(entry.createdAt)
                     .font(DS.Font.monoSM)
                     .foregroundStyle(Color.ink300)
             }
-            Text(entry.content)
-                .font(DS.Font.bodyMD)
-                .foregroundStyle(Color.ink900)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
             if entry.kind == .experience {
-                HStack(spacing: DS.Spacing.s12) {
-                    if let ref = entry.sourceRef, !ref.isEmpty {
-                        Label { Text(ref) } icon: { DSIcon(.link, size: 14) }
-                            .help("出处 source_ref：\(ref)")
-                    }
-                    if let confidence = entry.confidence {
-                        Text("置信度 \(Int((confidence * 100).rounded()))%")
-                    }
+                if let ref = entry.sourceRef, !ref.isEmpty {
+                    Label { Text(ref) } icon: { DSIcon(.link, size: 14) }
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink500)
+                        .help("出处 source_ref：\(ref)")
                 }
-                .font(DS.Font.bodyXS)
-                .foregroundStyle(Color.ink500)
+                if entry.calibrationPending == true {
+                    calibrationPrompt
+                }
             }
         }
         .padding(.vertical, DS.Spacing.s2)
@@ -279,6 +273,31 @@ private struct MemoryEntryRow: View {
                 )
         )
         .id(entry.id)
+    }
+
+    /// 校准确认条（E23「随使用校准」落地 UI）：注入后用户判定经验是否符合实际，
+    /// 确认/否定即自动调整内部置信度（不显示百分比），清除待校准标记。
+    private var calibrationPrompt: some View {
+        HStack(spacing: DS.Spacing.s8) {
+            Text("上次使用时已注入——这条假设符合实际吗？")
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.ink700)
+            Spacer(minLength: 0)
+            Button {
+                onCalibrate(true)
+            } label: {
+                Label { Text("符合") } icon: { DSIcon(.thumbsUp, size: 12) }
+            }
+            .buttonStyle(.ds(.secondary, size: .xs))
+            .help("确认有效：内部置信度上调（假设更接近定论）")
+            Button {
+                onCalibrate(false)
+            } label: {
+                Label { Text("不符") } icon: { DSIcon(.unlike, size: 12) }
+            }
+            .buttonStyle(.ds(.ghost, size: .xs))
+            .help("确认不符：内部置信度下调（负证据降得快）")
+        }
     }
 }
 
@@ -296,7 +315,7 @@ private struct InvalidatedEntryRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s4) {
             HStack(spacing: DS.Spacing.s6) {
-                MemoryKindBadge(kind: entry.kind)
+                MemoryNatureMark(kind: entry.kind)
                 Spacer()
                 Text(entry.createdAt)
                     .font(DS.Font.monoSM)
@@ -323,57 +342,62 @@ private struct InvalidatedEntryRow: View {
     }
 }
 
-// MARK: - kind 徽章（结论=蓝 约束=橙 否决=红 经验=紫）
+// MARK: - 行为标记（⚑ 硬边界=橙 / 假设=紫 / 普通结论不显示）
+// kind 为 AI 内部字段，界面不展示类型名——只暴露注入行为差异
 
-struct MemoryKindBadge: View {
+struct MemoryNatureMark: View {
     let kind: MemoryEntry.Kind
 
     private var title: String {
         switch kind {
-        case .conclusion: "结论"
-        case .constraint: "约束"
-        case .rejection: "否决"
-        case .experience: "经验"
+        case .constraint, .rejection: "⚑ 硬边界"
+        case .experience: "假设"
+        case .conclusion: ""
         }
     }
 
     private var color: Color {
         switch kind {
-        case .conclusion: Color.statusPrimary
-        case .constraint: Color.statusWarning
-        case .rejection: Color.statusError
+        case .constraint, .rejection: Color.statusWarning
         case .experience: Color.brand600
+        case .conclusion: .clear
         }
     }
 
     private var surface: Color {
         switch kind {
-        case .conclusion: Color.statusPrimarySurface1
-        case .constraint: Color.statusWarningSurface1
-        case .rejection: Color.statusErrorSurface1
+        case .constraint, .rejection: Color.statusWarningSurface1
         case .experience: Color.brandPopup
+        case .conclusion: .clear
         }
     }
 
     var body: some View {
-        Text(title)
-            .font(DS.Font.bodyXS)
-            .foregroundStyle(color)
-            .padding(.horizontal, DS.Spacing.s6)
-            .padding(.vertical, DS.Spacing.s2)
-            .background(Capsule().fill(surface))
+        if kind != .conclusion {
+            Text(title)
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(color)
+                .padding(.horizontal, DS.Spacing.s6)
+                .padding(.vertical, DS.Spacing.s2)
+                .background(Capsule().fill(surface))
+                .help(
+                    kind == .experience
+                        ? "假设：尚未验证的经验，注入时可被裁剪，验证后可提升为全局"
+                        : "硬边界：注入时永不裁剪，回答不得与之矛盾"
+                )
+        }
     }
 }
 
-// MARK: - scope 分组头（版本=brand 项目=primary 全局=success 四色区分）
+// MARK: - scope 分组头（项目=primary 全局=success）
+// internal：设置弹框「记忆」页复用
 
-private struct MemoryScopeHeader: View {
+struct MemoryScopeHeader: View {
     let title: String
     let scope: MemoryEntry.Scope
 
     private var badgeText: String {
         switch scope {
-        case .version: "版本"
         case .project: "项目"
         case .global: "全局"
         }
@@ -381,7 +405,6 @@ private struct MemoryScopeHeader: View {
 
     private var color: Color {
         switch scope {
-        case .version: Color.brand600
         case .project: Color.statusPrimary
         case .global: Color.statusSuccess
         }
@@ -389,7 +412,6 @@ private struct MemoryScopeHeader: View {
 
     private var surface: Color {
         switch scope {
-        case .version: Color.brandPopup
         case .project: Color.statusPrimarySurface1
         case .global: Color.statusSuccessSurface1
         }

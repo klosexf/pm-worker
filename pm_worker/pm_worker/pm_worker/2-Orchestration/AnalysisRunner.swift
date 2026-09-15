@@ -21,7 +21,7 @@ final class AnalysisRunner: ObservableObject {
         return keywords.contains { text.localizedCaseInsensitiveContains($0) }
     }
 
-    /// 运行竞品分析：搜索（可配）→ 抓正文 → LLM 五要素分析 → 落盘 05-analysis/competitive-analysis.md。
+    /// 运行竞品分析：搜索（可配）→ 抓正文 → LLM 五要素分析 → 落盘 05-analysis/竞品分析.md。
     /// - Returns: 产物 URL；模型未按协议输出有效 analysis 块时返回 nil。
     func run(
         topic: String,
@@ -47,7 +47,7 @@ final class AnalysisRunner: ObservableObject {
             maxTokens: 8192
         )
 
-        // ④ 解析 artifact:analysis 块 → 落盘 05-analysis/competitive-analysis.md
+        // ④ 解析 artifact:analysis 块 → 落盘 05-analysis/竞品分析.md
         let blocks = ArtifactParser.parseArtifactBlocks(in: reply)
         return try ArtifactParser.writeAnalysisArtifact(blocks: blocks, project: project, version: version)
     }

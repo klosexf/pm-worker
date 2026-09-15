@@ -433,8 +433,7 @@ private struct SkillDetailSheet: View {
                 }
             }
         }
-        .padding(DS.Spacing.s16)
-        .presentationBackground(Color.overlayL4)
+        .dsDismissOnOutsideTap { onClose() }  // 点击面板外关闭（与关闭钮同动作）
     }
 
     /// 字段区块：小标签 + 内容（对齐卡片详情「正文」块的排版）。

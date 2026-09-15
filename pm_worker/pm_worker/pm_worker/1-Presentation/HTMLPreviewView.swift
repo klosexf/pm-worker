@@ -77,6 +77,11 @@ struct HTMLPreviewSheet: View {
             HTMLPreviewView(fileURL: fileURL)
                 .ignoresSafeArea()
         }
-        .frame(minWidth: 720, minHeight: 520)
+        // 面板钳在 min–max 之间（ideal 保底尺寸，窗口大于 ideal 时浮卡可长到 max）
+        .frame(
+            minWidth: 860, idealWidth: 1080, maxWidth: 1280,
+            minHeight: 600, idealHeight: 780, maxHeight: 880
+        )
+        .dsDismissOnOutsideTap { dismiss() }  // 点击面板外关闭（与关闭钮同动作）
     }
 }

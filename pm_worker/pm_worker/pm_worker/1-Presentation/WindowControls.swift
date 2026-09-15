@@ -36,7 +36,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.styleMask.insert(.fullSizeContentView)
-        window.isMovableByWindowBackground = true
+        // 窗口背景不整体可拖（否则对话区等正文区域长按会拖动整个窗口）；
+        // 移动窗口改由顶栏行的 WindowDragArea 接管。
         // 隐藏系统红绿灯（关闭 / 最小化 / 缩放）——顶部安全区随之不再预留
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
@@ -108,7 +109,7 @@ struct WindowControlButtons<Trailing: View>: View {
         .padding(.trailing, DS.Spacing.s12)
         .padding(.top, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(WindowRef { targetWindow = $0 })
+        .background(WindowDragArea { targetWindow = $0 })
     }
 
     private enum Kind {
@@ -190,21 +191,34 @@ struct WindowControlButtons<Trailing: View>: View {
     }
 }
 
-/// 拿到视图所在 NSWindow 引用的辅助 representable。
-private struct WindowRef: NSViewRepresentable {
+/// 顶栏拖拽区：捕获所在 NSWindow 引用，并接管窗口移动——mouseDown 时进入
+/// 系统拖拽循环（与原生标题栏同机制）。仅覆盖顶栏行下层，正文区域不触发。
+private struct WindowDragArea: NSViewRepresentable {
     let onResolve: (NSWindow) -> Void
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async {
-            if let window = view.window { onResolve(window) }
-        }
+        let view = DragAreaView()
+        view.onResolve = onResolve
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? DragAreaView)?.onResolve = onResolve
         DispatchQueue.main.async {
             if let window = nsView.window { onResolve(window) }
+        }
+    }
+
+    private final class DragAreaView: NSView {
+        var onResolve: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window { onResolve?(window) }
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            window?.performDrag(with: event)
         }
     }
 }

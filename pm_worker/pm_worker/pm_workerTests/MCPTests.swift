@@ -4,7 +4,7 @@
 //
 //  MCP Server（Task 5.1）离线单测：
 //  - sanitizeSegment / resolvedTarget：路径段校验与入参兜底
-//  - 确认闸口：clarification.md / confirmed.json 缺失拦截、有则放行
+//  - 确认闸口：澄清要点表 / confirmed.json 缺失拦截、有则放行
 //  - 任务生命周期：mcp_tasks pending → running → done 流转 + 产物落盘 + pipeline_runs upsert
 //  - 重启 failover：残留 pending/running 判 failed
 //  - LLM 失败路径：缺 API Key → 任务 failed 且 result 带人话指引
@@ -132,19 +132,19 @@ final class MCPTests: XCTestCase {
     func testStructureGateRequiresClarification() async throws {
         let handlers = makeHandlers { _, _, _ in Self.structureReply }
 
-        // 无 clarification.md → 报错并引导先澄清
+        // 无澄清要点表 → 报错并引导先澄清
         do {
             _ = try await handlers.submitGenerationTask(
                 type: "generate_structure", project: nil, version: nil
             )
-            XCTFail("缺 clarification.md 应抛闸口错误")
+            XCTFail("缺澄清要点表应抛闸口错误")
         } catch {
             let text = "\(error)"
             XCTAssertTrue(text.contains("澄清"), "错误应引导先完成澄清：\(text)")
         }
 
         // 补齐要点表 → 过闸（返回 task_id）
-        try writeArtifact("# 澄清要点表", rel: "01-requirements/clarification.md")
+        try writeArtifact("# 澄清要点表", rel: ArtifactPath.clarification)
         let taskId = try await handlers.submitGenerationTask(
             type: "generate_structure", project: nil, version: nil
         )
@@ -191,7 +191,7 @@ final class MCPTests: XCTestCase {
     // MARK: - 4. 任务生命周期（pending → running → done + 落盘 + pipeline_runs）
 
     func testStructureTaskLifecycle() async throws {
-        try writeArtifact("# 澄清要点表", rel: "01-requirements/clarification.md")
+        try writeArtifact("# 澄清要点表", rel: ArtifactPath.clarification)
 
         let box = StatusBox()
         let db = try XCTUnwrap(database)
@@ -217,8 +217,8 @@ final class MCPTests: XCTestCase {
         await handlers.runTask(taskId)
         let done = try await handlers.taskStatus(taskId: taskId)
         XCTAssertEqual(done.status, "done")
-        XCTAssertTrue(done.result?.contains("02-structure/architecture.md") == true)
-        XCTAssertTrue(done.result?.contains("02-structure/module-page-map.md") == true)
+        XCTAssertTrue(done.result?.contains(ArtifactPath.architecture) == true)
+        XCTAssertTrue(done.result?.contains(ArtifactPath.modulePageMap) == true)
 
         // 模型执行期观察到 running（状态机在调用 LLM 前置位）
         let observed = await box.observed
@@ -228,9 +228,9 @@ final class MCPTests: XCTestCase {
         let dir = PMAgentStore.versionURL(project: "默认", version: "unversioned")
         let fm = FileManager.default
         for rel in [
-            "02-structure/architecture.md",
-            "02-structure/core-flows.md",
-            "02-structure/module-page-map.md",
+            ArtifactPath.architecture,
+            ArtifactPath.coreFlows,
+            ArtifactPath.modulePageMap,
         ] {
             XCTAssertTrue(
                 fm.fileExists(atPath: dir.appendingPathComponent(rel).path),
@@ -253,11 +253,11 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(run?.status, "done")
     }
 
-    /// 原型任务执行：假 artifact:prototype HTML → 03-prototypes/prototype-v1.html。
+    /// 原型任务执行：假 artifact:prototype HTML → 03-prototypes/可点击原型.html。
     func testPrototypeTaskWritesHTML() async throws {
         try writeArtifact("{}", rel: "02-structure/confirmed.json")
-        try writeArtifact("| 模块 | 页面 |\n|---|---|\n| A | 首页 |", rel: "02-structure/module-page-map.md")
-        try writeArtifact("flowchart TD", rel: "02-structure/core-flows.md")
+        try writeArtifact("| 模块 | 页面 |\n|---|---|\n| A | 首页 |", rel: ArtifactPath.modulePageMap)
+        try writeArtifact("flowchart TD", rel: ArtifactPath.coreFlows)
 
         let handlers = makeHandlers { _, _, _ in
             "```artifact:prototype\n<html><body>灰盒原型</body></html>\n```"
@@ -270,14 +270,14 @@ final class MCPTests: XCTestCase {
         let done = try await handlers.taskStatus(taskId: taskId)
         XCTAssertEqual(done.status, "done")
         let url = PMAgentStore.versionURL(project: "默认", version: "unversioned")
-            .appendingPathComponent("03-prototypes/prototype-v1.html")
+            .appendingPathComponent(ArtifactPath.prototype)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
 
-    /// PRD 任务执行：假 artifact:prd → 04-prd/prd-v1.md（standard 档）。
+    /// PRD 任务执行：假 artifact:prd → 04-prd/PRD文档.md（standard 档）。
     func testPRDTaskWritesDocument() async throws {
         try writeArtifact("{}", rel: "03-prototypes/confirmed.json")
-        try writeArtifact("# 澄清要点表", rel: "01-requirements/clarification.md")
+        try writeArtifact("# 澄清要点表", rel: ArtifactPath.clarification)
 
         let longBody = String(repeating: "功能需求与映射表一一对应。", count: 30)
         let handlers = makeHandlers { _, _, _ in
@@ -290,9 +290,9 @@ final class MCPTests: XCTestCase {
 
         let done = try await handlers.taskStatus(taskId: taskId)
         XCTAssertEqual(done.status, "done")
-        XCTAssertEqual(done.result, "[\"04-prd/prd-v1.md\"]")
+        XCTAssertEqual(done.result, "[\"\(ArtifactPath.prd)\"]")
         let url = PMAgentStore.versionURL(project: "默认", version: "unversioned")
-            .appendingPathComponent("04-prd/prd-v1.md")
+            .appendingPathComponent(ArtifactPath.prd)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
 
@@ -353,7 +353,7 @@ final class MCPTests: XCTestCase {
     // MARK: - 6. LLM 失败路径（缺 API Key）
 
     func testMissingAPIKeyFailsTaskWithGuidance() async throws {
-        try writeArtifact("# 澄清要点表", rel: "01-requirements/clarification.md")
+        try writeArtifact("# 澄清要点表", rel: ArtifactPath.clarification)
         let handlers = makeHandlers { _, _, _ in
             throw LLMClient.LLMError.missingAPIKey
         }

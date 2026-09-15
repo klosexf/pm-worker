@@ -231,6 +231,22 @@ final class MarkdownTests: XCTestCase {
         XCTAssertEqual(String(attr.characters), "普通中文段落，无任何标记。")
     }
 
+    func testInlineEveryRunCarriesExplicitFont() {
+        // 纯文本 run 也必须带字体：调用方（dsBodyType/heading）只设行距不设
+        // 字体，漏带会让 Text 退回系统默认字号、标题/正文字号阶梯全部失效
+        let plain = MarkdownParser.inline("纯文本无任何标记", size: 16, weight: .semibold)
+        XCTAssertTrue(plain.runs.allSatisfy { $0.font != nil })
+
+        let mixed = MarkdownParser.inline("前**粗**后 `code` 与[链接](https://example.com)", size: 15)
+        XCTAssertTrue(mixed.runs.allSatisfy { $0.font != nil })
+    }
+
+    func testInlineFallbackCarriesBaseFont() {
+        // 非法标记回退纯文本路径同样带基础字体（标题兜底字号不丢）
+        let attr = MarkdownParser.inline("见 [链接](broken", size: 16, weight: .semibold)
+        XCTAssertTrue(attr.runs.allSatisfy { $0.font != nil })
+    }
+
     func testInlineFallbackKeepsTextOnOddInput() {
         // 未闭合链接等非法标记：不抛错、文本完整保留（渲染永不崩）
         let attr = MarkdownParser.inline("见 [链接](broken", size: 15)

@@ -144,11 +144,7 @@ struct MCPStatusTab: View {
         let json = MCPServerRunner.claudeConfigJSON(executablePath: executablePath)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(json, forType: .string)
-        toast = DSNotifMessage(
-            variant: .success,
-            title: "已复制到剪贴板",
-            description: "粘贴到 Claude Desktop 或 Cursor 的 MCP 配置文件即可接入"
-        )
+        toast = DSNotifMessage(variant: .success, title: "已复制到剪贴板")
     }
 
     // MARK: - 工具列表
@@ -156,7 +152,7 @@ struct MCPStatusTab: View {
     private var toolsSection: some View {
         section(
             "已暴露工具（\(MCPServerRunner.toolDefinitions.count) 个）",
-            footer: "生成类工具为异步任务：提交即回 task_id，客户端用 get_task 轮询；确认闸口与 App 内一致（clarification.md / confirmed.json）。"
+            footer: "生成类工具为异步任务：提交即回 task_id，客户端用 get_task 轮询；确认闸口与 App 内一致（澄清要点表.md / confirmed.json）。"
         ) {
             ForEach(Array(MCPServerRunner.toolDefinitions.enumerated()), id: \.element.name) { index, tool in
                 if index > 0 {

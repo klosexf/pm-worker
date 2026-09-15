@@ -16,7 +16,7 @@
 //
 //  说明：MCP 路径 MVP 不注入记忆/检索上下文（ContextBuilder 仅 GUI 主线使用，
 //  AgentPrompts 的 injection 参数恒传 ""）；MCP 触发的运行会 upsert pipeline_runs，
-//  App UI 能看到。闸口事实源与 GUI 一致：clarification.md / confirmed.json。
+//  App UI 能看到。闸口事实源与 GUI 一致：澄清要点表 / confirmed.json。
 //
 
 import Foundation
@@ -59,7 +59,7 @@ nonisolated enum MCPServerRunner {
                         ChatMessage(role: .system, content: systemPrompt),
                         ChatMessage(role: .user, content: userPrompt),
                     ],
-                maxTokens: 16384
+                maxTokens: 32768
             )
         }
 
@@ -180,7 +180,7 @@ nonisolated enum MCPServerRunner {
             Tool(
                 name: "generate_prototype",
                 description: "③ 原型：基于已确认结构（02-structure/confirmed.json）生成单文件"
-                    + "HTML 原型，落盘 03-prototypes/prototype-v1.html。长任务，返回 task_id。",
+                    + "HTML 原型，落盘 03-prototypes/可点击原型.html。长任务，返回 task_id。",
                 inputSchema: .object([
                     "type": "object",
                     "properties": .object([
@@ -192,7 +192,7 @@ nonisolated enum MCPServerRunner {
             Tool(
                 name: "generate_prd",
                 description: "④ PRD：基于已确认原型（03-prototypes/confirmed.json）撰写 PRD"
-                    + "（standard 档模板），落盘 04-prd/prd-v1.md。长任务，返回 task_id。",
+                    + "（standard 档模板），落盘 04-prd/PRD文档.md。长任务，返回 task_id。",
                 inputSchema: .object([
                     "type": "object",
                     "properties": .object([
@@ -437,9 +437,9 @@ nonisolated struct MCPToolHandlers {
         let dir = PMAgentStore.versionURL(project: target.project, version: target.version)
         switch type {
         case "generate_structure":
-            guard Self.gatePassed(dir: dir, rel: "01-requirements/clarification.md") else {
+            guard Self.gatePassed(dir: dir, rel: ArtifactPath.clarification) else {
                 throw MCPToolError.gate(
-                    "该版本尚无澄清要点表（01-requirements/clarification.md 缺失）——"
+                    "该版本尚无澄清要点表（\(ArtifactPath.clarification) 缺失）——"
                         + "请先在 App 里完成①澄清阶段，或先用 analyze_requirement 生成要点表。"
                 )
             }
@@ -559,10 +559,10 @@ nonisolated struct MCPToolHandlers {
         )
         // 闸口复查（提交与执行之间文件可能被删）
         guard let clarification = Self.readArtifact(
-            project: project, version: version, rel: "01-requirements/clarification.md"
+            project: project, version: version, rel: ArtifactPath.clarification
         ) else {
             throw MCPToolError.gate(
-                "该版本尚无澄清要点表（01-requirements/clarification.md 缺失）——"
+                "该版本尚无澄清要点表（\(ArtifactPath.clarification) 缺失）——"
                     + "请先在 App 里完成①澄清阶段，或先用 analyze_requirement 生成要点表。"
             )
         }
@@ -582,14 +582,14 @@ nonisolated struct MCPToolHandlers {
             project: project, version: version, stage: "structure", status: "done"
         )
         return [
-            "02-structure/architecture.md",
-            "02-structure/core-flows.md",
-            "02-structure/module-page-map.md",
+            ArtifactPath.architecture,
+            ArtifactPath.coreFlows,
+            ArtifactPath.modulePageMap,
         ]
     }
 
     /// ③ 原型执行：照 AppModel 原型阶段——读已确认结构产物 → prototype prompt →
-    /// HTML 落盘 03-prototypes/prototype-v1.html。
+    /// HTML 落盘 03-prototypes/可点击原型.html。
     private func executePrototype(project: String, version: String) async throws -> [String] {
         try PMAgentStore.ensureWorkspace(project: project, version: version)
         await upsertPipelineRun(
@@ -606,10 +606,10 @@ nonisolated struct MCPToolHandlers {
             )
         }
         let map = Self.readArtifact(
-            project: project, version: version, rel: "02-structure/module-page-map.md"
+            project: project, version: version, rel: ArtifactPath.modulePageMap
         ) ?? "（缺失）"
         let flows = Self.readArtifact(
-            project: project, version: version, rel: "02-structure/core-flows.md"
+            project: project, version: version, rel: ArtifactPath.coreFlows
         ) ?? "（缺失）"
         let reply = try await llm(
             .prototype,
@@ -625,11 +625,11 @@ nonisolated struct MCPToolHandlers {
         await upsertPipelineRun(
             project: project, version: version, stage: "prototype", status: "done"
         )
-        return ["03-prototypes/prototype-v1.html"]
+        return [ArtifactPath.prototype]
     }
 
     /// ④ PRD 执行：照 AppModel PRD 阶段（三档模板默认 standard）——
-    /// 读上游已确认产物 → prd prompt → 落盘 04-prd/prd-v1.md。
+    /// 读上游已确认产物 → prd prompt → 落盘 04-prd/PRD文档.md。
     private func executePRD(project: String, version: String) async throws -> [String] {
         try PMAgentStore.ensureWorkspace(project: project, version: version)
         await upsertPipelineRun(
@@ -646,13 +646,13 @@ nonisolated struct MCPToolHandlers {
             )
         }
         let clarification = Self.readArtifact(
-            project: project, version: version, rel: "01-requirements/clarification.md"
+            project: project, version: version, rel: ArtifactPath.clarification
         ) ?? "（缺失）"
         let map = Self.readArtifact(
-            project: project, version: version, rel: "02-structure/module-page-map.md"
+            project: project, version: version, rel: ArtifactPath.modulePageMap
         ) ?? "（缺失）"
         let analysis = Self.readArtifact(
-            project: project, version: version, rel: "05-analysis/competitive-analysis.md"
+            project: project, version: version, rel: ArtifactPath.competitiveAnalysis
         ) ?? ""
         let rows = await AppModel.mapRows(in: map)
         let reply = try await llm(
@@ -678,7 +678,7 @@ nonisolated struct MCPToolHandlers {
         await upsertPipelineRun(
             project: project, version: version, stage: "prd", status: "done"
         )
-        return ["04-prd/prd-v1.md"]
+        return [ArtifactPath.prd]
     }
 
     // MARK: - get_task / 状态更新 / failover

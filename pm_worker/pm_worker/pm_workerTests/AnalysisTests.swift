@@ -403,5 +403,135 @@ final class AnalysisTests: XCTestCase {
         XCTAssertEqual(StageModelConfig.defaultModel(for: "anthropic-compat"), "claude-sonnet-4")
         XCTAssertEqual(StageModelConfig.defaultModel(for: "ollama"), "qwen2.5")
         XCTAssertEqual(StageModelConfig.defaultModel(for: "unknown"), "")
+        // 火山引擎（Ark OpenAI 兼容端点）
+        XCTAssertEqual(StageModelConfig.presetBaseURL(for: "volcengine"), "https://ark.cn-beijing.volces.com/api/v3")
+        XCTAssertEqual(StageModelConfig.defaultModel(for: "volcengine"), "doubao-seed-1-6")
+        XCTAssertTrue(StageModelConfig.defaultSupportsImages(for: "volcengine"))
+        XCTAssertTrue(DSProviderOption.all.contains { $0.value == "volcengine" && $0.title == "火山引擎" })
+    }
+
+    // MARK: 多模型管理（2026-09-14）
+
+    /// 多模型用例起点：清空 default 自带的出厂播种档案，从空档案表构造。
+    private func emptyModelSettings() -> LLMSettings {
+        var settings = LLMSettings.default
+        settings.models = []
+        settings.activeModelID = nil
+        return settings
+    }
+
+    func testSeedModelsFromChatPreservesLegacyKeychainSlot() {
+        // 旧存量 settings.json 无 models 字段：decode 后 models 为空，
+        // seedModelsFromChat 从 classify 播种首档案，且 Key 槽沿用 byok.<provider>（Key 不丢）
+        var legacy = LLMSettings.default
+        legacy.models = []
+        legacy.activeModelID = nil
+        legacy.seedModelsFromChat()
+
+        XCTAssertEqual(legacy.models.count, 1)
+        let seeded = try? XCTUnwrap(legacy.models.first)
+        XCTAssertEqual(seeded?.provider, "deepseek")
+        XCTAssertEqual(seeded?.model, "deepseek-flash")
+        XCTAssertEqual(seeded?.keychainKey, "byok.deepseek")
+        XCTAssertEqual(legacy.activeModelID, seeded?.id)
+        // 新增档案走档案私有槽位（同供应商多 Key 隔离）
+        let fresh = ModelProfile.newProfile(defaultProvider: "zhipu")
+        XCTAssertTrue(fresh.keychainKey.hasPrefix("byok.model."))
+        XCTAssertNotEqual(fresh.keychainKey, "byok.zhipu")
+    }
+
+    func testSetActiveModelWritesThroughAllChatStages() {
+        var settings = emptyModelSettings()
+        let profileA = ModelProfile(provider: "deepseek", model: "deepseek-chat")
+        let profileB = ModelProfile(provider: "zhipu", model: "glm-4.6")
+        settings.upsertModel(profileA)
+        settings.upsertModel(profileB)
+
+        settings.setActiveModel(id: profileB.id)
+        XCTAssertEqual(settings.activeModelID, profileB.id)
+        // 写透：八个对话阶段全部切到新模型（LLMClient 读 stages，运行时即时生效）
+        for stage in LLMStage.chatStages {
+            XCTAssertEqual(settings.stages[stage]?.provider, "zhipu")
+            XCTAssertEqual(settings.stages[stage]?.model, "glm-4.6")
+        }
+        // 独立 Key 槽位跟随档案进 stages
+        XCTAssertEqual(settings.stages[.classify]?.apiKeyKeychainKey, profileB.keychainKey)
+        // embedding 不受切换影响
+        XCTAssertEqual(settings.stages[.embedding]?.model, "embedding-3")
+
+        // chatConfig 投影与档案一致（下游旧读法兼容）
+        XCTAssertEqual(settings.chatConfig.model, "glm-4.6")
+    }
+
+    func testDisableActiveModelFallsBackToNextEnabled() {
+        var settings = emptyModelSettings()
+        let profileA = ModelProfile(provider: "deepseek", model: "deepseek-chat")
+        let profileB = ModelProfile(provider: "zhipu", model: "glm-4.6")
+        settings.upsertModel(profileA)
+        settings.upsertModel(profileB)
+        settings.setActiveModel(id: profileA.id)
+
+        // 停用使用中档案 → 自动迁移到下一个启用档案
+        settings.setModelEnabled(id: profileA.id, enabled: false)
+        XCTAssertEqual(settings.activeModelID, profileB.id)
+        XCTAssertEqual(settings.stages[.classify]?.model, "glm-4.6")
+        // 停用档案不出现在切换器
+        XCTAssertEqual(settings.switcherProfiles.map(\.id), [profileB.id])
+
+        // 重新启用不抢占使用中
+        settings.setModelEnabled(id: profileA.id, enabled: true)
+        XCTAssertEqual(settings.activeModelID, profileB.id)
+        XCTAssertEqual(settings.switcherProfiles.count, 2)
+    }
+
+    func testRemoveActiveModelFallsBackAndKeepsLastModel() {
+        var settings = emptyModelSettings()
+        let profileA = ModelProfile(provider: "deepseek", model: "deepseek-chat")
+        let profileB = ModelProfile(provider: "zhipu", model: "glm-4.6")
+        settings.upsertModel(profileA)
+        settings.upsertModel(profileB)
+        settings.setActiveModel(id: profileA.id)
+
+        settings.removeModel(id: profileA.id)
+        XCTAssertEqual(settings.models.count, 1)
+        XCTAssertEqual(settings.activeModelID, profileB.id)
+        XCTAssertEqual(settings.stages[.classify]?.model, "glm-4.6")
+
+        // 最后一个档案也可删（数据层允许；UI 层禁删最后一个）——stages 保留最后配置不回缺省
+        settings.removeModel(id: profileB.id)
+        XCTAssertNil(settings.activeModelID)
+        XCTAssertNil(settings.activeProfile)
+        XCTAssertEqual(settings.chatConfig.model, "glm-4.6")
+    }
+
+    func testModelSettingsRoundTripPreservesProfiles() throws {
+        var settings = emptyModelSettings()
+        let profile = ModelProfile(
+            provider: "zhipu", model: "glm-4.6", baseURL: "https://open.bigmodel.cn/api/paas/v4",
+            supportsImages: true, enabled: false
+        )
+        settings.upsertModel(profile)
+        settings.setActiveModel(id: profile.id)
+
+        let decoded = try JSONDecoder().decode(
+            LLMSettings.self, from: JSONEncoder().encode(settings)
+        )
+        XCTAssertEqual(decoded.models, settings.models)
+        XCTAssertEqual(decoded.activeModelID, profile.id)
+        XCTAssertEqual(decoded.stages[.classify]?.keychainKey, profile.keychainKey)
+
+        // 旧存量 JSON（无 models / activeModelID）decode 不报错
+        var legacySource = LLMSettings.default
+        legacySource.models = []
+        legacySource.activeModelID = nil
+        var encoded = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(legacySource)
+        ) as! [String: Any]
+        encoded.removeValue(forKey: "models")
+        encoded.removeValue(forKey: "activeModelID")
+        let legacy = try JSONDecoder().decode(
+            LLMSettings.self, from: try JSONSerialization.data(withJSONObject: encoded)
+        )
+        XCTAssertTrue(legacy.models.isEmpty)
     }
 }

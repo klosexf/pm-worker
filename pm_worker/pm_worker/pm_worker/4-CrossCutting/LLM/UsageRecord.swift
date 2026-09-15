@@ -26,7 +26,9 @@ nonisolated struct UsageRecord: Codable, Equatable {
 
 // 旧 JSONL 兼容：cacheHitTokens 缺省 0（decodeIfPresent）；
 // 放 extension 保住 memberwise init 的默认参。
-extension UsageRecord {
+// nonisolated：extension 不继承 nonisolated（默认 MainActor 隔离会让
+// init(from:) 与 nonisolated struct 上的 Decodable 一致性跨隔离冲突）。
+nonisolated extension UsageRecord {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         ts = try container.decode(String.self, forKey: .ts)

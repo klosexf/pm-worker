@@ -16,7 +16,10 @@ import SwiftUI
 
 /// 原型 .ds-dialog：白底 r12 · max-w 520（此处按调用点钉宽）· 双层大软阴影 ·
 /// head（图标 + heading-sm 标题 + 32×32 关闭钮，hover 灰）+ body + foot。
-/// 用法：sheet 内容根部包一层，外层 `.presentationBackground(Color.overlayL4)`。
+/// 用法：sheet 内容根部包一层，外层 `.dsDismissOnOutsideTap { … }`
+/// （自带 sheet 窗口撑满 + scrim 压暗底 + 点击面板外关闭；勿再套
+/// `.presentationBackground(Color.surfaceBase)`）。「无框纯影」方案：面板零描边，
+/// 边界交给明度差 + 阴影；勿再垫 padding——那会在面板外露出第二层底。
 struct DSDialog<Content: View, Footer: View>: View {
     let title: String
     var icon: DSIcon.Name? = nil
@@ -75,13 +78,71 @@ struct DSDialog<Content: View, Footer: View>: View {
             Color.surfaceBase,
             in: RoundedRectangle(cornerRadius: DS.Radius.xxl)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.xxl)
-                .strokeBorder(Color.borderL2, lineWidth: 1)
-        )
-        // 原型对话框阴影：0 24/64 14% + 0 4/16 8%（高度令牌 .overlay）
+        // 「无框纯影」：零描边，边界由明度差 + 双层大软阴影承担
+        // （原型对话框阴影：0 24/64 14% + 0 4/16 8%，高度令牌 .overlay）
         .dsShadow(.overlay)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.xxl))
+    }
+}
+
+// MARK: - 弹框「点击外部区域关闭」
+
+/// sheet 初始尺寸提议 = 主窗口内容区尺寸（macOS 无 iOS 的 .window 成员，自定义实现；
+/// 已用独立 spike 实测：提议可驱动 sheet 窗口尺寸，但提议时机 keyWindow 可能仍 nil、
+/// 父窗口 attachedSheet 也未设置——须按「keyWindow(非 sheet) → 第一个可见非 sheet 窗口」
+/// 查找，两条路径实测均可命中主窗口）。布局/呈现均发生在主线程。
+private nonisolated struct DSWindowPresentationSizing: PresentationSizing {
+    nonisolated func proposedSize(
+        for root: PresentationSizingRoot, context: PresentationSizingContext
+    ) -> ProposedViewSize {
+        guard
+            let size = MainActor.assumeIsolated({
+                let key = NSApp.keyWindow.flatMap { $0.isSheet ? nil : $0 }
+                return (key ?? NSApp.windows.first {
+                    !$0.isSheet && $0.isVisible && $0.contentView != nil
+                })?
+                // contentLayoutRect 排除标题栏/工具栏——sheet 正是挂在工具栏下方的内容区
+                .contentLayoutRect.size
+            }),
+            size.width > 1, size.height > 1
+        else { return .unspecified }  // 兜底：不约束（回落 fitted 行为）
+        return ProposedViewSize(width: size.width, height: size.height)
+    }
+}
+
+/// 弹框 sheet 根部统一宿主：ZStack 全幅 scrim 捕点层垫在内容后，点击落在面板外
+/// → 触发 onClose（与关闭钮 / 取消钮同动作）；面板内点击命中面板自身内容，
+/// 不会穿透到捕点层，内部交互不受影响。
+/// 关键：`.presentationSizing(DSWindowPresentationSizing())` 让 sheet 窗口 =
+/// 主窗口尺寸——macOS 的 sheet 默认收缩到内容 ideal 尺寸（frame(maxWidth:
+/// .infinity) 撑不开），面板外根本没有可点击区域，捕点无从谈起；窗口撑满 +
+/// scrim 铺底后，「外部区域」才真实存在。面板尺寸由自身的 min/ideal/max 钳制
+///（大窗浮卡居中）。
+/// scrim 必须画在内容层、不能指望 `.presentationBackground(.clear)`：macOS 26
+/// Liquid Glass 对大尺寸 sheet 强制不透明底（Apple 确认的有意行为），.clear
+/// 失效后回落成系统深灰满窗「大灰板」；内容层 scrim 无论窗口底透不透明都
+/// 呈现统一压暗。
+private struct DSDismissOnOutsideTapModifier: ViewModifier {
+    let onClose: () -> Void
+
+    func body(content: Content) -> some View {
+        ZStack {
+            Color.scrim
+                .contentShape(Rectangle())  // 压暗区也要可命中
+                .onTapGesture(perform: onClose)
+                .accessibilityHidden(true)
+            content
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .presentationSizing(DSWindowPresentationSizing())
+        .presentationBackground(.clear)
+    }
+}
+
+extension View {
+    /// 弹框「点击外部区域关闭」：sheet 内容根部套用（替代 .presentationBackground）。
+    func dsDismissOnOutsideTap(onClose: @escaping () -> Void) -> some View {
+        modifier(DSDismissOnOutsideTapModifier(onClose: onClose))
     }
 }
 

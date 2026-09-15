@@ -217,7 +217,7 @@ struct DeveloperInspector: View {
                     Text("trigger_signal：")
                         .font(DS.Font.bodyXSStrong)
                         .foregroundStyle(Color.ink300)
-                    Text(Self.countLine(records) { $0.triggerSignal.rawValue })
+                    Text(Self.countLine(records) { $0.triggerSignal?.rawValue ?? "none" })
                         .font(DS.Font.monoSM)
                         .foregroundStyle(Color.ink700)
                         .textSelection(.enabled)
@@ -227,7 +227,7 @@ struct DeveloperInspector: View {
                         Text(record.hypothesis)
                             .font(DS.Font.bodySM)
                             .foregroundStyle(Color.ink900)
-                        Text("\(record.triggerSignal.rawValue) · \(record.status.rawValue)")
+                        Text("\(record.triggerSignal?.rawValue ?? "none") · \(record.status.rawValue)")
                             .font(DS.Font.monoSM)
                             .foregroundStyle(Color.ink300)
                     }

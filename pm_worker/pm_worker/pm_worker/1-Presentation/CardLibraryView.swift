@@ -89,15 +89,6 @@ struct CardLibraryView: View {
         }
         .background(Color.surfaceSecondary)
         .frame(minWidth: 480, minHeight: 480)
-        .toolbar {
-            Button {
-                Task { await load() }
-            } label: {
-                Label { Text("重新加载") } icon: { DSIcon(.refresh, size: 14) }
-            }
-            .buttonStyle(.ds(.secondary, size: .sm))
-            .help("从索引库重新读取全部卡片")
-        }
         .task { await load() }
         .task(id: selectedId) { await loadDetail() }
         .sheet(isPresented: Binding(
@@ -325,8 +316,7 @@ private struct CardDetailSheet: View {
                 }
             }
         }
-        .padding(DS.Spacing.s16)
-        .presentationBackground(Color.overlayL4)
+        .dsDismissOnOutsideTap { onClose() }  // 点击面板外关闭（与关闭钮同动作）
     }
 }
 

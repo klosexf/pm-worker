@@ -67,6 +67,18 @@ nonisolated enum PitfallsRouter {
         return entries
     }
 
+    /// 阶段 → 钦定锚点技能（skills 表 id = name，每阶段恰 1 个、与该阶段产物直接对应）。
+    /// 意图优先路由的兜底层（2026-09-14 改造）：技能正文按消息语义命中注入，
+    /// 仅当语义零命中（embedder 失效 / 检索质量差）时注入锚点——保「主干方法论
+    /// 不因检索失效而缺席」，不再关键词全量常驻（旧口径会把「调研」「访谈」等
+    /// 高频词撞上的无关技能每轮全量注入，压过消息意图）。
+    static let stageAnchorSkills: [LLMStage: String] = [
+        .clarify: "问题定义画布",
+        .structure: "用户故事与验收标准",
+        .prototype: "高保真原型设计",
+        .prd: "证据先行门控",
+    ]
+
     // MARK: - Private
 
     /// JSON 数组字符串 → [String]（NULL / 空 / 解析失败回空数组）。

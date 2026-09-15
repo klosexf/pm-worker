@@ -8,6 +8,39 @@
 
 import Foundation
 
+/// 产物文件名规范（中文名，用户在 Finder / 产物抽屉直接可读）。
+/// 阶段子目录（01-requirements…07-reports）与系统文件（confirmed.json /
+/// self-review.jsonl / score-card.json 等）不在此列——只有「给人看的产物」用中文名。
+nonisolated enum ArtifactPath {
+    static let clarification = "01-requirements/澄清要点表.md"
+    /// 增补澄清进行中标记（回退协议 target=clarify 写入；要点表重新落盘推进时清除）。
+    /// deriveStage 据此区分「有表待生成结构」与「有表但增补澄清中（回到①）」。
+    static let clarifyAmend = "01-requirements/amend.json"
+    static let architecture = "02-structure/功能架构图.md"
+    static let coreFlows = "02-structure/核心流程图.md"
+    static let modulePageMap = "02-structure/模块-页面映射表.md"
+    static let businessFlows = "02-structure/业务流程图.md"
+    static let prototype = "03-prototypes/可点击原型.html"
+    static let prd = "04-prd/PRD文档.md"
+    static let prdTruncatedDraft = "04-prd/PRD截断草稿.md"
+    static let competitiveAnalysis = "05-analysis/竞品分析.md"
+    static let releaseNotes = "07-reports/发布说明.md"
+
+    /// 旧英文文件名 → 中文文件名（ensureWorkspace 幂等迁移，存量项目无缝升级）。
+    static let legacyRenames: [(legacy: String, current: String)] = [
+        ("01-requirements/clarification.md", clarification),
+        ("02-structure/architecture.md", architecture),
+        ("02-structure/core-flows.md", coreFlows),
+        ("02-structure/module-page-map.md", modulePageMap),
+        ("02-structure/business-flows.md", businessFlows),
+        ("03-prototypes/prototype-v1.html", prototype),
+        ("04-prd/prd-v1.md", prd),
+        ("04-prd/prd-truncated-draft.md", prdTruncatedDraft),
+        ("05-analysis/competitive-analysis.md", competitiveAnalysis),
+        ("07-reports/release-notes.md", releaseNotes),
+    ]
+}
+
 /// nonisolated：文件系统操作不受默认 MainActor 隔离约束。
 nonisolated enum PMAgentStore {
     /// 测试与正式环境可注入不同根目录。
@@ -22,6 +55,8 @@ nonisolated enum PMAgentStore {
     static var skillsDir: URL { root.appendingPathComponent("skills", isDirectory: true) }
     static var cardsDir: URL { root.appendingPathComponent("cards", isDirectory: true) }
     static var projectsDir: URL { root.appendingPathComponent("Projects", isDirectory: true) }
+    /// 全局记忆池（跨项目共享，与项目记忆完全分离）
+    static var globalMemoryURL: URL { root.appendingPathComponent("memory.jsonl") }
     /// 「默认」项目（系统预建，不可删除）
     static var defaultProjectName: String { "默认" }
 
@@ -128,9 +163,16 @@ nonisolated enum PMAgentStore {
             at: projectsDir, includingPropertiesForKeys: nil
         ) else { return [] }
         return entries
+            .filter { !$0.lastPathComponent.hasPrefix(".") }  // 隐藏目录（.git 等）不是项目
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
             .map(\.lastPathComponent)
             .sorted { $0 == defaultProjectName && $1 != defaultProjectName }
+    }
+
+    /// 项目目录创建时间（任务列表按创建时间倒序用）；读取失败返回 nil。
+    static func projectCreatedAt(_ projectName: String) -> Date? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: projectURL(projectName).path)
+        return attrs?[.creationDate] as? Date
     }
 
     // MARK: - Version
@@ -219,6 +261,19 @@ nonisolated enum PMAgentStore {
                 }
             }
         }
+        migrateLegacyArtifactNames(dir: dir)
+    }
+
+    /// 旧英文产物名 → 中文名（幂等）：旧名存在且新名不存在才搬，失败不阻塞工作区保障。
+    private static func migrateLegacyArtifactNames(dir: URL) {
+        let fm = FileManager.default
+        for rename in ArtifactPath.legacyRenames {
+            let oldURL = dir.appendingPathComponent(rename.legacy)
+            let newURL = dir.appendingPathComponent(rename.current)
+            guard fm.fileExists(atPath: oldURL.path),
+                  !fm.fileExists(atPath: newURL.path) else { continue }
+            try? fm.moveItem(at: oldURL, to: newURL)
+        }
     }
 
     // MARK: - 会话附件（图片走文件引用，base64 不落 jsonl）
@@ -261,6 +316,11 @@ nonisolated enum PMAgentStore {
                 userInfo: [NSLocalizedDescriptionKey: "产物写入后回读校验失败：\(url.path)"]
             )
         }
+        // 落盘成功即广播（右栏「文件」台账实时刷新，免切 Tab 重扫）。
+        // 本方法 nonisolated、可能被后台上下文调用，监听侧须 receive(on: main)。
+        NotificationCenter.default.post(
+            name: Notification.Name("pm.worker.artifacts.changed"), object: nil
+        )
     }
 
     /// 列出某项目下全部版本目录（磁盘为准）。
@@ -270,9 +330,121 @@ nonisolated enum PMAgentStore {
             at: projectURL(projectName), includingPropertiesForKeys: nil
         ) else { return [] }
         return entries
+            .filter { !$0.lastPathComponent.hasPrefix(".") }  // 隐藏目录（.git 等）不是版本
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
             .map(\.lastPathComponent)
             .sorted()
+    }
+
+    // MARK: - Project / Version 结构操作（侧栏行「更多」菜单）
+
+    /// 结构操作错误工厂（侧栏菜单的人话报错，经 AppModel 透传到通知条）。
+    private static func structError(_ message: String) -> NSError {
+        NSError(
+            domain: "PMAgentStore", code: 10,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    /// 目录名合法性：非空、无路径分隔符（/ 与 :）、非「.」「..」——目录名直接拼路径。
+    private static func validateNodeName(_ name: String) throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed != ".", trimmed != "..",
+              !trimmed.contains("/"), !trimmed.contains(":") else {
+            throw structError("名称不能为空，且不能包含 / 或 : 等路径字符")
+        }
+    }
+
+    /// 重命名项目：目录整体 move + project.json name 回写。
+    /// 「默认」是系统预建项目（newSession/startTask 的兜底落点），不可重命名。
+    static func renameProject(from oldName: String, to newName: String) throws {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        try validateNodeName(trimmed)
+        guard oldName != defaultProjectName else {
+            throw structError("系统预建项目「\(defaultProjectName)」不可重命名")
+        }
+        let fm = FileManager.default
+        let src = projectURL(oldName)
+        guard fm.fileExists(atPath: src.path) else {
+            throw structError("项目不存在：\(oldName)")
+        }
+        let dst = projectURL(trimmed)
+        guard !fm.fileExists(atPath: dst.path) else {
+            throw structError("项目已存在：\(trimmed)")
+        }
+        try fm.moveItem(at: src, to: dst)
+        if var project = try readProject(trimmed) {
+            project.name = trimmed
+            try writeProject(project, to: dst)
+        }
+    }
+
+    /// 删除项目：整目录移除（含全部版本、会话与产物）。「默认」不可删除。
+    static func deleteProject(_ name: String) throws {
+        guard name != defaultProjectName else {
+            throw structError("系统预建项目「\(defaultProjectName)」不可删除")
+        }
+        let dir = projectURL(name)
+        guard FileManager.default.fileExists(atPath: dir.path) else {
+            throw structError("项目不存在：\(name)")
+        }
+        try FileManager.default.removeItem(at: dir)
+    }
+
+    /// 重命名版本：目录 move + version.json version 字段 + project.json
+    /// versions 清单与 currentVersion 回写。unversioned 是会话兜底落点
+    /// （系统保留）、已封板版本是只读快照，两者均拒绝。
+    static func renameVersion(project: String, from oldName: String, to newName: String) throws {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        try validateNodeName(trimmed)
+        guard oldName != "unversioned" else {
+            throw structError("「unversioned」为系统保留版本，不可重命名")
+        }
+        if let doc = try readVersion(project: project, version: oldName), doc.status == .released {
+            throw structError("已封板版本为只读快照，不可重命名")
+        }
+        let fm = FileManager.default
+        let src = versionURL(project: project, version: oldName)
+        guard fm.fileExists(atPath: src.path) else {
+            throw structError("版本不存在：\(project)/\(oldName)")
+        }
+        let dst = versionURL(project: project, version: trimmed)
+        guard !fm.fileExists(atPath: dst.path) else {
+            throw structError("版本已存在：\(project)/\(trimmed)")
+        }
+        try fm.moveItem(at: src, to: dst)
+        if var doc = try readVersion(project: project, version: trimmed) {
+            doc.version = trimmed
+            try write(doc, to: dst.appendingPathComponent("version.json"))
+        }
+        if var projectDoc = try readProject(project) {
+            if let index = projectDoc.versions.firstIndex(of: oldName) {
+                projectDoc.versions[index] = trimmed
+            }
+            if projectDoc.currentVersion == oldName { projectDoc.currentVersion = trimmed }
+            try writeProject(projectDoc, to: projectURL(project))
+        }
+    }
+
+    /// 删除版本：整目录移除 + project.json versions 清单回写。
+    /// unversioned（系统保留）与已封板版本（只读快照）拒绝删除。
+    static func deleteVersion(project: String, version: String) throws {
+        guard version != "unversioned" else {
+            throw structError("「unversioned」为系统保留版本，不可删除")
+        }
+        if let doc = try readVersion(project: project, version: version), doc.status == .released {
+            throw structError("已封板版本为只读快照，不可删除")
+        }
+        let dir = versionURL(project: project, version: version)
+        guard FileManager.default.fileExists(atPath: dir.path) else {
+            throw structError("版本不存在：\(project)/\(version)")
+        }
+        try FileManager.default.removeItem(at: dir)
+        if var projectDoc = try readProject(project) {
+            projectDoc.versions.removeAll { $0 == version }
+            try writeProject(projectDoc, to: projectURL(project))
+        }
     }
 
     // MARK: - JSONL
