@@ -165,12 +165,16 @@ nonisolated final class Retriever {
 
         // 5. 技能：阈值过滤（按 skillQuery 向量——意图优先）。命中只给 when_to_use
         //    摘要（正文渐进式披露）；未命中（含被 topK 截断与零长度占位）的技能
-        //    全部 id 进 unmatchedSkills——E11 验证依据
+        //    全部 id 进 unmatchedSkills——E11 验证依据。
+        //    skillIndexReady：技能表是否存在可解码向量（索引失效态判据——空向量恒零
+        //    命中不等于「消息与技能都无关」，Context Builder 据此区分锚点兜底时机）
         var skillCandidates: [RetrievalHit] = []
         var allSkillIds: [String] = []
+        var skillIndexReady = false
         for row in skillRows {
             allSkillIds.append(row.id)
             guard !row.embedding.isEmpty, let vector = VectorMath.decode(row.embedding) else { continue }
+            skillIndexReady = true
             let score = VectorMath.cosine(skillVector, vector)
             guard score > Self.skillThreshold else { continue }
             skillCandidates.append(
@@ -210,7 +214,8 @@ nonisolated final class Retriever {
             filteredCrossProject: filteredCrossProject,
             unmatchedSkills: unmatchedSkills,
             durationMs: Self.milliseconds(of: clock.now - start),
-            skillQuery: skillQuery
+            skillQuery: skillQuery,
+            skillIndexReady: skillIndexReady
         )
     }
 

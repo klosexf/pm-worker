@@ -323,6 +323,115 @@ final class MilestoneTests: XCTestCase {
         XCTAssertNil(MessageBubble.warnRow(fromText: "活跃 💀 已达 多条（软上限 3 条）：建议收敛。", index: 0))
     }
 
+    func testMergeableNotesAbsorbRiskAdoptionNote() {
+        // 采纳落实闭环（2026-09-15）的「⚡ 风险台账 · 已受理采纳…」受理行必须作为
+        // preamble 并入落实回合顶部注记。漏登记会让受理行退回独立事件条、与落实
+        // 回合断开（回归锚点：⚡ 不入 eventEmojis，白名单走「⚡ 风险台账」专属前缀）。
+        var at = Date(timeIntervalSince1970: 1_700_000_000)
+        func entry(_ role: DiscussionEntry.Role, _ content: String) -> DiscussionEntry {
+            at.addTimeInterval(1)
+            return DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s1", role: role, content: content,
+                createdAt: ISO8601DateFormatter().string(from: at)
+            )
+        }
+        let entries = [
+            entry(.assistant, "上一回合回答正文"),
+            entry(.system, "⚡ 风险台账 · 已受理采纳，正在落实方案"),
+            entry(.assistant, "执行包正文（纯 Markdown，无产物块）"),
+        ]
+        let notes = MessageBubble.mergeableNotes(before: 2, in: entries)
+        XCTAssertEqual(notes.count, 1, "受理行并入落实回合顶部")
+        XCTAssertTrue(notes[0].text.contains("风险台账"), "⚡ 前缀已剥（图标由 DSIcon.bolt 承担）")
+        XCTAssertFalse(notes[0].text.hasPrefix("⚡"))
+
+        // 快速通道链判定不受影响：受理行不含「快速通道」标记，不构成链式续段
+        XCTAssertFalse(
+            MessageBubble.isFastForwardChainedBefore(2, in: entries),
+            "采纳落实是独立回合，不并上一条回答的头"
+        )
+    }
+
+    func testMergeableNotesAbsorbAutoSedimentRow() {
+        // 方法论自动沉淀行（🧠，①→② 收束时落卡）归**上一回合尾部注记**（aftermath 归属，
+        // 刻意不进 isTurnPreamble）：
+        // ① 与 ✅ 推进链互不干扰——✅ 仍归下一回合顶部注记；
+        // ② amending 场景（「✅ 要点表已按新功能诉求更新——进入」为推进语 preamble）
+        //    归增量修订回答顶部，🧠 仍归上一回合尾部，互不打断；
+        // ③ ⏳ 待验证提醒行（独立事件条）隔断时 🧠 仍就近归上一回合。
+        var at = Date(timeIntervalSince1970: 1_700_000_000)
+        func entry(_ role: DiscussionEntry.Role, _ content: String) -> DiscussionEntry {
+            at.addTimeInterval(1)
+            return DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s1", role: role, content: content,
+                createdAt: ISO8601DateFormatter().string(from: at)
+            )
+        }
+
+        // 场景① 常规确认：[澄清 assistant][🧠][✅][结构 assistant]
+        let rows = [
+            entry(.assistant, "澄清最后回答"),
+            entry(.system, "🧠 自动沉淀：方法论卡 +2 条 · 合并 1 条进既有卡——卡片库可查，跨项目直接用不降级。"),
+            entry(.system, "✅ 澄清要点表已确认——进入 ① 结构设计"),
+            entry(.assistant, "结构生成回答"),
+        ]
+        var notes = MessageBubble.mergeableNotes(after: 0, in: rows)
+        XCTAssertEqual(notes.count, 1, "沉淀行并入上一回合尾部")
+        XCTAssertEqual(
+            notes[0].text,
+            "自动沉淀：方法论卡 +2 条 · 合并 1 条进既有卡——卡片库可查，跨项目直接用不降级。"
+        )
+        XCTAssertFalse(notes[0].text.hasPrefix("🧠"), "emoji 已剥（图标由 DSIcon.mem 承担）")
+
+        notes = MessageBubble.mergeableNotes(before: 3, in: rows)
+        XCTAssertEqual(notes.count, 1, "✅ 推进仍归下一回合顶部，不被沉淀行干扰")
+        XCTAssertTrue(notes[0].text.contains("澄清要点表已确认"))
+
+        XCTAssertEqual(
+            MessageBubble.mergedSystemIndices(in: rows), [1, 2],
+            "两行各归其位——无独立胶囊与注记双重渲染"
+        )
+
+        // 场景② amending（增补澄清）：[assistant][🧠][✅（推进语 → preamble）][assistant]
+        let amending = [
+            entry(.assistant, "上一回合回答"),
+            entry(.system, "🧠 自动沉淀：方法论卡 +1 条 · 合并 0 条进既有卡——卡片库可查，跨项目直接用不降级。"),
+            entry(.system, "✅ 要点表已按新功能诉求更新——进入 ② 结构（增量修订）"),
+            entry(.assistant, "增量结构回答"),
+        ]
+        let amendingNotes = MessageBubble.mergeableNotes(after: 0, in: amending)
+        XCTAssertEqual(
+            amendingNotes.count, 1,
+            "amending 场景：🧠 仍并入上一回合尾部；✅ 推进语不再走 after 链"
+        )
+        XCTAssertTrue(amendingNotes[0].text.contains("自动沉淀"))
+        let amendingTop = MessageBubble.mergeableNotes(before: 3, in: amending)
+        XCTAssertEqual(
+            amendingTop.count, 1,
+            "✅ 要点表已更新行并入增量修订回答顶部注记（塞进 Agent 的回答，不落独立事件条）"
+        )
+        XCTAssertTrue(amendingTop[0].text.contains("要点表已按新功能诉求更新"))
+        XCTAssertEqual(
+            MessageBubble.mergedSystemIndices(in: amending), [1, 2],
+            "两行各归其位（🧠 → 上一回合尾部 / ✅ → 下一回合顶部）——无独立胶囊与注记双重渲染"
+        )
+
+        // 场景③ 待验证提醒（⏳，独立事件条）隔断：[assistant][🧠][⏳][✅][assistant]
+        let withNudge = [
+            entry(.assistant, "上一回合回答"),
+            entry(.system, "🧠 自动沉淀：方法论卡 +0 条 · 合并 2 条进既有卡——卡片库可查，跨项目直接用不降级。"),
+            entry(.system, "⏳ 进入结构前——「澄清」阶段还有 1 个已挂方案的风险待验证：右栏「风险」台账逐条核（已解除 / 没解决）。"),
+            entry(.system, "✅ 澄清要点表已确认——进入 ① 结构设计"),
+            entry(.assistant, "结构回答"),
+        ]
+        let nudgeNotes = MessageBubble.mergeableNotes(after: 0, in: withNudge)
+        XCTAssertEqual(nudgeNotes.count, 1, "沉淀行就近归上一回合（⏳ 隔断不影响 after 链）")
+        XCTAssertTrue(nudgeNotes[0].text.contains("自动沉淀"))
+        // ⏳ 仍是独立事件条；✅ 仍归下一回合顶部
+        XCTAssertFalse(MessageBubble.mergedSystemIndices(in: withNudge).contains(2))
+        XCTAssertEqual(MessageBubble.mergeableNotes(before: 4, in: withNudge).count, 1)
+    }
+
     // MARK: - ⑤ 快速通道链式续段 / 流式双渲染去重
 
     func testFastForwardChainedBeforeDetection() {
@@ -373,6 +482,118 @@ final class MilestoneTests: XCTestCase {
         XCTAssertFalse(
             MessageBubble.isFastForwardChainedBefore(3, in: userSeparated),
             "用户消息隔断后不判链，新回答有独立回答头"
+        )
+    }
+
+    /// 回退重做的链式续段（2026-09-15）：LLM 回退块触发 executeBacktrack 发
+    /// 「🔄 已回到 …——马上重做。」连接器行后，regenAfterBacktrack 自动续的第二轮
+    /// 生成必须并入上一条回答（不出新 Agent 头）——「一条用户消息一条回答」不因
+    /// 中间跨了阶段而破例。漏判会让续段独立出头，观感变成「AI 分两次回答」。
+    func testBacktrackContinuationChainedBefore() {
+        // 系统行工厂（时间戳递增保证 id/排序唯一）
+        var at = Date(timeIntervalSince1970: 1_700_000_000)
+        func entry(_ role: DiscussionEntry.Role, _ content: String) -> DiscussionEntry {
+            at.addTimeInterval(1)
+            return DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s1", role: role, content: content,
+                createdAt: ISO8601DateFormatter().string(from: at)
+            )
+        }
+        // 流式期：assistant 回答1（含 backtrack 块）→ 🔄 连接器行 → 🎨 note 行 → 续段生成中
+        let streaming = [
+            entry(.user, "样式改一下，顺便把配色调成苹果质感"),
+            entry(.assistant, "本轮判断：上游原型样式修订，走回退。\n```artifact:backtrack\n{\"target\": \"prototype\", \"instruction\": \"…\"}\n```"),
+            entry(.system, "🔄 已回到 ③ 原型（PRD 标记过期：局部）——马上重做。"),
+            entry(.system, "🎨 按你的要求重做原型"),
+        ]
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(streaming.count, in: streaming),
+            "🔄 已回到连接器 → 判链，流式续段不出独立回答头"
+        )
+        // 落盘后：续段 assistant 已在 entries，同样判链
+        var settled = streaming
+        settled.append(entry(.assistant, "原型修订说明 + 产物块"))
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(3, in: settled),
+            "落盘续段同样并入上一条回答"
+        )
+        // 回退到 ① 增补澄清：note 行「🔄 回到 ① 澄清」（无「已」字）不构成标记，
+        // 判链凭据仍是 executeBacktrack 发的「🔄 已回到」行
+        let amend = [
+            entry(.assistant, "上一答"),
+            entry(.system, "🔄 已回到 ① 澄清（增补模式：要点表保留作基底）——AI 将先判断新功能能不能做、适不适合做，再围绕缺口提问。"),
+            entry(.system, "🔄 回到 ① 澄清——新功能先判断，再补问缺口"),
+        ]
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(amend.count, in: amend),
+            "增补澄清续段同样并入"
+        )
+        // 反例：只有重做 note 行、无「🔄 已回到」连接器 → 不判链（标记收窄防误伤）
+        let noteOnly = [
+            entry(.assistant, "第一答"),
+            entry(.system, "🎨 按你的要求重做原型"),
+        ]
+        XCTAssertFalse(
+            MessageBubble.isFastForwardChainedBefore(noteOnly.count, in: noteOnly),
+            "🎨 note 行不是链标记，无连接器的回合保留独立回答头"
+        )
+    }
+
+    /// 自动收束链的链式续段（2026-09-16）：质量门通过 / 轮次耗尽的「澄清自动收束」
+    /// 受理行、增补收束的「要点表已按新功能诉求更新」推进行——确认链自动续生的
+    /// 第二条回答（要点表更新 → 结构重生成）必须并入上一条回答（不出新 Agent 头，
+    /// 值班单过渡）。漏判会让收束续段独立出头，观感变成「发送一条消息，AI 分两次回答」。
+    func testAutoSettleContinuationChainedBefore() {
+        // 系统行工厂（时间戳递增保证 id/排序唯一）
+        var at = Date(timeIntervalSince1970: 1_700_000_000)
+        func entry(_ role: DiscussionEntry.Role, _ content: String) -> DiscussionEntry {
+            at.addTimeInterval(1)
+            return DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s1", role: role, content: content,
+                createdAt: ISO8601DateFormatter().string(from: at)
+            )
+        }
+        // 质量门自动收束：回答1 → ✅ 质量门行 → 流式续段生成中
+        let qualityGate = [
+            entry(.assistant, "风险二讨论 + 三条路"),
+            entry(.system, "✅ 质量门通过：漏项雷达无缺项、自检覆盖充分——澄清自动收束，生成要点表并进入 ② 结构。"),
+        ]
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(qualityGate.count, in: qualityGate),
+            "质量门自动收束行 → 判链，要点表/结构生成不出独立回答头"
+        )
+        // 轮次耗尽收束：回答1 → ⏳ 耗尽受理行 → 流式续段生成中
+        let exhausted = [
+            entry(.assistant, "第五轮回答"),
+            entry(.system, "⏳ 澄清轮次已达上限——澄清自动收束，缺失项记入要点表 open_questions，进入 ② 结构。"),
+        ]
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(exhausted.count, in: exhausted),
+            "轮次耗尽受理行 → 判链，自动收束续段同样并入"
+        )
+        // 增补收束：回答1 → ✅ 要点表已更新推进行 → 流式续段生成中（落盘后同判）
+        var amend = [
+            entry(.assistant, "增补讨论回答"),
+            entry(.system, "✅ 要点表已按新功能诉求更新——进入 ② 结构（增量修订）"),
+        ]
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(amend.count, in: amend),
+            "增补收束推进行 → 判链，结构增量修订续段并入"
+        )
+        amend.append(entry(.assistant, "增量结构产物说明"))
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(2, in: amend),
+            "落盘后的增补收束续段同样并入上一条回答"
+        )
+        // 反例：常规确认推进的 ✅ note（无自动收束语）不构成标记——
+        // 该场景本就被用户确认消息隔断，标记收窄防「✅ 推进语」整体变成链凭据
+        let normal = [
+            entry(.assistant, "第一答"),
+            entry(.system, "✅ 澄清要点表已确认——进入 ② 结构设计"),
+        ]
+        XCTAssertFalse(
+            MessageBubble.isFastForwardChainedBefore(normal.count, in: normal),
+            "常规确认 note 行不是链标记，保留独立回答头"
         )
     }
 
@@ -469,17 +690,124 @@ final class MilestoneTests: XCTestCase {
         XCTAssertNil(second.first?.milestones)
     }
 
+    func testFullPipelineFlowNoDoubleRenderInvariant() {
+        // 双渲染防回归总锚点（2026-09-15）：快速通道链 + 常规确认推进混排的**全流程**
+        // 差分不变量——逐场景测试守住已知序列，此处守住两套判据的结构对称性本身：
+        // ① 每条被气泡吸收（mergeableNotes 两向行走）的系统行都在 mergedSystemIndices
+        //    里（displayItems 据此跳过独立胶囊），漏一条即「注记 + 胶囊」双渲染回归；
+        // ② 设计上保持独立胶囊的行（⚡ 受理行 = 判链标记，须肉眼可见）不被误吸收；
+        // ③ 链式续段判定与注记归属互不污染（连接器是 aftermath，不进续段头部）。
+        var at = Date(timeIntervalSince1970: 1_700_000_000)
+        func entry(
+            _ role: DiscussionEntry.Role, _ content: String,
+            stamps: [MilestoneStamp]? = nil
+        ) -> DiscussionEntry {
+            at.addTimeInterval(1)
+            return DiscussionEntry(
+                id: UUID().uuidString, sessionId: "s1", role: role, content: content,
+                milestones: stamps,
+                createdAt: ISO8601DateFormatter().string(from: at)
+            )
+        }
+
+        let entries = [
+            entry(.user, "别问了，直接给我 PRD"),
+            // 1 ⚡ 受理行：turnNote 不可并入 → 独立事件条（判链标记须可见）
+            entry(.system, "⚡ 快速通道：已按你的要求跳过逐步确认，直接生成原型并撰写 PRD（产物落盘，可事后修改）。"),
+            entry(.assistant, "结构产物回答（artifact:structure）"),
+            entry(
+                .system, "📦 结构产物已生成——机器初审中……（快速通道：自动确认，继续生成 ③ 原型）",
+                stamps: [MilestoneStamp(
+                    kind: "stage", label: "结构产物", nextAction: "确认后 AI 随即生成 ③ 原型"
+                )]
+            ),
+            entry(.system, "✅ 机器初审通过——确定性检查全部通过。确认后进入 ③ 原型。"),
+            entry(.assistant, "原型回答（artifact:prototype）"),  // 5 快速通道链式续段
+            entry(
+                .system, "⚠️ 自评审新增 2 个风险（各带应对方案）——右栏「风险」台账逐条决定：采纳方案 / 接受风险。",
+                stamps: [MilestoneStamp(kind: "risk", count: 2)]
+            ),
+            entry(
+                .system, "🔍 自评审发现 5 项——风险已入右栏「风险」台账。",
+                stamps: [MilestoneStamp(kind: "radar", count: 5, detail: "缺项 2 · 修正 1 · 风险 2")]
+            ),
+            entry(
+                .system, "📝 决策记录 +2 条——右栏「决策日志」可查。",
+                stamps: [MilestoneStamp(kind: "decision", count: 2)]
+            ),
+            entry(
+                .system, "📦 交互原型已生成——机器初审中……",
+                stamps: [MilestoneStamp(
+                    kind: "stage", label: "原型", nextAction: "确认后 AI 随即撰写 ④ PRD"
+                )]
+            ),
+            entry(.system, "ℹ️ 机器初审跳过（评审模型不可用）——直接进入人工确认。"),
+            entry(.user, "可以，进入下一阶段"),
+            entry(.system, "✅ 交互原型已确认——进入 ④ PRD。"),  // 12 preamble：归 PRD 回合头部
+            entry(
+                .system, "📊 PRD 评分卡 → standard 档",
+                stamps: [MilestoneStamp(kind: "score", label: "standard", dims: nil)]
+            ),
+            entry(.assistant, "PRD 回答（artifact:prd）"),  // 14 被用户消息隔断：独立回答头
+            entry(
+                .system, "📦 产品需求文档已生成——数据指标与验收用例见文内。",
+                stamps: [MilestoneStamp(kind: "stage", label: "PRD")]
+            ),
+        ]
+
+        // ③ 链判定：原型续段并头；PRD 回合被用户消息隔断，保留独立回答头
+        XCTAssertTrue(
+            MessageBubble.isFastForwardChainedBefore(5, in: entries),
+            "📦 连接器带「快速通道」标记 → 原型回答是结构回答的链式续段"
+        )
+        XCTAssertFalse(
+            MessageBubble.isFastForwardChainedBefore(14, in: entries),
+            "用户消息隔断 → PRD 回合不吃上一条回答的头"
+        )
+
+        // ① 吸收归属（两向行走）
+        XCTAssertEqual(MessageBubble.mergeableNotes(after: 2, in: entries).count, 2,
+                       "📦 连接器 + ✅ 初审结论归结构回答尾部")
+        XCTAssertEqual(MessageBubble.mergeableNotes(before: 5, in: entries).count, 0,
+                       "连接器是 aftermath，不进续段头部（不与结构回答重复渲染）")
+        XCTAssertEqual(MessageBubble.mergeableNotes(after: 5, in: entries).count, 5,
+                       "风险 / 雷达 / 决策 / 📦 / ℹ️ 五行全归原型回答尾部")
+        XCTAssertEqual(MessageBubble.mergeableNotes(before: 14, in: entries).count, 2,
+                       "✅ 已确认 + 📊 评分卡归 PRD 回合头部")
+        XCTAssertEqual(MessageBubble.mergeableNotes(after: 14, in: entries).count, 1,
+                       "📦 PRD 落盘行归 PRD 回答尾部")
+
+        // ② 双渲染不变量：吸收行全集 == 去重集；⚡ 受理行（1）不在其中（独立胶囊保留）
+        let merged = MessageBubble.mergedSystemIndices(in: entries)
+        XCTAssertEqual(merged, [3, 4, 6, 7, 8, 9, 10, 12, 13, 15])
+
+        // 装配终态：原型回合摘要条 = 风险 / 自评审 / 决策 / 原型待确认（ℹ️ 跳过 → reviewDone）
+        let assemblyB = MessageBubble.milestoneAssembly(
+            from: MessageBubble.mergeableNotes(after: 5, in: entries)
+        )
+        XCTAssertEqual(assemblyB.rows.map(\.name), ["风险", "自评审", "决策记录", "原型待确认"])
+        XCTAssertTrue(assemblyB.rows.last?.isNext ?? false)
+        XCTAssertTrue(assemblyB.leftovers.isEmpty)
+        // PRD 回合头部：评分卡进摘要条，✅ 推进行保留为注记行
+        let assemblyC = MessageBubble.milestoneAssembly(
+            from: MessageBubble.mergeableNotes(before: 14, in: entries)
+        )
+        XCTAssertEqual(assemblyC.rows.map(\.name), ["PRD 评分卡"])
+        XCTAssertEqual(assemblyC.leftovers.count, 1)
+    }
+
     // MARK: - ⑤ 截断卡「重新发送」原始消息查找
 
     private func entry(
         _ role: DiscussionEntry.Role,
         _ content: String,
         images: [String]? = nil,
+        files: [String]? = nil,
         id: String = UUID().uuidString
     ) -> DiscussionEntry {
         DiscussionEntry(
             id: id, sessionId: "s1", role: role, content: content,
-            images: images, createdAt: "2026-09-13T12:00:00Z"
+            images: images, files: files, createdAt: "2026-09-13T12:00:00Z"
         )
     }
 
@@ -498,17 +826,23 @@ final class MilestoneTests: XCTestCase {
     }
 
     func testOriginalUserMessageReturnsNearestRealUserMessage() {
-        // 多轮会话：取触发本回答的最近一条真实用户输入（含附图文件名）
+        // 多轮会话：取触发本回答的最近一条真实用户输入（含附图文件名 / 引用文件）
         let entries = [
             entry(.user, "第一条", id: "u1"),
             entry(.assistant, "第一答"),
-            entry(.user, "第二条（带截图）", images: ["shot-1.png"], id: "u2"),
+            entry(
+                .user, "第二条（带截图与引用文件）",
+                images: ["shot-1.png"], files: ["02-structure/模块-页面映射表.md"],
+                id: "u2"
+            ),
             entry(.system, "📦 注记行"),
             entry(.assistant, "第二答（截断）", id: "a2"),
         ]
         let origin = MessageBubble.originalUserMessage(before: "a2", in: entries)
-        XCTAssertEqual(origin?.content, "第二条（带截图）")
+        XCTAssertEqual(origin?.content, "第二条（带截图与引用文件）")
         XCTAssertEqual(origin?.images, ["shot-1.png"])
+        // 重发须一并回填引用文件（否则重生成时 AI 读不到被引用的产物）
+        XCTAssertEqual(origin?.files, ["02-structure/模块-页面映射表.md"])
     }
 
     func testOriginalUserMessageEdgeCases() {
@@ -534,6 +868,87 @@ final class MilestoneTests: XCTestCase {
         XCTAssertEqual(
             MessageBubble.originalUserMessage(before: "a1", in: padded)?.content,
             "帮我做原型"
+        )
+    }
+
+    // MARK: - ⑦ 交付回执卡（方案 A「一次交付，一张回执」）
+
+    func testReceiptFooterWaitingState() {
+        // 📦 已落盘但机器初审未出结论 → 等待态脚注（原居中注脚文案统一收进脚注行）
+        let rows = [MilestoneRow(id: "next", icon: .clock, tint: .ink500, name: "机器初审中")]
+        let footer = MessageBubble.receiptFooter(for: rows)
+        XCTAssertEqual(footer?.text, "机器初审中——结论稍后并入本回执")
+        XCTAssertEqual(footer?.waiting, true)
+    }
+
+    func testReceiptFooterDockGuidanceStripsConfirmedPrefix() {
+        // ①②③ 有确认坞：尾注「确认后 …」剥前缀接入确认坞指路句——
+        // 推进动作只活在确认坞，回执只指路不替按，不出现双重「确认」措辞
+        let rows = [MilestoneRow(
+            id: "next", icon: .arrowRight, tint: .brandAccent, name: "原型待确认",
+            tail: "确认后 AI 随即撰写 ④ PRD", isNext: true
+        )]
+        let footer = MessageBubble.receiptFooter(for: rows)
+        XCTAssertEqual(
+            footer?.text,
+            "本轮产物就绪。预览满意后，在下方确认坞选择「确认并进入」，AI 随即撰写 ④ PRD。"
+        )
+        XCTAssertEqual(footer?.waiting, false)
+    }
+
+    func testReceiptFooterPRDSealFlowWithoutDockPhrase() {
+        // ④ PRD 封板流程（无确认坞）：尾注无「确认后」前缀 → 不硬套确认坞句式
+        let rows = [MilestoneRow(
+            id: "next", icon: .arrowRight, tint: .brandAccent, name: "产品需求文档待确认",
+            tail: "审阅后可在项目页封板版本", isNext: true
+        )]
+        let footer = MessageBubble.receiptFooter(for: rows)
+        XCTAssertEqual(footer?.text, "本轮产物就绪。审阅后可在项目页封板版本。")
+    }
+
+    func testReceiptFooterNilWithoutNextRow() {
+        // 仅雷达 / 决策的修订轮（无 stage 行）→ 无脚注
+        let rows = [MilestoneRow(
+            id: "decision@0", icon: .bookmark, tint: .ink500, name: "决策记录",
+            countText: "+1 条", tab: .decisions
+        )]
+        XCTAssertNil(MessageBubble.receiptFooter(for: rows))
+    }
+
+    func testFastForwardAutoNoteExtraction() {
+        // 括注句提取；无括注走通用兜底；无标记返回 nil
+        XCTAssertEqual(
+            MessageBubble.fastForwardAutoNote(
+                from: "📦 结构产物已生成——机器初审中……（快速通道：自动确认，继续生成 ③ 原型）"
+            ),
+            "快速通道 · 自动确认，继续生成 ③ 原型"
+        )
+        XCTAssertEqual(
+            MessageBubble.fastForwardAutoNote(from: "📦 结构产物已生成——快速通道"),
+            "快速通道 · 自动确认，产物已落盘，继续推进后续阶段"
+        )
+        XCTAssertNil(MessageBubble.fastForwardAutoNote(from: "📦 结构产物已生成——机器初审中……"))
+    }
+
+    func testAssemblyMarksFastForwardStageAutoNoteAndSkipsDockGuidance() {
+        // 快速通道 📦 行（自动确认，无机器门无确认坞）→ 下一节点直接进 isNext 态
+        // 且携带自动确认脚注；回执脚注走自动确认句，禁走「确认坞」指路
+        let notes = [
+            note(
+                "结构产物已生成——机器初审中……（快速通道：自动确认，继续生成 ③ 原型）",
+                stamps: [MilestoneStamp(
+                    kind: "stage", label: "结构产物",
+                    nextAction: "确认后 AI 随即生成 ③ 原型"
+                )]
+            )
+        ]
+        let assembly = MessageBubble.milestoneAssembly(from: notes)
+        XCTAssertEqual(assembly.rows.count, 1)
+        XCTAssertTrue(assembly.rows[0].isNext, "快速通道链无机器门，不落「机器初审中」等待态")
+        XCTAssertEqual(assembly.rows[0].autoNote, "快速通道 · 自动确认，继续生成 ③ 原型")
+        XCTAssertEqual(
+            MessageBubble.receiptFooter(for: assembly.rows)?.text,
+            "快速通道 · 自动确认，继续生成 ③ 原型"
         )
     }
 }

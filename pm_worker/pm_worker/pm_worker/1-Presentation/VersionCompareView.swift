@@ -210,7 +210,7 @@ private struct ArtifactPane: View {
     }
 
     private var textPane: some View {
-        ScrollView {
+        DSScroll {
             Text((try? String(contentsOf: url, encoding: .utf8)) ?? "（文件不存在或读取失败）")
                 .font(DS.Font.monoSM)
                 .foregroundStyle(Color.ink900)

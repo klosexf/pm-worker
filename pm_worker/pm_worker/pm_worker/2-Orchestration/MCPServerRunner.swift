@@ -179,8 +179,10 @@ nonisolated enum MCPServerRunner {
             ),
             Tool(
                 name: "generate_prototype",
-                description: "③ 原型：基于已确认结构（02-structure/confirmed.json）生成单文件"
-                    + "HTML 原型，落盘 03-prototypes/可点击原型.html。长任务，返回 task_id。",
+                description: "③ 原型：基于已确认结构（02-structure/confirmed.json）生成 HTML 原型，"
+                    + "落盘 03-prototypes/（单端产品落 可点击原型.html；多端产品按端分块，"
+                    + "如 prototype-mobile → 移动端原型.html；多方案对比按方案分块，"
+                    + "如 prototype-plan-a → 原型-方案A.html）。长任务，返回 task_id。",
                 inputSchema: .object([
                     "type": "object",
                     "properties": .object([
@@ -614,18 +616,22 @@ nonisolated struct MCPToolHandlers {
         let reply = try await llm(
             .prototype,
             AgentPrompts.prototype(modulePageMap: map, coreFlows: flows, injection: ""),
-            "请基于模块-页面映射表生成单文件 HTML 原型（P0 页面 3-5 个，页面跳转按核心流程图连通）。"
+            "请基于模块-页面映射表生成 HTML 原型（P0 页面 3-5 个，页面跳转按核心流程图连通；"
+                + "多端产品按端分块输出 artifact:prototype-<端名> 块）。"
         )
         let blocks = ArtifactParser.parseArtifactBlocks(in: reply)
-        guard try ArtifactParser.writePrototypeArtifact(
+        guard let prototype = try ArtifactParser.writePrototypeArtifact(
             blocks: blocks, project: project, version: version
-        ) != nil else {
-            throw MCPToolError.artifactIncomplete("模型回复未包含合法的 artifact:prototype HTML 块")
+        ) else {
+            throw MCPToolError.artifactIncomplete(
+                "模型回复未包含合法的 artifact:prototype（或 prototype-mobile / prototype-desktop 等"
+                    + "分端块）HTML 块"
+            )
         }
         await upsertPipelineRun(
             project: project, version: version, stage: "prototype", status: "done"
         )
-        return [ArtifactPath.prototype]
+        return prototype.slots.map(\.relPath)
     }
 
     /// ④ PRD 执行：照 AppModel PRD 阶段（三档模板默认 standard）——
@@ -651,6 +657,12 @@ nonisolated struct MCPToolHandlers {
         let map = Self.readArtifact(
             project: project, version: version, rel: ArtifactPath.modulePageMap
         ) ?? "（缺失）"
+        let architecture = Self.readArtifact(
+            project: project, version: version, rel: ArtifactPath.architecture
+        ) ?? ""
+        let coreFlows = Self.readArtifact(
+            project: project, version: version, rel: ArtifactPath.coreFlows
+        ) ?? ""
         let analysis = Self.readArtifact(
             project: project, version: version, rel: ArtifactPath.competitiveAnalysis
         ) ?? ""
@@ -661,6 +673,8 @@ nonisolated struct MCPToolHandlers {
                 tier: "standard",
                 clarification: clarification,
                 modulePageMap: map,
+                architecture: architecture,
+                coreFlows: coreFlows,
                 prototypePages: rows.pages,
                 analysisNotes: analysis,
                 injection: ""

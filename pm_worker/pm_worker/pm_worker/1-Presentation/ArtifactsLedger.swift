@@ -4,7 +4,9 @@
 //
 //  产物面板改版（方案 A · 分区台账）：
 //  - 产物区：扫 01~07 编号目录内的实质产物（.md/.html/.mmd），按扩展名 + 目录
-//    映射四类（文档/原型/图表/报告），行式台账 + 类型筛选 chips；
+//    映射四类（文档/原型/图表/报告），行式台账 + 类型筛选 chips（左键点击
+//    选中并打开预览 sheet，右键上下文菜单：预览 / 添加到对话——引用插入
+//    输入坞草稿）；
 //  - 工作空间文件区：版本目录全量内容的档案树（含编号产物目录与产物文件，
 //    与 Finder 口径一致），面包屑标注磁盘目录；
 //  - 产物台账是白名单摘要视图，工作空间文件是全量磁盘投影，两者并存。
@@ -242,9 +244,14 @@ nonisolated enum ArtifactCatalog {
 struct ArtifactsLedgerView: View {
 
     let entries: [ArtifactEntry]
-    /// 预览（md/html/mmd 走 sheet）；无法预览的走系统打开。
+    /// 选中行 id（url.path；左键点选与右键联动，选中态由父级持有跨滚动保持）。
+    var selectedID: String?
+    /// 左键点选回调。
+    var onSelect: (ArtifactEntry) -> Void
+    /// 点击整行预览（md/html/mmd 走 sheet）；无法预览的走系统打开。
     let onOpen: (ArtifactEntry) -> Void
-    let onReveal: (ArtifactEntry) -> Void
+    /// 右键菜单「添加到对话」回调。
+    var onAddToConversation: (ArtifactEntry) -> Void
 
     @State private var filter: ArtifactKind?
 
@@ -323,7 +330,13 @@ struct ArtifactsLedgerView: View {
                 DSDivider()
             } else {
                 ForEach(filtered) { entry in
-                    LedgerRow(entry: entry, onOpen: onOpen, onReveal: onReveal)
+                    LedgerRow(
+                        entry: entry,
+                        isSelected: entry.id == selectedID,
+                        onSelect: { onSelect(entry) },
+                        onPreview: { onOpen(entry) },
+                        onAddToConversation: { onAddToConversation(entry) }
+                    )
                     DSDivider()
                 }
             }
@@ -331,14 +344,23 @@ struct ArtifactsLedgerView: View {
     }
 }
 
-/// 台账行：类型色块徽标 + 标题/副行，hover 浮现「预览 / 定位」。
+/// 台账行：类型色块徽标 + 标题/副行。左键点击选中（选中态跨滚动保持）并打开
+/// 预览 sheet（与工作空间文件树「点开即预览」惯例一致），右键在点击点弹出
+/// 上下文菜单（预览 / 添加到对话）。行交互下沉 AppKit
+/// （LedgerRowInteraction）：SwiftUI 手势在 macOS 无法区分左右键，视觉仍由
+/// SwiftUI 绘制——DividerHandle 同款分工。
 private struct LedgerRow: View {
 
     let entry: ArtifactEntry
-    let onOpen: (ArtifactEntry) -> Void
-    let onReveal: (ArtifactEntry) -> Void
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onPreview: () -> Void
+    let onAddToConversation: () -> Void
 
     @State private var hovered = false
+    @State private var menuPresented = false
+    /// 右键点击点（行内 SwiftUI 坐标，y 向下）：菜单 popover 的 1pt 锚点。
+    @State private var menuAnchor: CGPoint = .zero
 
     var body: some View {
         HStack(spacing: DS.Spacing.s12) {
@@ -363,36 +385,134 @@ private struct LedgerRow: View {
             }
 
             Spacer(minLength: 0)
-
-            // hover 操作（触屏/键盘焦点时常显由 .focusable 兜底，桌面以 hover 为主）
-            HStack(spacing: DS.Spacing.s6) {
-                if hovered {
-                    Button("预览") { onOpen(entry) }
-                        .font(DS.Font.bodyXSStrong)
-                        .foregroundStyle(Color.brandAccent)
-                        .padding(.horizontal, DS.Spacing.s10)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule().strokeBorder(Color.borderL2)
-                        )
-                    Button("定位") { onReveal(entry) }
-                        .font(DS.Font.bodyXSStrong)
-                        .foregroundStyle(Color.ink700)
-                        .padding(.horizontal, DS.Spacing.s10)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule().strokeBorder(Color.borderL2)
-                        )
-                }
-            }
-            .animation(DS.Motion.springFast, value: hovered)
         }
         .padding(.horizontal, DS.Spacing.s16)
         .padding(.vertical, DS.Spacing.s10)
-        .background(hovered ? Color.brand100.opacity(0.75) : Color.clear)
-        .contentShape(Rectangle())
-        .onHover { hovered in
-            withAnimation(DS.Motion.springFast) { self.hovered = hovered }
+        .background(
+            // 选中 brand100 实色（比 hover 水洗强一档）；hover 保持品牌色弱水洗
+            RoundedRectangle(cornerRadius: DS.Radius.sm)
+                .fill(
+                    isSelected
+                        ? Color.brand100
+                        : (hovered ? Color.brand100.opacity(0.75) : Color.clear)
+                )
+        )
+        // 选中左缘 2pt 品牌条（RiskLedgerTab 状态条同形制）
+        .overlay(alignment: .leading) {
+            if isSelected {
+                Capsule()
+                    .fill(Color.brandAccent)
+                    .frame(width: 2, height: 16)
+                    .padding(.leading, 6)
+            }
+        }
+        .overlay {
+            LedgerRowInteraction(
+                onSelect: {
+                    onSelect()
+                    onPreview()
+                },
+                onContext: { point in
+                    // 右键联动选中（macOS 列表惯例），先落锚点再下一拍呈现——
+                    // 确保 popover 锚定到本次点击点而非上一帧位置
+                    onSelect()
+                    menuAnchor = point
+                    DispatchQueue.main.async { menuPresented = true }
+                },
+                onHover: { inside in
+                    withAnimation(DS.Motion.springFast) { hovered = inside }
+                }
+            )
+        }
+        // 菜单锚点：行内 1pt 透明视图钉在右键点击点上（菜单跟随鼠标位置）。
+        // popover 挂在 1×1 视图上、position 只负责移动——顺序反了锚点会退化
+        // 成整行 frame；popover 独立窗口呈现，点外自动收起、空间不足自动翻转。
+        .background {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .popover(isPresented: $menuPresented, arrowEdge: .trailing) {
+                    contextMenu
+                }
+                .position(menuAnchor)
+        }
+        .animation(DS.Motion.springFast, value: isSelected)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text(entry.name))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(Text("左键打开预览，右键打开添加到对话菜单"))
+    }
+
+    /// 右键上下文菜单（DSMenu 毛玻璃卡 + DSMenuItem hover 升阶；presentation
+    /// Background 去系统底露出玻璃卡——NewTaskView 下拉同款机制）。
+    private var contextMenu: some View {
+        DSMenu(minWidth: 172) {
+            DSMenuItem(title: "预览", icon: .glasses, titleFont: DS.Font.bodySM) {
+                menuPresented = false
+                onPreview()
+            }
+            DSMenuItem(title: "添加到对话", icon: .chat, titleFont: DS.Font.bodySM) {
+                menuPresented = false
+                onAddToConversation()
+            }
+        }
+        .presentationBackground(.clear)
+    }
+}
+
+/// 台账行事件捕获层（AppKit）：透明 NSView 盖满整行，mouseDown（左键）回传
+/// 选中、rightMouseDown 在点击点回传锚点（AppKit y 向上已翻转为 SwiftUI y
+/// 向下，overlay 与行同框 1:1 映射）、hover 由 tracking area 回传。视图自身
+/// 零绘制，scrollWheel 不拦截（沿响应链上抛给 ScrollView 正常滚动）。
+private struct LedgerRowInteraction: NSViewRepresentable {
+    var onSelect: () -> Void
+    var onContext: (CGPoint) -> Void
+    var onHover: (Bool) -> Void
+
+    func makeNSView(context: Context) -> InteractionView {
+        let view = InteractionView()
+        view.onSelect = onSelect
+        view.onContext = onContext
+        view.onHover = onHover
+        return view
+    }
+
+    func updateNSView(_ nsView: InteractionView, context: Context) {
+        nsView.onSelect = onSelect
+        nsView.onContext = onContext
+        nsView.onHover = onHover
+    }
+
+    final class InteractionView: NSView {
+        var onSelect: (() -> Void)?
+        var onContext: ((CGPoint) -> Void)?
+        var onHover: ((Bool) -> Void)?
+
+        private var trackingArea: NSTrackingArea?
+
+        /// 全尺寸内容区下透明视图默认让按下事件给窗口拖动，须显式拒绝。
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                owner: self
+            )
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) { onHover?(true) }
+        override func mouseExited(with event: NSEvent) { onHover?(false) }
+
+        override func mouseDown(with event: NSEvent) { onSelect?() }
+
+        override func rightMouseDown(with event: NSEvent) {
+            let p = convert(event.locationInWindow, from: nil)
+            onContext?(CGPoint(x: p.x, y: bounds.height - p.y))
         }
     }
 }

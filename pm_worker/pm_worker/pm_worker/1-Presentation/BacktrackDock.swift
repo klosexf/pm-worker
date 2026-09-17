@@ -3,7 +3,7 @@
 //  pm_worker
 //
 //  回退坞（④ PRD 阶段的快捷回退入口，与 ConfirmDock 同构的询问卡）：
-//  收起态 = 虚线细条（不占空间的可选动作入口）；点击展开 = 选项卡片单选
+//  收起态 = 虚线图标小胶囊（不占空间的可选动作入口，无文案）；点击展开 = 选项卡片单选
 //  （重做原型 / 重做结构，回退后果写在副标题里，不再藏 tooltip），
 //  页脚动作钮执行 AppModel.requestBacktrack（回退 + 自动重生成，redo 语义）。
 //  视觉规格与 ConfirmDock 逐一对齐（折叠胶囊 / 白底浮卡 / 勾选框 / 数字徽章）。
@@ -68,25 +68,23 @@ struct BacktrackDock: View {
         Button {
             withAnimation(DS.Motion.springFast) { collapsed = false }
         } label: {
-            HStack(spacing: DS.Spacing.s6) {
-                DSIcon(.refresh, size: 13)
-                Text("上游产物有问题？重做原型 / 重做结构")
-                    .font(DS.Font.bodySM)
-            }
-            .foregroundStyle(Color.ink500)
-            .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s4)
-            .background(
-                Capsule().fill(Color.surfaceSecondary)
-            )
-            .overlay(
-                Capsule().strokeBorder(
-                    Color.borderL2,
-                    style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+            DSIcon(.refresh, size: 13)
+                .foregroundStyle(Color.ink500)
+                .padding(.horizontal, DS.Spacing.s10)
+                .padding(.vertical, DS.Spacing.s6)
+                .background(
+                    Capsule().fill(Color.surfaceSecondary)
                 )
-            )
+                .overlay(
+                    Capsule().strokeBorder(
+                        Color.borderL2,
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+                    )
+                )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("重做上游产物")
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -97,11 +95,11 @@ struct BacktrackDock: View {
             headerRow
             DSDivider()
 
-            optionsArea
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, DS.Spacing.s12)
-                .padding(.vertical, DS.Spacing.s12)
-                .background(Color.surfaceSecondary)
+            // 内容区（同 ConfirmDock）：窗口变矮时降级为坞内滚动，不挤占消息流
+            ViewThatFits(in: .vertical) {
+                optionsPanel
+                DSScroll { optionsPanel }
+            }
 
             footerRow
                 .padding(.horizontal, DS.Spacing.s12)
@@ -146,6 +144,15 @@ struct BacktrackDock: View {
                 }
             }
         }
+    }
+
+    /// 选项区面板（浅灰底衬托）：ViewThatFits 自然 / 滚动两分支复用同一内容
+    private var optionsPanel: some View {
+        optionsArea
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, DS.Spacing.s12)
+            .padding(.vertical, DS.Spacing.s12)
+            .background(Color.surfaceSecondary)
     }
 
     // MARK: 选项卡片（白底 + 勾选框 + 说明 + 数字徽章；选中态品牌紫，与确认坞同款）

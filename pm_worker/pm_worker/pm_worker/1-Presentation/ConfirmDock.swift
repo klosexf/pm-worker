@@ -2,13 +2,16 @@
 //  ConfirmDock.swift
 //  pm_worker
 //
-//  确认坞（Task 2.2，design.md §6.1 阶段推进确认通用机制）：
-//  输入框上方停靠的问答卡（2026-09 布局改版：选项卡片 + 右下角动作钮）——
-//  单页直接确认（2026-09-12 简化，design.md v0.9.12：取消两段式提交的第二页摘要，
+//  确认段内容件（Task 2.2，design.md §6.1 阶段推进确认通用机制）：
+//  无卡片外壳，由 StageDockCard 统一停靠卡承载（2026-09-15 改版：作答段 → 确认段
+//  同卡分步切换，替代确认坞 / 作答坞两卡同叠；卡壳 / 720 停靠列 / 描边 / 浮起影统一）。
+//  结构（2026-09 布局改版：选项卡片 + 右下角动作钮）——
+//  单页直接确认（design.md v0.9.12：取消两段式提交的第二页摘要，
 //  「确认后会发生什么」由选项卡副标题用人话承载，选中后页脚按钮直接提交生效）——
 //  ① 选择处理方式（确认并进入 / 继续修改），单选卡片 + 数字徽章
-//  ② 弹出纪律（2026-09-14，每阶段弹一次）：产物落盘弹坞一次；「稍后再说 / 继续修改」
-//     写入 AppModel.deferConfirmGate → 本阶段永久静默不再弹（修订落盘也不弹），
+//  ② 弹出纪律（2026-09-15 改版，每版本每阶段弹一次）：产物落盘弹坞一次；「稍后再说 / 继续修改」
+//     写入 AppModel.deferConfirmGate → 版本级持久静默（confirm-silence.json，
+//     跨启动 / 跨会话，重启不重复弹、💬 留痕不重复落），修订落盘也不弹，
 //     推进由用户发起（自由作答「进入下一阶段」/ 摘要条兜底行）；
 //     静默中的修订轮由 gateInviteSuffix 在 AI 回复末尾融一句推进邀请。
 //  提交后对话流落确认记录胶囊（AppModel 写入）。
@@ -16,7 +19,9 @@
 
 import SwiftUI
 
-struct ConfirmDock: View {
+/// 确认段内容件：头部（图标 + 标题）+ 选项区（浅灰底）+ 页脚动作钮。
+/// 卡壳（surfaceBase 底 / brand200 描边 / floating 影 / xxl 圆角 / 滑入）由 StageDockCard 统一承载。
+struct ConfirmDockContent: View {
     @ObservedObject private var model: AppModel
     @ObservedObject private var store: SessionStore
 
@@ -28,7 +33,7 @@ struct ConfirmDock: View {
     @State private var hoveredOption: Option?
 
     /// 处理方式选项（单选；rawValue = 数字徽章编号）。「稍后再说」走页脚次按钮，不占选项位。
-    enum Option: Int, CaseIterable {
+    private enum Option: Int, CaseIterable {
         case proceed = 1       // 确认并进入
         case editLater = 2     // 继续修改
     }
@@ -40,17 +45,6 @@ struct ConfirmDock: View {
     }
 
     var body: some View {
-        dock
-            // 与输入区同宽的 720 居中列（原型 DockCard 停靠于输入框正上方）
-            .frame(maxWidth: 720 + DS.Spacing.s64)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, DS.Spacing.s32)
-            .padding(.bottom, DS.Spacing.s8)
-    }
-
-    // MARK: - 停靠卡（白底浮起 · 淡紫描边 · 大软阴影）
-
-    private var dock: some View {
         VStack(spacing: 0) {
             headerRow
             DSDivider()
@@ -66,27 +60,16 @@ struct ConfirmDock: View {
                 .padding(.horizontal, DS.Spacing.s12)
                 .padding(.vertical, DS.Spacing.s10)
         }
-        .background(
-            Color.surfaceBase,
-            in: RoundedRectangle(cornerRadius: DS.Radius.xxl)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.xxl)
-                .strokeBorder(Color.brand200, lineWidth: 1)
-        )
-        .dsShadow(.floating)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.xxl))
-        .dsSlideIn()
     }
 
-    // MARK: - 头部：图标 + 标题
+    // MARK: - 头部：图标 + 标题（与作答段头部同规格：图标 16 · brandAccent · headingSM）
 
     private var headerRow: some View {
-        HStack(spacing: DS.Spacing.s6) {
-            DSIcon(.circleCheck, size: 14)
+        HStack(spacing: DS.Spacing.s8) {
+            DSIcon(.circleCheck, size: 16)
                 .foregroundStyle(Color.brandAccent)
             Text(target.title)
-                .font(DS.Font.headingXS)
+                .font(DS.Font.headingSM)
                 .foregroundStyle(Color.ink900)
             Spacer(minLength: DS.Spacing.s12)
         }
@@ -218,8 +201,8 @@ struct ConfirmDock: View {
         HStack(spacing: DS.Spacing.s8) {
             Spacer()
             Button {
-                // 稍后再说：本阶段永久静默（每阶段弹一次），坞随挂载条件消失；
-                // 推进改由自由作答 / 摘要条兜底行发起
+                // 稍后再说：本版本内永久静默（每版本每阶段弹一次，持久化跨启动），
+                // 坞随挂载条件消失；推进改由自由作答 / 摘要条兜底行发起
                 model.deferConfirmGate(target)
             } label: {
                 Text("稍后再说")

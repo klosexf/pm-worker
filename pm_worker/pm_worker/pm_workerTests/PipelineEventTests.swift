@@ -159,6 +159,7 @@ final class PipelineEventTests: XCTestCase {
 
         let prdPrompt = AgentPrompts.prd(
             tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
             prototypePages: ["首页"], analysisNotes: "", injection: "- 记忆"
         )
         XCTAssertGreaterThan(
@@ -181,6 +182,7 @@ final class PipelineEventTests: XCTestCase {
 
         let prdPrompt = AgentPrompts.prd(
             tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
             prototypePages: ["首页"], analysisNotes: "", injection: ""
         )
         XCTAssertTrue(prdPrompt.contains("歧义处理"))

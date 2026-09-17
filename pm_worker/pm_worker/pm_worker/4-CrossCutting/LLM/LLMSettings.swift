@@ -422,9 +422,4 @@ nonisolated struct LLMSettings: Codable, Equatable {
         }
     }
 
-    /// 某阶段的 API Key（Keychain 按 provider 一把）。
-    nonisolated func apiKey(for stage: LLMStage) -> String? {
-        guard let config = stages[stage] else { return nil }
-        return KeychainStore.get(config.apiKeyKeychainKey)
-    }
 }

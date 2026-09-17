@@ -106,7 +106,7 @@ struct MemorySettingsTab: View {
     // MARK: - 入口页（全局记忆 + 各项目记忆，完全分离）
 
     private var entryPage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s16) {
                 VStack(alignment: .leading, spacing: DS.Spacing.s4) {
                     Text("记忆")
@@ -275,7 +275,7 @@ struct MemorySettingsTab: View {
                     .padding(.top, DS.Spacing.s8)
             }
 
-            ScrollView {
+            DSScroll {
                 VStack(alignment: .leading, spacing: 0) {
                     if effective.isEmpty {
                         VStack(spacing: DS.Spacing.s8) {
@@ -655,7 +655,7 @@ private struct MemoryEntryEditor: View {
                             .foregroundStyle(Color.brandAccent)
                     }
                     if previewing {
-                        ScrollView {
+                        DSScroll {
                             MemoryContentView(content: content)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }

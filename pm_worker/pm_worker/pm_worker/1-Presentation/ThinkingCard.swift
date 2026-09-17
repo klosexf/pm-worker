@@ -5,7 +5,8 @@
 //  思考过程两态展示（Task 2.7，design.md §6.4.1；2026-09-12 起纯文字化——
 //  去掉胶囊底/步骤区底框，对齐 Trae 对话「思考过程 ›」样式）：
 //  - 思考中：品牌色 pulse 圆点 + 「正在思考…」think-sweep 流光扫字（2.4s 循环，
-//    原型 .think-live/.run-dot，长静默期防假死感；减弱动态时降级纯文本）
+//    原型 .think-live/.run-dot，长静默期防假死感；减弱动态时降级纯文本）；
+//    reasoning 原文开始流入后头行可点击展开，实时尾随模型思考内容（bottom 锚定）
 //  - 已完成：默认折叠摘要行「思考了 Ns · M 步 · <技能名|技能 ×K> ›」，点击展开步骤
 //    （技能 ≤2 个摘要直接点名，≥3 显示计数；技能行带 ✦ 与推理行区分）
 //
@@ -15,9 +16,15 @@ import SwiftUI
 struct ThinkingCard: View {
     /// nil → 思考中态；有值 → 完成态。
     let data: ThinkData?
+    /// 思考中态的模型 reasoning 原文（流式增量累积，SessionStore 节流发布）；
+    /// 非空时头行可展开，实时看到模型在想什么。完成态忽略此参数。
+    var reasoning: String = ""
     /// 思考中态展示的引用技能 id（本轮 Context Builder 注入的技能；
     /// 完成态由 data.steps 的技能步骤承载，此参数忽略）。
     var skills: [String] = []
+    /// 思考中态的阶段文案（如「正在抽取澄清要点表…」）；nil = 通用「正在思考…」。
+    /// 确认链多跳 LLM 往返期间逐步更新，让慢等待显性化为可见进度。
+    var phase: String? = nil
 
     @State private var expanded = false
 
@@ -33,9 +40,20 @@ struct ThinkingCard: View {
 
     private var streamingCard: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s4) {
-            HStack(spacing: DS.Spacing.s8) {
-                DSPulseDot()
-                ThinkSweepText("正在思考…")
+            // reasoning 已开始流入 → 头行可点击展开实时思考内容（chevron 与完成态同款）
+            if reasoning.isEmpty {
+                streamingHeader
+            } else {
+                Button {
+                    withAnimation(DS.Motion.springFast) { expanded.toggle() }
+                } label: {
+                    streamingHeader
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            if expanded && !reasoning.isEmpty {
+                liveReasoning
             }
             if !skills.isEmpty {
                 // 引用技能行：技能在组装期已确定注入，思考中即时可见（与完成态技能行同款图标）
@@ -49,6 +67,36 @@ struct ThinkingCard: View {
                 }
             }
         }
+    }
+
+    /// 头行：pulse 圆点 + 流光扫字（reasoning 非空时带尾部 chevron，折叠右指 / 展开转下）
+    private var streamingHeader: some View {
+        HStack(spacing: DS.Spacing.s4) {
+            HStack(spacing: DS.Spacing.s8) {
+                DSPulseDot()
+                ThinkSweepText(phase ?? "正在思考…")
+            }
+            if !reasoning.isEmpty {
+                DSIcon(.down, size: 11)
+                    .foregroundStyle(Color.ink300)
+                    .rotationEffect(.degrees(expanded ? 0 : -90))
+            }
+        }
+    }
+
+    /// 展开态：reasoning 原文实时流出。限高滚动 + bottom 锚定贴底跟随新 delta，
+    /// 用户上滚阅读时不被拽回；限高避免长思考把对话流顶走。
+    private var liveReasoning: some View {
+        DSScroll {
+            Text(reasoning)
+                .dsCaptionType(size: 13)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .defaultScrollAnchor(.bottom)
+        .frame(maxHeight: 280)
+        .padding(.top, DS.Spacing.s4)
+        .transition(.opacity)
     }
 
     // MARK: - 已完成（默认折叠一行摘要，纯文字 + 尾部箭头，参考图「思考过程 ›」式）

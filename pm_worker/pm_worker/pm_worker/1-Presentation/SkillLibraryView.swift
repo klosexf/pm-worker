@@ -66,7 +66,7 @@ struct SkillLibraryView: View {
     // MARK: - 页面（hero 头部 + 行卡片列表，内容区 max 920 居中）
 
     private var scrollPane: some View {
-        ScrollView {
+        DSScroll {
             VStack(spacing: DS.Spacing.s16) {
                 hero
                 searchField
@@ -358,7 +358,7 @@ private struct SkillDetailSheet: View {
             onClose: onClose,
             width: 560
         ) {
-            ScrollView {
+            DSScroll {
                 VStack(alignment: .leading, spacing: DS.Spacing.s16) {
                     // 元信息：type 徽章 + 命中计数
                     HStack(spacing: DS.Spacing.s10) {

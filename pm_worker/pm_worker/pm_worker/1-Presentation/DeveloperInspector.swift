@@ -17,7 +17,7 @@ struct DeveloperInspector: View {
     @ObservedObject private var searchLog = SearchTraceLog.shared
 
     var body: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s20) {
                 tokenSection
                 retrievalSection
@@ -240,6 +240,11 @@ struct DeveloperInspector: View {
 
     private var skillBodySection: some View {
         section("注入技能正文（渐进式披露）") {
+            if let report = model.lastAssembly?.skillJudgeReport {
+                Text(Self.judgeLine(report))
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink500)
+            }
             if let bodies = model.lastAssembly?.injectedSkillBodies, !bodies.isEmpty {
                 ForEach(bodies, id: \.self) { body in
                     Text(body)
@@ -284,6 +289,13 @@ struct DeveloperInspector: View {
         }
         .font(DS.Font.bodyXS)
         .foregroundStyle(Color.ink500)
+    }
+
+    /// 判定通道一行摘要（混合路由：本地零命中才调用）。
+    private static func judgeLine(_ report: SkillJudgeReport) -> String {
+        if !report.available { return "判定通道：不可用（网络 / 解析失败）" }
+        if report.picked.isEmpty { return "判定通道：判为「本轮不需要技能」（不注入）" }
+        return "判定通道：命中 " + report.picked.joined(separator: "、")
     }
 
     private static func usagePercent(_ breakdown: TokenBreakdown) -> Int {

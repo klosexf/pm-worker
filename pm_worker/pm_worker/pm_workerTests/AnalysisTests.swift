@@ -267,6 +267,23 @@ final class AnalysisTests: XCTestCase {
         XCTAssertFalse(AnalysisRunner.isAnalysisIntent(""))
     }
 
+    // MARK: 分支执行前确认（意图误触发防护）
+
+    func testConfirmBeforeRunDefaultsOnAndRoundTrips() {
+        // 清场 + 收尾兜底：不污染同套件其他用例的 UserDefaults 状态
+        UserDefaults.standard.removeObject(forKey: AnalysisRunner.confirmBeforeRunKey)
+        defer { UserDefaults.standard.removeObject(forKey: AnalysisRunner.confirmBeforeRunKey) }
+
+        // 默认开（键缺省 = 先确认，防误触发优先）
+        XCTAssertTrue(AnalysisRunner.confirmBeforeRunEnabled)
+
+        // 写读回环：关 → 直接执行口径；再开 → 确认口径
+        AnalysisRunner.setConfirmBeforeRun(false)
+        XCTAssertFalse(AnalysisRunner.confirmBeforeRunEnabled)
+        AnalysisRunner.setConfirmBeforeRun(true)
+        XCTAssertTrue(AnalysisRunner.confirmBeforeRunEnabled)
+    }
+
     // MARK: prompt 协议（五要素 + artifact:analysis）
 
     func testPromptContainsProtocol() {

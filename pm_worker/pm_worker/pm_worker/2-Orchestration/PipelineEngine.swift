@@ -172,11 +172,11 @@ final class PipelineEngine: ObservableObject {
 
     /// 事件流旁路（append-only events.jsonl，审计 / 崩溃恢复底座）；失败静默不阻塞。
     private func log(
-        _ kind: PipelineEvent.Kind, detail: String, reason: String? = nil
+        _ kind: PipelineEvent.Kind, detail: String, reason: String? = nil, outcome: String? = nil
     ) {
         PipelineEventLog.append(
             kind: kind, stage: stage.rawValue, detail: detail, reason: reason,
-            project: project, version: version
+            outcome: outcome, project: project, version: version
         )
     }
 
@@ -191,7 +191,9 @@ final class PipelineEngine: ObservableObject {
     var clarifyExhausted: Bool { clarifyRounds >= Self.clarifyRoundLimit }
 
     /// 澄清要点表落盘后的阶段推进（①→②）；增补澄清收束时清增补标记。
-    func advanceFromClarify() {
+    /// outcome：闸口确认结算（approved / approved_after_revision / fast_track），
+    /// 由 AppModel 按确认形态判定（增补收束 / 快速通道指令）。
+    func advanceFromClarify(outcome: String = "approved") {
         let dir = PMAgentStore.versionURL(project: project, version: version)
         let wasAmending = FileManager.default.fileExists(
             atPath: dir.appendingPathComponent(ArtifactPath.clarifyAmend).path
@@ -201,25 +203,25 @@ final class PipelineEngine: ObservableObject {
         persist()
         log(.stageAdvance, detail: wasAmending
             ? "① 增补澄清收束 → ② 结构（要点表已按新功能诉求更新）"
-            : "① 澄清 → ② 结构（澄清要点表已确认）")
+            : "① 澄清 → ② 结构（澄清要点表已确认）", outcome: outcome)
     }
 
     /// ② 确认闸口：写 confirmed.json（闸口事实源）。
-    func confirmStructure() throws {
+    func confirmStructure(outcome: String = "approved") throws {
         try writeConfirmRecord(stage: "structure", rel: "02-structure/confirmed.json")
         structureConfirmed = true
         stage = .prototype
         persist()
-        log(.stageConfirm, detail: "② 结构产物确认，进入 ③ 原型")
+        log(.stageConfirm, detail: "② 结构产物确认，进入 ③ 原型", outcome: outcome)
     }
 
     /// ③ 确认闸口。
-    func confirmPrototype() throws {
+    func confirmPrototype(outcome: String = "approved") throws {
         try writeConfirmRecord(stage: "prototype", rel: "03-prototypes/confirmed.json")
         prototypeConfirmed = true
         stage = .prd
         persist()
-        log(.stageConfirm, detail: "③ 原型确认，进入 ④ PRD")
+        log(.stageConfirm, detail: "③ 原型确认，进入 ④ PRD", outcome: outcome)
     }
 
     private func writeConfirmRecord(stage name: String, rel: String) throws {

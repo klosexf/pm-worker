@@ -85,9 +85,11 @@ final class RiskStore: ObservableObject {
 
     /// 采纳方案：open → mitigating（挂起等验证，≠ 解除）。
     /// 同步回写一条决策日志（待验证态——方案落地验证通过后由 resolve 补一条解除决策）。
+    /// - Parameter evidence: 实施证据指针（采纳落实闭环：AI 生成实施交付物的对话留痕，
+    ///   形如「对话留痕 · 会话 s_xx · 回合 m_xx」；普通采纳传 nil）。
     /// - Returns: 回写的决策记录（含 id，供台账行展示「→ 决策日志 d_xx」）。
     @discardableResult
-    func adopt(id: String) throws -> DecisionRecord {
+    func adopt(id: String, evidence: String? = nil) throws -> DecisionRecord {
         guard let index = risks.firstIndex(where: { $0.id == id }) else {
             throw RiskStore.notFound(id)
         }
@@ -96,8 +98,10 @@ final class RiskStore: ObservableObject {
         }
         var record = risks[index]
         record.status = .mitigating
-        let decision = Self.mitigationDecision(for: record)
-        record.resolution = "决策日志 \(decision.id)"
+        let decision = Self.mitigationDecision(for: record, evidence: evidence)
+        record.resolution = evidence == nil
+            ? "决策日志 \(decision.id)"
+            : "决策日志 \(decision.id) · 实施证据已留对话"
         record.closedAt = nil
         try PMAgentStore.appendLine(record, to: risksURL)
         try PMAgentStore.appendLine(DecisionLogEntry.decision(decision), to: decisionsURL)
@@ -176,7 +180,9 @@ final class RiskStore: ObservableObject {
                     RiskHitRecord(
                         riskId: fired.id,
                         predicted: fired.hypothesis,
-                        actual: note ?? Self.describe(trigger)
+                        actual: note ?? Self.describe(trigger),
+                        // 结算时刻：决策档案按天归组用（历史行无此字段，回退文件序归日）
+                        createdAt: now
                     )
                 ),
                 to: decisionsURL
@@ -206,15 +212,20 @@ final class RiskStore: ObservableObject {
     // MARK: - Private
 
     /// 采纳决策（决策日志五要素；toBeVerified=true，解除时补闭环决策）。
-    private static func mitigationDecision(for record: RiskRecord) -> DecisionRecord {
+    /// evidence 非空 = 采纳落实闭环：决策带实施证据指针（生成回合的对话留痕）。
+    private static func mitigationDecision(
+        for record: RiskRecord, evidence: String? = nil
+    ) -> DecisionRecord {
         var why = "风险：\(record.hypothesis)"
-        if let impact = record.impact, !impact.isEmpty { why += "（炸了会怎样：\(impact)）" }
+        if let impact = record.impact, !impact.isEmpty { why += "（后果：\(impact)）" }
         return DecisionRecord(
             version: record.version,
             decision: "【风险应对】\(record.plan ?? "挂上应对方案，等验证")",
             why: why,
+            rejectedAlternatives: [],
             confidence: 1.0,
-            toBeVerified: true
+            toBeVerified: true,
+            evidence: evidence
         )
     }
 

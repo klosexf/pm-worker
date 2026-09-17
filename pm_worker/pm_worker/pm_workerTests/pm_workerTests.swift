@@ -229,6 +229,47 @@ final class StorageTests: XCTestCase {
         XCTAssertEqual(report2, report)
     }
 
+    /// 2026-09-15 根因防回归：真实向量重建必须写「非空 embedding」——
+    /// 旧生产入口全走同步零向量重建，技能语义检索恒零命中（路由退化为阶段锚点
+    /// 每轮兜底，用户实测「离题提问也被注入高保真原型设计」）。
+    func testAsyncRebuildWritesRealSkillVectors() async throws {
+        try PMAgentStore.bootstrap(seedSkills: false)
+        let skill = """
+        ---
+        name: 竞品分析
+        type: interactive
+        when_to_use: 需要摸清竞品格局时
+        best_for: ["产品定位"]
+        tags: ["竞品"]
+        pitfalls: ["只看功能清单不看数据"]
+        ---
+        # 竞品分析技能正文
+        """
+        try skill.write(
+            to: PMAgentStore.skillsDir.appendingPathComponent("竞品分析.md"),
+            atomically: true, encoding: .utf8
+        )
+
+        let db = try AppDatabase(indexURL: tempRoot.appendingPathComponent("index.sqlite"))
+        let report = try await IndexRebuilder.rebuild(
+            database: db, embeddingProvider: DeterministicHashEmbedder()
+        )
+        XCTAssertEqual(report.skills, 1)
+
+        let blob = try await db.dbQueue.read { database -> Data? in
+            try Data.fetchOne(
+                database, sql: "SELECT embedding FROM skills WHERE id = ?",
+                arguments: ["竞品分析"]
+            )
+        }
+        let embedding = try XCTUnwrap(blob)
+        // 非空 + 维度对齐（检索层按此编码解出向量参与余弦）
+        XCTAssertEqual(
+            embedding.count,
+            DeterministicHashEmbedder.dimensions * MemoryLayout<Float>.size
+        )
+    }
+
     // MARK: - 模型编解码往返
 
     func testSkillFrontMatterBlockList() throws {
@@ -543,10 +584,15 @@ final class PipelineM2Tests: XCTestCase {
             ),
             ArtifactParser.ArtifactBlock(name: "architecture", content: "非 HTML"),
         ]
-        let written = try ArtifactParser.writePrototypeArtifact(
-            blocks: blocks, project: "M2项目", version: "v1.0"
+        let written = try XCTUnwrap(
+            ArtifactParser.writePrototypeArtifact(
+                blocks: blocks, project: "M2项目", version: "v1.0"
+            )
         )
-        let saved = try XCTUnwrap(written).url
+        XCTAssertEqual(written.slots.count, 1)
+        XCTAssertEqual(written.slots.first?.relPath, ArtifactPath.prototype)
+        let saved = PMAgentStore.versionURL(project: "M2项目", version: "v1.0")
+            .appendingPathComponent(ArtifactPath.prototype)
         XCTAssertEqual(
             try String(contentsOf: saved, encoding: .utf8),
             "<!DOCTYPE html><html><body>灰盒原型</body></html>"
@@ -619,6 +665,75 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertNil(ArtifactParser.prdTruncatedDraft(from: "普通回复，无产物。"))
     }
 
+    /// PRD 产物块四反引号围栏 + 内嵌 ```text 线框图（嵌套围栏安全协议）：
+    /// 旧三反引号正则 lazy 到第一个 ``` 就闭栏，线框图与后续章节全部游离在块外
+    /// 落不了盘——预览里看不到线框图（回归绊线）。
+    func testPRDArtifactSurvivesNestedTextFences() {
+        let reply = """
+        撰写说明。
+
+        ````artifact:prd
+        # PRD
+
+        ### 4.4 页面线框图
+
+        #### P1 今日页
+
+        ```text
+        ┌────┐
+        │录入│
+        └────┘
+        ```
+
+        ## 五、数据指标
+
+        基线待建立。
+        ````
+
+        ```artifact:radar
+        [{"finding": "demo"}]
+        ```
+        """
+        let blocks = ArtifactParser.parseArtifactBlocks(in: reply)
+        let prd = blocks.first { $0.name == "prd" }
+        XCTAssertNotNil(prd, "四反引号块应完整解析")
+        XCTAssertTrue(prd?.content.contains("```text") ?? false, "内嵌 text 围栏留在正文里")
+        XCTAssertTrue(prd?.content.contains("┌────┐") ?? false, "内嵌线框图 ASCII 不丢")
+        XCTAssertTrue(prd?.content.contains("五、数据指标") ?? false, "内嵌围栏后的章节不截断")
+        XCTAssertFalse(prd?.content.contains("````") ?? true, "闭栏不混入正文")
+        // 同回复内三反引号 radar 块（旧协议）不受影响
+        XCTAssertEqual(blocks.first { $0.name == "radar" }?.content, "[{\"finding\": \"demo\"}]")
+        // 剥离展示正文：prd 整块替换，内嵌围栏不残留
+        let stripped = ArtifactParser.stripArtifactBlocks(in: reply)
+        XCTAssertFalse(stripped.contains("```text"))
+        XCTAssertTrue(stripped.contains("撰写说明"))
+    }
+
+    /// 流式口径：四反引号 PRD 块内的 ```text 开/闭栏都不算闭合，四反引号闭栏才算完成。
+    func testParseIncompleteArtifactFourBacktickNesting() {
+        // 内嵌 ```text 围栏（含裸 ``` 闭栏行）仍在进行中
+        let streaming = "说明。\n\n````artifact:prd\n# PRD\n\n```text\n┌──┐\n└──┘\n```\n"
+        let incomplete = ArtifactParser.parseIncompleteArtifact(in: streaming)
+        XCTAssertEqual(incomplete?.name, "prd")
+        XCTAssertTrue(incomplete?.partial.contains("┌──┐") ?? false)
+
+        // 四反引号闭栏出现 → 完成
+        XCTAssertNil(ArtifactParser.parseIncompleteArtifact(in: streaming + "````\n"))
+
+        // 截断草稿：四反引号块在内嵌围栏处被截断仍可提取（含内嵌围栏正文）
+        let longBody = String(repeating: "功能需求条目。\n", count: 80)
+        let streaming4 = "说明。\n\n````artifact:prd\n# PRD\n\(longBody)\n```text\n┌──┐\n```\n"
+        XCTAssertTrue(
+            ArtifactParser.prdTruncatedDraft(from: streaming4)?.contains("```text") ?? false,
+            "内嵌围栏后的正文仍在草稿里"
+        )
+
+        // 三反引号块（旧协议）行为不变：裸 ``` 行闭合
+        XCTAssertNil(ArtifactParser.parseIncompleteArtifact(
+            in: "```artifact:prototype\n<ht\n```"
+        ))
+    }
+
     // MARK: 澄清选项行解析（E1：选项式提问点选）
 
     func testParseClarifyOptions() {
@@ -643,6 +758,114 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertNil(ArtifactParser.parseClarifyOptions(in: "问：X？\nA) 只有一个"))
         // 纯文本 → 无选项
         XCTAssertNil(ArtifactParser.parseClarifyOptions(in: "普通回复，无选项"))
+    }
+
+    // MARK: 选项行问题组解析（多组 → 问题卡向导逐题作答）
+
+    func testParseOptionLineQuestionGroups() {
+        // 单组：与 parseClarifyOptions 同口径（题干收尾行 + 选项）
+        let single = ArtifactParser.parseOptionLineQuestionGroups(in: "问：核心场景？\nA) 甲\nB) 乙")
+        XCTAssertEqual(single?.questions.count, 1)
+        XCTAssertEqual(single?.questions[0].title, "问：核心场景？")
+        XCTAssertEqual(single?.questions[0].options, ["甲", "乙"])
+        XCTAssertEqual(single?.bodyText, "问：核心场景？")
+
+        // 多组：模型未走问题卡协议一次抛两问 → 两组逐题作答；正文剥除所有组选项行
+        let multi = ArtifactParser.parseOptionLineQuestionGroups(in: """
+        先对齐两个事实。
+
+        问题一：团队规模？
+        A) 1-2 人
+        B) 3-5 人
+
+        问题二：预算周期？
+        A) 一个月
+        B) 半年
+        """)
+        XCTAssertEqual(multi?.questions.count, 2)
+        XCTAssertEqual(multi?.questions[0].title, "问题一：团队规模？")
+        XCTAssertEqual(multi?.questions[0].options, ["1-2 人", "3-5 人"])
+        XCTAssertEqual(multi?.questions[1].title, "问题二：预算周期？")
+        XCTAssertEqual(multi?.questions[1].options, ["一个月", "半年"])
+        XCTAssertTrue(multi?.bodyText.contains("问题一：团队规模？") == true)
+        XCTAssertTrue(multi?.bodyText.contains("A)") == false)
+
+        // 题干收尾代码围栏块整块跳过（题干不能显示成「```」）
+        let fenced = ArtifactParser.parseOptionLineQuestionGroups(in: """
+        看下现状
+        ```yaml
+        key: value
+        ```
+
+        A) 甲
+        B) 乙
+        """)
+        XCTAssertEqual(fenced?.questions[0].title, "看下现状")
+
+        // 选项行不在末尾（选项后还有正文）→ 不触发
+        XCTAssertNil(ArtifactParser.parseOptionLineQuestionGroups(
+            in: "问：X？\nA) 甲\nB) 乙\n以上就是选项。"
+        ))
+
+        // 超过 4 行连续选项行 → 视为列表散文，不成组
+        XCTAssertNil(ArtifactParser.parseOptionLineQuestionGroups(
+            in: "列表：\nA) 1\nB) 2\nC) 3\nD) 4\nE) 5"
+        ))
+    }
+
+    // MARK: 收尾确认标记（① 澄清一次确认协议）
+
+    func testGateConfirmMarkerParsing() {
+        // 标记尾行 + 单组：gateConfirm 置位，选项行照常成组，正文剥除标记行
+        let marked = ArtifactParser.parseOptionLineQuestionGroups(in: """
+        最后一个问题：以上要点是否确认？
+        A) 确认，先只出移动版
+        B) 有要改的地方
+        [收尾确认]
+        """)
+        XCTAssertEqual(marked?.gateConfirm, true)
+        XCTAssertEqual(marked?.questions.count, 1)
+        XCTAssertEqual(marked?.questions[0].options, ["确认，先只出移动版", "有要改的地方"])
+        XCTAssertEqual(marked?.questions[0].title, "最后一个问题：以上要点是否确认？")
+        XCTAssertEqual(marked?.bodyText.contains("[收尾确认]"), false)
+
+        // 全角括号变体同样识别
+        let fullwidth = ArtifactParser.parseOptionLineQuestionGroups(
+            in: "确认一下？\nA) 确认\nB) 再改改\n【收尾确认】"
+        )
+        XCTAssertEqual(fullwidth?.gateConfirm, true)
+
+        // 无标记 → 不置位（常规澄清问路径不受影响）
+        let plain = ArtifactParser.parseOptionLineQuestionGroups(in: "问：X？\nA) 甲\nB) 乙")
+        XCTAssertEqual(plain?.gateConfirm, false)
+
+        // 标记 + 多组：仍按多组解析（收尾确认问协议要求单组，多组由调用方忽略标记语义）
+        let multiMarked = ArtifactParser.parseOptionLineQuestionGroups(
+            in: "问一？\nA) 甲\nB) 乙\n\n问二？\nA) 丙\nB) 丁\n[收尾确认]"
+        )
+        XCTAssertEqual(multiMarked?.questions.count, 2)
+        XCTAssertEqual(multiMarked?.gateConfirm, true)
+
+        // 只有标记、无有效选项组 → nil（标记行不成组）
+        XCTAssertNil(ArtifactParser.parseOptionLineQuestionGroups(in: "正文\n[收尾确认]"))
+    }
+
+    // MARK: 一次确认肯定项判定
+
+    func testGateConfirmSelection() {
+        let options = ["确认，先只出移动版", "确认，移动版 + 桌面版一起修订", "有要改的地方"]
+        // 点选「确认」开头选项（点选即发送原文）→ 一次确认生效
+        XCTAssertTrue(AppModel.isGateConfirmSelection(
+            "确认，先只出移动版", options: options
+        ))
+        // 非确认开头选项 → 常规作答
+        XCTAssertFalse(AppModel.isGateConfirmSelection("有要改的地方", options: options))
+        // 自由输入（即便以确认开头，非选项原文）→ 不触发，走 AI 判读
+        XCTAssertFalse(AppModel.isGateConfirmSelection(
+            "确认，但桌面版要支持深色模式", options: options
+        ))
+        // 空文本兜底
+        XCTAssertFalse(AppModel.isGateConfirmSelection("  ", options: options))
     }
 
     // MARK: JSON 容错解析（要点表 / 记忆抽取）
@@ -947,6 +1170,46 @@ final class RiskStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.adopt(id: risk.id))
     }
 
+    func testAdoptWithEvidencePointer() throws {
+        // 采纳落实闭环（2026-09-15）：带证据指针的采纳——决策日志 evidence 字段
+        // 落盘可回读，resolution 标注「实施证据已留对话」；普通采纳口径不变
+        // （testFourStateFlow 的 resolution 精确断言依赖此项）。
+        try makeWorkspace()
+        let decisionsURL = PMAgentStore.jsonlURL(
+            project: "风险项目", version: "v1.0", file: "decisions.jsonl"
+        )
+        let store = RiskStore(project: "风险项目", version: "v1.0")
+        let risk = makeRisk("留存假设无一手数据支撑", trigger: .decisionOverturned, stage: .clarify)
+        try store.append(risk)
+
+        let adopted = try store.adopt(
+            id: risk.id, evidence: "对话留痕 · 会话 s1 · 回合 m9"
+        )
+        XCTAssertEqual(adopted.evidence, "对话留痕 · 会话 s1 · 回合 m9")
+        XCTAssertTrue(adopted.toBeVerified)
+        XCTAssertEqual(
+            store.risks.first { $0.id == risk.id }?.resolution,
+            "决策日志 \(adopted.id) · 实施证据已留对话"
+        )
+
+        // decisions.jsonl 回读：evidence 字段随行持久化（append-only 可查）
+        let decisions = PMAgentStore.readLines(DecisionLogEntry.self, from: decisionsURL)
+        guard case .decision(let first)? = decisions.first else {
+            return XCTFail("决策条目类型不符")
+        }
+        XCTAssertEqual(first.evidence, "对话留痕 · 会话 s1 · 回合 m9")
+
+        // 普通采纳（无证据）：evidence 为 nil，resolution 保持原口径
+        let plain = makeRisk("无需生成的线下方案", trigger: .release)
+        try store.append(plain)
+        let plainAdopted = try store.adopt(id: plain.id)
+        XCTAssertNil(plainAdopted.evidence)
+        XCTAssertEqual(
+            store.risks.first { $0.id == plain.id }?.resolution,
+            "决策日志 \(plainAdopted.id)"
+        )
+    }
+
     // MARK: 封板兜底（未闭合统一自留；已闭合不动）
 
     func testReleaseSettlement() throws {
@@ -1199,6 +1462,7 @@ final class PipelineM3Tests: XCTestCase {
 
         let prdPrompt = AgentPrompts.prd(
             tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
             prototypePages: ["首页"], analysisNotes: "", injection: ""
         )
         XCTAssertTrue(prdPrompt.contains("artifact:backtrack"), "④ 提示词含回退协议")
@@ -1207,9 +1471,9 @@ final class PipelineM3Tests: XCTestCase {
         XCTAssertTrue(prdPrompt.contains("\"clarify\""), "④ 可回①澄清（新功能）")
 
         let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
-        XCTAssertTrue(structurePrompt.contains("artifact:backtrack"), "② 含回退协议（新功能回①增补澄清）")
-        // ② 的回退目标校验收窄到回退段内断言（快速通道段合法引入 prototype/prd 字样）
-        if let backtrackStart = structurePrompt.range(of: "━━ 回退请求"),
+        XCTAssertTrue(structurePrompt.contains("artifact:backtrack"), "② 含变更提案协议（新功能回①增补澄清）")
+        // ② 的回退目标校验收窄到变更提案段内断言（快速通道段合法引入 prototype/prd 字样）
+        if let backtrackStart = structurePrompt.range(of: "━━ 变更提案"),
            let ffStart = structurePrompt.range(of: "━━ 快速通道") {
             let backtrackSection = structurePrompt[backtrackStart.lowerBound..<ffStart.lowerBound]
             XCTAssertTrue(backtrackSection.contains("\"clarify\""), "② 只含 clarify 目标")
@@ -1485,6 +1749,7 @@ final class PipelineM3Tests: XCTestCase {
 
         let prdPrompt = AgentPrompts.prd(
             tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
             prototypePages: ["首页"], analysisNotes: "", injection: ""
         )
         XCTAssertFalse(prdPrompt.contains("artifact:question-card"), "④ 不含问题卡协议")
@@ -1532,12 +1797,13 @@ final class PipelineM3Tests: XCTestCase {
     func testIterativePromptInjectsPreviousBase() {
         // 段头「上一版×（修订基底）」是注入段独有标记（backtrack 协议文案里的
         // 「修订基底」字样不算——用完整段头断言防撞词）。
-        // ③ 有旧原型 → 注入基底；无 → 不含基底段（首次生成行为不变）
+        // ③ 有旧原型 → 逐槽位注入基底；无 → 不含基底段（首次生成行为不变）
         let iterative = AgentPrompts.prototype(
             modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD",
-            previousPrototype: "<html><body>旧原型</body></html>", injection: ""
+            previousPrototypes: [(label: "交互原型", html: "<html><body>旧原型</body></html>")],
+            injection: ""
         )
-        XCTAssertTrue(iterative.contains("上一版原型（修订基底）"))
+        XCTAssertTrue(iterative.contains("上一版原型（交互原型）（修订基底）"))
         XCTAssertTrue(iterative.contains("<html><body>旧原型</body></html>"))
         XCTAssertLessThan(
             iterative.range(of: "（修订基底）")!.lowerBound,
@@ -1549,6 +1815,22 @@ final class PipelineM3Tests: XCTestCase {
             modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD", injection: ""
         )
         XCTAssertFalse(fresh.contains("（修订基底）"), "首次生成无基底，不注入")
+
+        // 多端多基底：逐槽位注入（label 区分端），输出协议含分端块
+        let multi = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD",
+            previousPrototypes: [
+                (label: "交互原型 · 移动端", html: "<html>m</html>"),
+                (label: "交互原型 · 桌面端", html: "<html>d</html>"),
+            ],
+            injection: ""
+        )
+        XCTAssertTrue(multi.contains("上一版原型（交互原型 · 移动端）（修订基底）"))
+        XCTAssertTrue(multi.contains("<html>m</html>"))
+        XCTAssertTrue(multi.contains("上一版原型（交互原型 · 桌面端）（修订基底）"))
+        XCTAssertTrue(multi.contains("<html>d</html>"))
+        XCTAssertTrue(multi.contains("```artifact:prototype-mobile"))
+        XCTAssertTrue(multi.contains("```artifact:prototype-desktop"))
 
         // ② 结构迭代同理
         let structureIterative = AgentPrompts.structure(
@@ -1642,6 +1924,179 @@ final class PipelineM3Tests: XCTestCase {
         let blocks = ArtifactParser.parseArtifactBlocks(in: reply)
         let radar = try? XCTUnwrap(ArtifactParser.parseRadar(blocks: blocks))
         XCTAssertNil(radar?.fatal?.first?.signal, "未知触发信号应返回 nil（调用侧丢弃防悬空）")
+    }
+
+    // MARK: 自评审对账 trace（B3 事件驱动：落盘往返 + 跨轮 diff + 💀 去重）
+
+    func testSelfReviewWriteReadRoundTrip() throws {
+        try PMAgentStore.bootstrap()
+        try PMAgentStore.createProject(named: "B3项目")
+        try PMAgentStore.createVersion("v1.0", in: "B3项目")
+        // appendLine 不建文件：先铺阶段目录骨架（对账 trace 数据源）
+        let base = PMAgentStore.versionURL(project: "B3项目", version: "v1.0")
+        for dir in ["01-requirements", "02-structure"] {
+            let stageDir = base.appendingPathComponent(dir)
+            try FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
+            FileManager.default.createFile(
+                atPath: stageDir.appendingPathComponent("self-review.jsonl").path, contents: nil
+            )
+        }
+
+        let radar1 = ArtifactParser.RadarReport(
+            fixed: ["修正A"], covered: ["目标用户"],
+            missing: ["定价模式"],
+            skipped: [ArtifactParser.RadarReport.Skipped(point: "多租户", reason: "MVP 不展开")],
+            fatal: [ArtifactParser.RadarReport.Fatal(
+                hypothesis: "单机文件粒度足够", impact: nil, plan: nil, triggerSignal: nil)]
+        )
+        try ArtifactParser.writeSelfReview(
+            radar1, stage: "clarify", project: "B3项目", version: "v1.0"
+        )
+        let radar2 = ArtifactParser.RadarReport(covered: ["目标用户", "核心场景"], missing: ["定价模式"])
+        try ArtifactParser.writeSelfReview(
+            radar2, stage: "structure", project: "B3项目", version: "v1.0"
+        )
+
+        let reviews = ArtifactParser.readSelfReviews(project: "B3项目", version: "v1.0")
+        XCTAssertEqual(reviews.count, 2, "两轮落盘都要能读回（对账 trace 数据源）")
+        let first = try XCTUnwrap(reviews.first)
+        let last = try XCTUnwrap(reviews.last)
+        XCTAssertEqual([first.stage, last.stage], ["clarify", "structure"], "按时间正序合并")
+        XCTAssertEqual(first.radar.covered, ["目标用户"], "covered 全量保留（审计契约不动）")
+        XCTAssertEqual(last.radar.covered, ["目标用户", "核心场景"])
+
+        // 旧格式兼容：B3 前经 appendLine(String) 双重编码的行（外层 JSON 字符串）
+        // 也能剥层读出（存量会话的 diff 基线依赖此兼容）
+        let legacyInner = """
+        {"stage":"prototype","radar":{"covered":["旧轮覆盖"]},"createdAt":"2026-09-15T10:00:00+08:00"}
+        """
+        let protoDir = base.appendingPathComponent("03-prototypes")
+        try FileManager.default.createDirectory(at: protoDir, withIntermediateDirectories: true)
+        let protoURL = protoDir.appendingPathComponent("self-review.jsonl")
+        XCTAssertTrue(FileManager.default.createFile(atPath: protoURL.path, contents: nil))
+        let quotedData = try JSONEncoder().encode(legacyInner)
+        let handle = try FileHandle(forWritingTo: protoURL)
+        try handle.write(contentsOf: quotedData + Data("\n".utf8))
+        try handle.close()
+
+        let mixed = ArtifactParser.readSelfReviews(project: "B3项目", version: "v1.0")
+        XCTAssertEqual(mixed.count, 3, "旧双重编码行兼容读出")
+        XCTAssertEqual(mixed.first?.radar.covered, ["旧轮覆盖"], "createdAt 最早排前")
+        XCTAssertEqual(mixed.first?.stage, "prototype")
+    }
+
+    func testRadarDiffNormalizedMatching() {
+        // 归一化口径：大小写折叠 + 全部空白移除
+        XCTAssertEqual(ArtifactParser.normalizedText("  iOS  App\n首版 "), "iosapp首版")
+
+        // ❓ missing：重播（含空白微差）被挡，新增保留本轮顺序
+        let newMissing = ArtifactParser.newItems(
+            current: ["定价模式", "分发渠道"],
+            previous: ["定价 模式", "已答过的用户画像"]
+        )
+        XCTAssertEqual(newMissing, ["分发渠道"])
+
+        // ⏭️ skipped：point 归一化匹配（reason 变化不算新增）
+        let newSkipped = ArtifactParser.newSkipped(
+            current: [
+                ArtifactParser.RadarReport.Skipped(point: "多租户", reason: "MVP 不展开"),
+                ArtifactParser.RadarReport.Skipped(point: "SSO", reason: "v2 再说"),
+            ],
+            previous: [ArtifactParser.RadarReport.Skipped(point: "多 租户", reason: "旧理由")]
+        )
+        XCTAssertEqual(newSkipped.map(\.point), ["SSO"])
+
+        // 💀 fatal：与台账全量 hypothesis 归一化去重——重播不重复登记
+        let fresh = ArtifactParser.newFatals(
+            current: [
+                ArtifactParser.RadarReport.Fatal(
+                    hypothesis: "单机文件粒度足够", impact: nil, plan: nil, triggerSignal: nil),
+                ArtifactParser.RadarReport.Fatal(
+                    hypothesis: "付费意愿足够强", impact: nil, plan: nil, triggerSignal: nil),
+            ],
+            existingHypotheses: ["单机  文件粒度足够", "已登记的其他假设"]
+        )
+        XCTAssertEqual(fresh.map(\.hypothesis), ["付费意愿足够强"])
+    }
+}
+
+/// PRD 模板 13 章契约（2026-09-16 结构升级）：三档 prompt 均嵌入模板全文，
+/// 骨架章名与关键机制锚必须在场；档位差异（lean 收敛 / full 基线表）可断言。
+@MainActor
+final class PRDTemplateContractTests: XCTestCase {
+    private let chapterAnchors = [
+        "文档基本信息", "修订记录", "需求概述", "产品目标与成功指标", "用户分析",
+        "设计与原型", "功能清单", "业务流程", "详细设计", "性能与兼容性",
+        "发布计划", "上线效果验证", "协作与依赖",
+    ]
+
+    private func makePrompt(tier: String) -> String {
+        AgentPrompts.prd(
+            tier: tier, clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "", prototypePages: ["首页"],
+            analysisNotes: "", injection: ""
+        )
+    }
+
+    func testAllTiersEmbedThirteenChapterSkeleton() {
+        for tier in ["lean", "standard", "full"] {
+            let prompt = makePrompt(tier: tier)
+            for anchor in chapterAnchors {
+                XCTAssertTrue(prompt.contains(anchor), "\(tier) 档缺章锚：\(anchor)")
+            }
+            XCTAssertTrue(prompt.contains("目标收敛句"), "\(tier) 档缺目标收敛句")
+            XCTAssertTrue(prompt.contains("行为规则表"), "\(tier) 档缺行为规则表")
+            XCTAssertTrue(prompt.contains("状态完整性"), "\(tier) 档缺状态完整性检验")
+            XCTAssertTrue(prompt.contains("穷举三步法"), "\(tier) 档缺状态穷举三步法")
+            XCTAssertTrue(prompt.contains("验收 eval"), "\(tier) 档缺验收 eval")
+        }
+    }
+
+    func testFullTemplateAddsBaselineAndDecisionLink() {
+        let prompt = makePrompt(tier: "full")
+        XCTAssertTrue(prompt.contains("基线表"), "full 档必备基线表")
+        XCTAssertTrue(prompt.contains("决策回链"), "full 档必备决策回链")
+    }
+
+    func testLeanTemplateCollapsesDetail() {
+        let prompt = makePrompt(tier: "lean")
+        XCTAssertTrue(prompt.contains("页面概览"), "lean 每页 3 子项之一")
+        XCTAssertFalse(prompt.contains("基线表"), "lean 档不展开基线表")
+        XCTAssertFalse(prompt.contains("状态流转图"), "lean 档免状态流转图")
+    }
+
+    // MARK: - rejections 注入（PRD 3.4「范围-不包含」数据源）
+
+    func testRejectionsInjectionListsRejectedAlternatives() {
+        let record = DecisionRecord(
+            version: "v1.0", decision: "采用 A 方案", why: "成本最低",
+            rejectedAlternatives: [
+                RejectedAlternative(option: "B 方案", reason: "集成成本高", owner: "adopted"),
+                RejectedAlternative(option: "C 方案", reason: "超出范围", owner: nil),
+            ]
+        )
+        let injection = AppModel.rejectionsInjection([record])
+        XCTAssertTrue(injection.contains("B 方案"))
+        XCTAssertTrue(injection.contains("否决原因：集成成本高"))
+        XCTAssertTrue(injection.contains("范围-不包含"))
+        XCTAssertTrue(injection.contains("AI建议-采纳"), "所有权标注展示")
+        XCTAssertTrue(injection.contains("C 方案"), "无所有权标注的行不丢")
+    }
+
+    func testRejectionsInjectionEmptyReturnsEmptyString() {
+        XCTAssertEqual(AppModel.rejectionsInjection([]), "")
+        let noAlternatives = DecisionRecord(version: "v1.0", decision: "拍板", why: "唯一可行")
+        XCTAssertEqual(AppModel.rejectionsInjection([noAlternatives]), "")
+    }
+
+    func testRejectionsInjectionBudgetTruncation() {
+        let record = DecisionRecord(
+            version: "v1.0", decision: "拍板", why: "w",
+            rejectedAlternatives: [
+                RejectedAlternative(option: "超长项", reason: String(repeating: "长", count: 400)),
+            ]
+        )
+        XCTAssertTrue(AppModel.rejectionsInjection([record]).contains("（其余略）"))
     }
 }
 
@@ -1986,6 +2441,7 @@ final class LLMLiveTests: XCTestCase {
             case .text(let text): full += text
             case .reasoning(let chunk): reasoning += chunk
             case .truncated: break
+            case .retrying: break  // live 测试不校验重试状态
             }
         }
         XCTAssertFalse(

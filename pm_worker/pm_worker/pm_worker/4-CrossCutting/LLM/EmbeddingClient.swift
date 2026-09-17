@@ -14,6 +14,9 @@ nonisolated enum EmbeddingClient {
 
     enum EmbeddingError: LocalizedError {
         case missingAPIKey
+        /// Keychain item 存在但读取被拒（构建重签后运行中进程常见）——
+        /// 勿与 missingAPIKey 混同：重启 App 即恢复，重填 Key 无效。
+        case keychainAccessDenied(OSStatus)
         case missingBaseURL
         case http(Int, String)
         /// 返回向量条数与输入不符
@@ -26,6 +29,8 @@ nonisolated enum EmbeddingClient {
         var errorDescription: String? {
             switch self {
             case .missingAPIKey: "未配置向量编码阶段的 API Key——请到设置（⌘,）填写"
+            case .keychainAccessDenied(let status):
+                "向量编码阶段的 API Key 在钥匙串中完好但访问被拒（构建重签后常见）——退出并重启 App 即恢复，无需重填（OSStatus \(status)）"
             case .missingBaseURL: "向量编码阶段的模型端点（baseURL）未配置"
             case .http(let code, let body): "HTTP \(code)：\(body.prefix(300))"
             case .mismatchedRows(let expected, let received):
@@ -53,7 +58,14 @@ nonisolated enum EmbeddingClient {
         guard let config = settings.stages[.embedding] else {
             throw EmbeddingError.missingBaseURL
         }
-        guard let apiKey = settings.apiKey(for: .embedding), !apiKey.isEmpty else {
+        // 与 LLMClient.streamChat 同纪律：拒读（accessFailed）不得折叠成「未配置」。
+        let apiKey: String
+        switch KeychainStore.read(config.apiKeyKeychainKey) {
+        case .found(let key) where !key.isEmpty:
+            apiKey = key
+        case .accessFailed(let status):
+            throw EmbeddingError.keychainAccessDenied(status)
+        default:
             throw EmbeddingError.missingAPIKey
         }
         let baseURL = config.resolvedBaseURL

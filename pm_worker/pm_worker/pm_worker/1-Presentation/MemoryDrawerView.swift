@@ -35,6 +35,7 @@ struct MemoryDrawerView: View {
                 .scrollContentBackground(.hidden)
                 .background(Color.surfaceBase)
                 .padding(.horizontal, DS.Spacing.s8)
+                .dsScrollbar()
             }
         }
         // 原型 .ds-drawer：bg-base · neutral-l1 边 · r12 · max-w 360 ·

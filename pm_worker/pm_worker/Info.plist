@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- macOS 26 Tahoe Liquid Glass 窗口描边（外框灰线）与 App 自有 DS 设计不符，
+	     整体退回 pre-26 窗口外观。临时受支持键，macOS 27 起被系统忽略。 -->
+	<key>UIDesignRequiresCompatibility</key>
+	<true/>
+</dict>
+</plist>

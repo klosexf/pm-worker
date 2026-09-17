@@ -32,6 +32,10 @@ nonisolated struct PipelineEvent: Codable, Equatable, Identifiable {
     var detail: String
     /// 回退 / 标记原因（structure_regen / prototype_regen / prd_stale 等）。
     var reason: String?
+    /// 闸口确认 outcome 结算（approved / approved_after_revision / fast_track）：
+    /// 仅带批准仪式语义的事件携带（① 确认推进 / ②③ stageConfirm）。
+    /// 驳回不在此列——stageInvalidate 事件即驳回留痕。历史行无此键 → nil。
+    var outcome: String?
     var createdAt: String
 }
 
@@ -51,6 +55,7 @@ nonisolated enum PipelineEventLog {
         stage: String,
         detail: String,
         reason: String? = nil,
+        outcome: String? = nil,
         project: String,
         version: String
     ) {
@@ -68,6 +73,7 @@ nonisolated enum PipelineEventLog {
             stage: stage,
             detail: detail,
             reason: reason,
+            outcome: outcome,
             createdAt: ISO8601.timestamp()
         )
         try? PMAgentStore.appendLine(event, to: url)

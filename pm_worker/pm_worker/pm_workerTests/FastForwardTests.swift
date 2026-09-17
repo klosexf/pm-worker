@@ -128,6 +128,7 @@ final class FastForwardTests: XCTestCase {
         // ④ 是终点：不注入
         let prdPrompt = AgentPrompts.prd(
             tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
             prototypePages: ["首页"], analysisNotes: "", injection: ""
         )
         XCTAssertFalse(prdPrompt.contains("artifact:fast-forward"), "④ 不含快速通道协议")

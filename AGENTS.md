@@ -75,14 +75,15 @@ xcodebuild ... test -only-testing:pm_workerTests/ContextBuilderTests
 - `WKPreferences.javaScriptEnabled` 弃用（macOS 11+），改 `config.defaultWebpagePreferences.allowsContentJavaScript = true`。
 - `[Float]→Data` 别用 `UnsafeBufferPointer(start:)` 悬垂指针，用 `vector.withUnsafeBufferPointer { Data(buffer: $0) }`。
 - IDGenerator 等跨线程工具：nonisolated + NSLock + `nonisolated(unsafe)` 静态可变量。
+- 带 `.textSelection(.enabled)` 的 `Text` 上**禁止挂 `.mask` / `.drawingGroup` 等 compositing 修饰符**（macOS 上 Text 被拍平成图层，拖选交互静默失效——用户气泡曾因此永远选不中）。折叠渐隐等视觉效果改用 overlay 淡入底色 + `.allowsHitTesting(false)`。改后冒烟必查：消息文字能鼠标拖选。
 
 ## UI 约定（DS 设计系统）
 
-所有界面必须用 `1-Presentation/DS/` 的令牌与组件，**禁止系统默认控件**（ProgressView / 系统 Toggle / `Image(systemName:)` / `.secondary` 前景等残留要清零，新增代码零引入）：
+所有界面必须用 `1-Presentation/DS/` 的令牌与组件，**禁止系统默认控件**（ProgressView / 系统 Toggle / `.secondary` 前景等残留要清零，新增代码零引入）：
 
 - 颜色：`DS.swift` 的语义令牌（ink / surface / overlay / border / brand / status / userBubble / shadowInk / scrim…）。深色模式由 `Color.dynamic(light:dark:)` 工厂全量自适应，调用点无需判断 colorScheme。
 - 组件：`DSComponents*.swift`（DSButtonStyle / dsInput / dsCard / DSTabs / DSSwitch / DSSelect / DSSlider / DSDialog / DSMenu / DSTable / DSTag / DSNotif / DSSkeleton / DSAvatar / DSKbd / DSBreadcrumb / .ds-drawer / .ds-code…）。
-- 图标：`DSIcon.swift` 自绘体系，不用 SF Symbols。
+- 图标（2026-09-15 改版）：`DSIcon.swift` 是唯一入口，内部渲染 **SF Symbols**（`Image(systemName:)` 仅允许出现在 DSIcon.swift 内部，调用点一律写 `DSIcon(.name, size:)`）。新图标 = 在 `extension DSIcon.Name` 加一行 `static let foo = DSIcon.Name(symbol: "sf.name")`；个别品牌字符（agent 机器人头像、markdown 徽标）保留自绘 path 兜底。
 - 字体：`DS.Font.*` 令牌（body 12–15、heading 17–34、display 系 New York 衬线、mono 系 JetBrains Mono）。
 - 动效：`DS.Motion.spring`，不用 easeOut/easeInOut。
 - **DS 令牌已与原型 v4 CSS 值有意分歧**（「高级感升级」：冷调微染、双层阴影、衬线大字）——**不要「还原」回原型原值**。设计基调 = 保留 TraeWork 品牌骨架的 Branded Native。
@@ -99,6 +100,6 @@ xcodebuild ... test -only-testing:pm_workerTests/ContextBuilderTests
 ## 工作方式
 
 - 改前先读目标文件最新状态（跨会话可能有并发写盘，行号会漂移；怀疑时 `ps aux | grep xcodebuild` 查遗留构建）。编辑 old_string 失配时重读文件，勿盲目重试。
-- 增删 UI 控件后用 Grep 清点系统控件残留（`systemName:|ProgressView|Toggle(`）。
+- 增删 UI 控件后用 Grep 清点系统控件残留（`ProgressView|Toggle(`；`systemName:` 仅 DSIcon.swift 白名单内允许）。
 - 提交信息遵循仓库现有风格（简短中文/英文均可，聚焦 why）。
 - 里程碑状态见 README「Roadmap & status」；M5（MCP + 收尾）进行中。

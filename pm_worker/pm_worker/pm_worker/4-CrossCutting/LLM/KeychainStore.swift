@@ -8,9 +8,37 @@
 import Foundation
 import Security
 
-/// nonisolated：纯 Security.framework 调用，不持有可变状态。
+/// nonisolated：纯 Security.framework 调用 + NSLock 保护的进程内 Key 缓存。
 nonisolated enum KeychainStore {
     private static let service = "com.xiaofengchen.pm-worker.byok"
+
+    /// 进程内缓存：read 成功后驻留内存，set/delete 时失效。
+    /// 动机：重建把磁盘上的 .app 换掉后，仍在运行的旧进程会被 securityd
+    /// 整体拒绝读钥匙串（OSStatus -25293，且授权弹窗被压制，进程内无法
+    /// 自愈，官方出路只有退出重开）。此前 streamChat 每次发送都重读
+    /// 钥匙串，导致并行构建后旧进程一发言就撞死。缓存后仅进程内首次
+    /// 读取走钥匙串，旧进程可照常工作到退出；安全性无新增暴露——Key
+    /// 本就随每次请求进入内存。
+    /// 代价：外部工具（钥匙串访问/CLI）绕过本进程改值时读不到新值；
+    /// 本进程的 set/delete 均同步失效缓存，正常路径不受影响。
+    private static let cacheLock = NSLock()
+    private nonisolated(unsafe) static var cache: [String: String] = [:]
+
+    private static func cachedValue(forKey key: String) -> String? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache[key]
+    }
+
+    private static func storeCached(_ value: String?, forKey key: String) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if let value {
+            cache[key] = value
+        } else {
+            cache.removeValue(forKey: key)
+        }
+    }
 
     enum KeychainError: LocalizedError {
         case unexpectedStatus(OSStatus)
@@ -42,6 +70,7 @@ nonisolated enum KeychainStore {
         } else if status != errSecSuccess {
             throw KeychainError.unexpectedStatus(status)
         }
+        storeCached(value, forKey: key)
     }
 
     /// 读取三态：「不存在」与「访问失败」必须区分——沙盒/并行构建重签等环境会把
@@ -54,6 +83,7 @@ nonisolated enum KeychainStore {
     }
 
     static func read(_ key: String) -> KeychainRead {
+        if let cached = cachedValue(forKey: key) { return .found(cached) }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -69,6 +99,7 @@ nonisolated enum KeychainStore {
         guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
             return .notFound
         }
+        storeCached(value, forKey: key)
         return .found(value)
     }
 
@@ -79,6 +110,7 @@ nonisolated enum KeychainStore {
     }
 
     static func delete(_ key: String) {
+        storeCached(nil, forKey: key)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

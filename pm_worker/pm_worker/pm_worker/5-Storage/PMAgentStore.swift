@@ -39,6 +39,97 @@ nonisolated enum ArtifactPath {
         ("05-analysis/competitive-analysis.md", competitiveAnalysis),
         ("07-reports/release-notes.md", releaseNotes),
     ]
+
+    // MARK: - 多端原型槽位协议（artifact:prototype / prototype-<slug> 双向映射）
+
+    /// 已知槽位表：块名 → 相对路径 + 显示名。默认槽位（prototype）兼容旧数据；
+    /// 分端槽位各落独立文件（多端产品按端分块生成，一端一文件，说的份数=磁盘份数）；
+    /// plan-a/b/c 为多方案对比槽位（用户要「出几版看看」时按方案分块）。
+    static let knownPrototypeSlots: [(block: String, rel: String, display: String)] = [
+        ("prototype", prototype, "交互原型"),
+        ("prototype-mobile", "03-prototypes/移动端原型.html", "交互原型 · 移动端"),
+        ("prototype-desktop", "03-prototypes/桌面端原型.html", "交互原型 · 桌面端"),
+        ("prototype-tablet", "03-prototypes/平板端原型.html", "交互原型 · 平板端"),
+        ("prototype-plan-a", "03-prototypes/原型-方案A.html", "交互原型 · 方案 A"),
+        ("prototype-plan-b", "03-prototypes/原型-方案B.html", "交互原型 · 方案 B"),
+        ("prototype-plan-c", "03-prototypes/原型-方案C.html", "交互原型 · 方案 C"),
+    ]
+
+    /// 块名是否为原型类（默认槽位或 prototype-<slug> 分端槽位）。
+    /// 流式进度卡 / 结果卡 / 截断兜底等按类判定的入口统一走这里。
+    static func isPrototypeBlock(_ name: String) -> Bool {
+        name == "prototype" || name.hasPrefix("prototype-")
+    }
+
+    /// 块名 → 槽位（相对路径 + 显示名）。已知槽位查表；未知 slug 走通用命名
+    /// `03-prototypes/原型-<slug>.html`（slug 口径与 artifact 块名一致，防路径注入）。
+    static func prototypeSlot(forBlockName name: String) -> (relPath: String, display: String)? {
+        if let known = knownPrototypeSlots.first(where: { $0.block == name }) {
+            return (known.rel, known.display)
+        }
+        guard name.hasPrefix("prototype-") else { return nil }
+        let slug = String(name.dropFirst("prototype-".count))
+        guard isValidSlug(slug) else { return nil }
+        return ("03-prototypes/原型-\(slug).html", "交互原型 · \(slug)")
+    }
+
+    /// 相对路径 → 块名（反向映射，含未知 slug round-trip；不认识的路径返回 nil）。
+    static func prototypeBlockName(forRelativePath rel: String) -> String? {
+        if let known = knownPrototypeSlots.first(where: { $0.rel == rel }) {
+            return known.block
+        }
+        // 未知 slug：03-prototypes/原型-<slug>.html
+        let prefix = "03-prototypes/原型-"
+        guard rel.hasPrefix(prefix), rel.hasSuffix(".html") else { return nil }
+        let slug = String(rel.dropFirst(prefix.count).dropLast(".html".count))
+        guard isValidSlug(slug) else { return nil }
+        return "prototype-\(slug)"
+    }
+
+    /// slug 合法性：非空 ASCII 字母/数字/连字符/下划线（与 artifact 块名解析口径一致）。
+    private static func isValidSlug(_ slug: String) -> Bool {
+        !slug.isEmpty && slug.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_")
+        }
+    }
+
+    /// 扫描版本目录 03-prototypes/ 下所有可识别的槽位文件（磁盘是事实源），
+    /// 按 默认 → 移动端 → 桌面端 → 平板端 → 未知 slug（字母序）返回；
+    /// 不认识的 .html 跳过（产物台账 / 版本对比走目录扫描，可见性不丢）。
+    static func prototypeSlotFiles(
+        project: String, version: String
+    ) -> [(blockName: String, relPath: String, display: String, url: URL)] {
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+            .appendingPathComponent("03-prototypes", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return []
+        }
+        let htmlNames = Set(entries.filter { $0.hasSuffix(".html") })
+        var results: [(blockName: String, relPath: String, display: String, url: URL)] = []
+        // 已知槽位按固定顺序
+        for slot in knownPrototypeSlots {
+            let filename = slot.rel.split(separator: "/").last.map(String.init) ?? slot.rel
+            guard htmlNames.contains(filename) else { continue }
+            results.append((slot.block, slot.rel, slot.display, dir.appendingPathComponent(filename)))
+        }
+        // 未知 slug 槽位
+        let knownBlocks = Set(knownPrototypeSlots.map(\.block))
+        let unknownFiles = htmlNames
+            .filter { filename in
+                guard let block = prototypeBlockName(forRelativePath: "03-prototypes/\(filename)") else {
+                    return false
+                }
+                return !knownBlocks.contains(block)
+            }
+            .sorted()
+        for filename in unknownFiles {
+            let rel = "03-prototypes/\(filename)"
+            guard let block = prototypeBlockName(forRelativePath: rel),
+                  let slot = prototypeSlot(forBlockName: block) else { continue }
+            results.append((block, rel, slot.display, dir.appendingPathComponent(filename)))
+        }
+        return results
+    }
 }
 
 /// nonisolated：文件系统操作不受默认 MainActor 隔离约束。
@@ -209,8 +300,8 @@ nonisolated enum PMAgentStore {
         let doc = VersionDocument(version: version, scope: scope, inheritedFrom: inheritedFrom)
         try write(doc, to: dir.appendingPathComponent("version.json"))
 
-        // append-only 日志三件套：存在即不覆盖
-        for file in ["decisions.jsonl", "risks.jsonl", "discussions.jsonl", "events.jsonl"] {
+        // append-only 日志清单（决策/风险/会话/事件/变更提案）：存在即不覆盖
+        for file in ["decisions.jsonl", "risks.jsonl", "discussions.jsonl", "events.jsonl", "changes.jsonl"] {
             let url = dir.appendingPathComponent(file)
             if !fm.fileExists(atPath: url.path) {
                 fm.createFile(atPath: url.path, contents: nil)
@@ -250,7 +341,7 @@ nonisolated enum PMAgentStore {
                 try fm.createDirectory(at: d, withIntermediateDirectories: true)
             }
         }
-        for file in ["decisions.jsonl", "risks.jsonl", "discussions.jsonl", "events.jsonl"] {
+        for file in ["decisions.jsonl", "risks.jsonl", "discussions.jsonl", "events.jsonl", "changes.jsonl"] {
             let url = dir.appendingPathComponent(file)
             if !fm.fileExists(atPath: url.path) {
                 guard fm.createFile(atPath: url.path, contents: nil) else {
@@ -274,6 +365,28 @@ nonisolated enum PMAgentStore {
                   !fm.fileExists(atPath: newURL.path) else { continue }
             try? fm.moveItem(at: oldURL, to: newURL)
         }
+    }
+
+    // MARK: - 确认坞静默（「稍后再说」每版本每阶段只弹一次，design.md §6.1）
+
+    /// 已静默闸口持久化文件（版本级、跨启动）：静默纪律不因重启失忆。
+    static func confirmSilenceURL(project: String, version: String) -> URL {
+        versionURL(project: project, version: version).appendingPathComponent("confirm-silence.json")
+    }
+
+    /// 读取已静默的确认闸口阶段 key（clarify / structure / prototype）。
+    /// 缺失或损坏 = 空集（可重建语义：静默丢失只是坞多弹一次，不致命）。
+    static func readConfirmSilence(project: String, version: String) -> Set<String> {
+        guard let stages = try? read(
+            [String].self, at: confirmSilenceURL(project: project, version: version)
+        ) else { return [] }
+        return Set(stages)
+    }
+
+    static func writeConfirmSilence(
+        _ stages: Set<String>, project: String, version: String
+    ) throws {
+        try write(stages.sorted(), to: confirmSilenceURL(project: project, version: version))
     }
 
     // MARK: - 会话附件（图片走文件引用，base64 不落 jsonl）

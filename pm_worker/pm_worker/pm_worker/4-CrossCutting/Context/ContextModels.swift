@@ -78,6 +78,18 @@ nonisolated struct ContextAssembly: Codable, Equatable {
     /// 本次实际注入的技能 id（按相关度降序、过预算裁剪后的口径）——
     /// 思考卡「引用技能」展示的数据源；默认空兼容既有构造点。
     var skillIds: [String] = []
+    /// 技能判定通道结果（混合路由兜底通道；nil = 未调用——本地已命中或未接线）。
+    var skillJudgeReport: SkillJudgeReport? = nil
+}
+
+/// 技能判定通道结果（本地检索零命中时由 classify 档小模型判定；检查器可观测）。
+nonisolated struct SkillJudgeReport: Codable, Equatable {
+    /// 判定查询（发送轮 = 本轮消息；系统轮 = 历史兜底文本）。
+    var query: String
+    /// 是否成功拿到判定（false = 通道不可用：网络/解析失败）。
+    var available: Bool
+    /// 判出的技能名（available 且为空 = 判定为「本轮不需要技能」）。
+    var picked: [String]
 }
 
 /// 分支触发记录（检查器「分支技能触发记录」：竞品分析/毒舌评审等）。

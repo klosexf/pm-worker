@@ -6,10 +6,15 @@
 //  五段组装（规则 / 记忆 / 技能正文 / 检索 / 历史）+ token 预算分配 +
 //  超预算按优先级裁剪；Task 4.8：pitfalls 确定性路由进自检清单，拼到
 //  system prompt 尾部。2026-09-14：技能路由改「意图优先、阶段兜底」——
-//  技能语义命中走 skillQuery（最近用户消息，含本轮），检索零命中才注入
+//  技能语义命中走 skillQuery（发送轮 = 本轮用户消息），检索零命中才注入
 //  阶段钦定锚点技能（每阶段 1 个，PitfallsRouter.stageAnchorSkills）；
 //  旧「阶段关键词全量确定性注入」废弃（高频词滥匹配会压过消息意图）。
-//  命中计数收口为「正文实际进上下文才算」（语义 + 锚点同口径，注入后统一计数）。
+//  2026-09-15 修订（用户钦定「语义为准」+ 判定兜底）：技能正文 = 本地语义命中
+//  （AppModel 发送轮只用本轮消息，不混历史）→ 零命中时由判定通道（classify 档小模型
+//  读技能清单判「本轮真正需要哪些技能」，AppModel.judgeSkills 接线）接住——判空即
+//  不注入（离题 / 闲聊不得被塞阶段技能）；阶段锚点仅在「判定不可用 + 索引无向量」
+//  的链路全断态兜底。
+//  命中计数收口为「正文实际进上下文才算」（语义 + 判定 + 锚点同口径，注入后统一计数）。
 //  AppModel 是唯一调用方（组装结果写回 lastAssembly，检查器 ⌘D 读取）。
 //
 
@@ -70,6 +75,9 @@ final class ContextBuilder: ObservableObject {
     /// - calibration: 记忆校准注入文本（假设态经验条目）
     /// - skillQuery: 技能检索意图查询（最近用户消息含本轮；nil 回退 stageQuery——
     ///   旧行为兼容，AppModel 主线恒传）
+    /// - skillJudge: 技能判定兜底通道（混合路由，2026-09-15 用户钦定）——本地检索
+    ///   零命中时调用，入参（判定查询, 技能清单[(id, when_to_use)]），返回判出的技能名
+    ///   （[] = 判定为不需要技能；nil = 通道不可用）。nil = 未接线（旧行为：零命中退锚点）
     /// - returns: systemPrompt 已含规则/记忆/技能正文/检索四段 + 自检清单 pitfalls；历史段预算见 breakdown
     func assemble(
         stage: LLMStage,
@@ -78,6 +86,7 @@ final class ContextBuilder: ObservableObject {
         skillQuery: String? = nil,
         memoryContext: String,
         calibration: [String],
+        skillJudge: (@MainActor (String, [(id: String, whenToUse: String)]) async -> [String]?)? = nil,
         promptBuilder: (String) -> String
     ) async -> ContextAssembly {
         // ── ① 规则层（Bundle rules/global.md；读不到走内置兜底；常驻永不裁）
@@ -97,28 +106,52 @@ final class ContextBuilder: ObservableObject {
             )) ?? trace
         }
 
-        // ── ③ 技能正文（意图优先 + 阶段兜底）：
-        //    a) 语义命中注入（主通道）：skillQuery 与技能四字段向量的相关度降序，
+        // ── ③ 技能正文（语义为准 + 判定兜底，2026-09-15）：
+        //    a) 本地检索命中注入（零额外开销）：skillQuery 与技能四字段向量的相关度降序，
         //       命中才 loadSkillBody（渐进式披露；Retriever 命中只带 when_to_use 摘要，
         //       doc_path 在此按命中 id 补查）——技能跟消息语义走，不跟阶段走。
-        //    b) 阶段锚点兜底：语义零命中（embedder 失效 / 检索质量差 / 正文全部
-        //       加载失败）时注入该阶段钦定的 1 个锚点技能——保「主干方法论不缺席」，
-        //       但不再无条件常驻（预算压力下锚点排最尾，最先让位）。
-        let docPaths = await Self.skillDocPaths(database: database)
+        //    b) 判定兜底通道：本地零命中时让 classify 档小模型读技能清单判「本轮真正需要
+        //       哪些技能」——口语化说法（「这个按钮放哪」）本地词面兜不住时由它接住；
+        //       判空 = 本轮不需要技能，不注入（离题提问 / 闲聊即此路径，用户钦定）。
+        //    c) 阶段锚点兜底仅限「判定也不可用 + 技能索引无向量」的链路全断态——
+        //       保「主干方法论不因检索失效而缺席」；索引可用或判定可用时都不再锚点。
+        //       预算压力下锚点排最尾，最先让位。
+        let catalog = await Self.skillCatalog(database: database)
         var skillBlocks: [(id: String, body: String)] = []
 
         let skillHits = trace.hits.filter { $0.library == .skills }  // 已按相似度降序
         for hit in skillHits {
-            guard let path = docPaths[hit.id],
-                  let body = Retriever.loadSkillBody(docPath: path),
+            guard let entry = catalog[hit.id],
+                  let body = Retriever.loadSkillBody(docPath: entry.docPath),
                   !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { continue }
             skillBlocks.append((id: hit.id, body: body))
         }
+
+        var judgeReport: SkillJudgeReport?
+        if skillBlocks.isEmpty, let skillJudge {
+            let judgeQuery = skillQuery ?? stageQuery
+            let candidates = catalog
+                .map { (id: $0.key, whenToUse: $0.value.whenToUse) }
+                .sorted { $0.id < $1.id }
+            let picked = await skillJudge(judgeQuery, candidates)
+            judgeReport = SkillJudgeReport(
+                query: judgeQuery, available: picked != nil, picked: picked ?? []
+            )
+            for id in picked ?? [] {
+                guard let entry = catalog[id],
+                      let body = Retriever.loadSkillBody(docPath: entry.docPath),
+                      !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { continue }
+                skillBlocks.append((id: id, body: body))
+            }
+        }
         if skillBlocks.isEmpty,
+           judgeReport?.available != true,
+           trace.skillIndexReady != true,
            let anchorId = PitfallsRouter.stageAnchorSkills[stage],
-           let path = docPaths[anchorId],
-           let body = Retriever.loadSkillBody(docPath: path),
+           let entry = catalog[anchorId],
+           let body = Retriever.loadSkillBody(docPath: entry.docPath),
            !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             skillBlocks.append((id: anchorId, body: body))
         }
@@ -191,7 +224,7 @@ final class ContextBuilder: ObservableObject {
         if !skillBlocks.isEmpty {
             let blocks = skillBlocks.map { "#### 技能：\($0.id)\n\($0.body)" }
                 .joined(separator: "\n\n")
-            sections.append("### 技能正文（按消息意图语义相关度降序；检索零命中时阶段锚点兜底）\n\(blocks)")
+            sections.append("### 技能正文（语义命中 / 判定兜底，命中才注入）\n\(blocks)")
         }
         if !retrievalLines.isEmpty {
             sections.append("### 检索参考（方法论卡片）\n" + retrievalLines.joined(separator: "\n"))
@@ -229,7 +262,8 @@ final class ContextBuilder: ObservableObject {
             calibration: calibration,
             pitfalls: pitfalls,
             createdAt: ISO8601.timestamp(),
-            skillIds: skillBlocks.map(\.id)
+            skillIds: skillBlocks.map(\.id),
+            skillJudgeReport: judgeReport
         )
     }
 
@@ -249,16 +283,19 @@ final class ContextBuilder: ObservableObject {
         return fallbackRules
     }
 
-    /// 技能 doc_path 映射（一次读全量启用技能）。
+    /// 技能清单（一次读全量启用技能）：id →（doc_path, when_to_use）。
+    /// doc_path 供命中 / 判定后加载正文；when_to_use 供判定通道组提示词。
     /// Row 非 Sendable：异步 read 闭包内投影成 Sendable 字典再带出。
-    nonisolated private static func skillDocPaths(database: AppDatabase?) async -> [String: String] {
+    nonisolated private static func skillCatalog(
+        database: AppDatabase?
+    ) async -> [String: (docPath: String, whenToUse: String)] {
         guard let database else { return [:] }
-        return (try? await database.dbQueue.read { db -> [String: String] in
-            var map: [String: String] = [:]
+        return (try? await database.dbQueue.read { db -> [String: (docPath: String, whenToUse: String)] in
+            var map: [String: (docPath: String, whenToUse: String)] = [:]
             for row in try Row.fetchAll(
-                db, sql: "SELECT id, doc_path FROM skills WHERE enabled = 1"
+                db, sql: "SELECT id, doc_path, when_to_use FROM skills WHERE enabled = 1"
             ) {
-                map[row["id"]] = row["doc_path"]
+                map[row["id"]] = (docPath: row["doc_path"], whenToUse: row["when_to_use"])
             }
             return map
         }) ?? [:]

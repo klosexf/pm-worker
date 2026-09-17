@@ -4,8 +4,11 @@
 //
 //  新建任务页（首页，Task 1.2，design.md §5.1.1 v0.9.4 · 对齐原型 v4 Home）：
 //  品牌时刻（PM with Copilot）+ 640 宽大输入卡（卡内工具行：本地 chip /
-//  关联项目 chip / 澄清模型标签 / ⏎ 发送 + 圆形发送按钮）。
+//  关联项目 chip / 版本 chip / 模型标签 / ⏎ 发送 + 圆形发送按钮）。
 //  工具行只放已实装能力——附件/自动流水线/通知未实装，不占位。
+//  2026-09-16 质感 P0（launch center 化）：顶部内容带代替纯黑虚空——
+//  时间问候副标题 / 四意图建议 chips（点击填入草稿）；
+//  输入卡表面改 composerSurface（深色比页面底抬亮一档，与对话页输入坞同令牌）。
 //
 
 import SwiftUI
@@ -32,40 +35,29 @@ struct NewTaskView: View {
     @FocusState private var inputFocused: Bool
     /// IME 组字中（拼音未上屏）：回车确认组字不触发发送（与对话页同策略）
     @State private var imeComposing = false
+    /// 「版本行菜单 → 新建对话」预填流：钦定版本先挂起，待关联项目置入
+    /// 触发的 onChange 重置之后回填（否则会被「项目变更即重置版本」清掉）。
+    @State private var pendingPrefillVersion: String?
 
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: DS.Spacing.s64)
-
-            VStack(spacing: DS.Spacing.s48) {
-                // 品牌时刻（原型 Home：ai_stars + 「PM with Copilot」，Copilot 品牌紫）
-                // 零间距嵌套 HStack 替代弃用的 Text `+` 拼接（macOS 26+）
-                // 高级感升级：编辑级衬线展示字（New York）+ 紧字距——首页杂志时刻
-                HStack(spacing: DS.Spacing.s10) {
-                    DSIcon(.aiStars, size: 30)
-                        .foregroundStyle(Color.brandAccent)
-                    HStack(spacing: 0) {
-                        Text("PM with ")
-                            .foregroundStyle(Color.ink900)
-                            .dsTight()
-                        Text("Copilot")
-                            .foregroundStyle(Color.brandAccent)
-                            .dsTight()
-                    }
+        // launch center（2026-09-16 质感 P0）：垂直居中的内容带代替纯黑虚空——
+        // 品牌 Logo + 时间问候 → 大输入卡 → 建议 chips。视口有富余时上下
+        // Spacer 均分余量居中；窗口过矮时收缩到 64 边距并进入滚动（不裁切）。
+        GeometryReader { viewport in
+            DSScroll {
+                VStack(spacing: 0) {
+                    Spacer(minLength: DS.Spacing.s64)
+                    launchContent
+                    Spacer(minLength: DS.Spacing.s64)
                 }
-                .font(DS.Font.displayLG)
-                .dsFadeIn()
-
-                // 大输入卡（原型：640 宽 · 白底 r12 · 聚焦黑边 · 大软阴影）
-                inputCard
-                    .dsFadeIn()
+                // 内容不足一屏时撑满视口 → Spacer 才有余量可分（居中生效）
+                .frame(minHeight: viewport.size.height, alignment: .center)
+                .frame(maxWidth: .infinity)
             }
-
-            Spacer(minLength: DS.Spacing.s64)
         }
         .frame(minWidth: 480, minHeight: 400)
         .background(Color.surfaceBase)
@@ -73,13 +65,84 @@ struct NewTaskView: View {
         // 无位移单击，按钮与 TextEditor 自行消费点击不受影响）。
         .contentShape(Rectangle())
         .onTapGesture { inputFocused = false }
-        .onAppear { inputFocused = true }
+        .onAppear {
+            inputFocused = true
+            applyPrefillIfNeeded()
+        }
+        // 已在本页时（selection 原值就是 .newTask，视图不重建、onAppear 不触发），
+        // 预填载荷的到达本身作为消费信号
+        .onChange(of: model.newTaskPrefill) { _, prefill in
+            guard prefill != nil else { return }
+            applyPrefillIfNeeded()
+        }
         .onChange(of: associatedProject) { _, _ in
             // 版本强依赖关联项目：项目变更即重置版本选择与内联表单
             selectedVersion = nil
             explicitNoVersion = false
             versionCreateMode = false
+            // 预填流：本次重置之后回填钦定版本（pending 用后即焚）
+            if let version = pendingPrefillVersion {
+                selectedVersion = version
+                explicitNoVersion = false
+                pendingPrefillVersion = nil
+            }
         }
+    }
+
+    /// 居中内容带：品牌 Logo / 时间问候 / 大输入卡 / 建议 chips。
+    private var launchContent: some View {
+        VStack(spacing: 0) {
+            // 品牌时刻（原型 Home：ai_stars + 「PM with Copilot」，Copilot 品牌紫）
+            // 零间距嵌套 HStack 替代弃用的 Text `+` 拼接（macOS 26+）
+            // 高级感升级：编辑级衬线展示字（New York）+ 紧字距——首页杂志时刻
+            HStack(spacing: DS.Spacing.s10) {
+                DSIcon(.aiStars, size: 30)
+                    .foregroundStyle(Color.brandAccent)
+                HStack(spacing: 0) {
+                    Text("PM with ")
+                        .foregroundStyle(Color.ink900)
+                        .dsTight()
+                    Text("Copilot")
+                        .foregroundStyle(Color.brandAccent)
+                        .dsTight()
+                }
+            }
+            .font(DS.Font.displayLG)
+            .dsFadeIn()
+
+            // 时间感知问候副标题（价值主张从 placeholder 解放出来）
+            Text("\(Self.greeting)，今天想推进哪个产品决策？")
+                .font(DS.Font.bodyLG)
+                .foregroundStyle(Color.ink500)
+                .dsFadeIn()
+                .padding(.top, DS.Spacing.s12)
+
+            // 大输入卡（原型：640 宽 · 白底 r12 · 聚焦黑边 · 大软阴影）
+            inputCard
+                .dsFadeIn()
+                .padding(.top, DS.Spacing.s40)
+
+            // 建议 chips（四阶段高频意图，点击整句填入草稿）
+            suggestionChips
+                .dsFadeIn()
+                .padding(.top, DS.Spacing.s24)
+        }
+    }
+
+    /// 消费「版本行菜单 → 新建对话」预填（AppModel.newTaskPrefill，消费即清）：
+    /// 预关联项目 + 版本。项目赋值会经 onChange 重置版本选择，故钦定版本
+    /// 先挂 pending，待重置后回填；项目已一致时无 onChange 可依赖，直接回填。
+    private func applyPrefillIfNeeded() {
+        guard let prefill = model.newTaskPrefill else { return }
+        model.newTaskPrefill = nil
+        if associatedProject == prefill.project {
+            selectedVersion = prefill.version
+            explicitNoVersion = false
+            pendingPrefillVersion = nil
+            return
+        }
+        pendingPrefillVersion = prefill.version
+        associatedProject = prefill.project
     }
 
     // MARK: - 输入卡（textarea 2 行 + 卡内工具行）
@@ -125,13 +188,12 @@ struct NewTaskView: View {
                         return .handled
                     }
 
-                // 占位在聚焦（光标出现）时即消失，与对话页输入框交互一致
+                // 占位在聚焦（光标出现）时即消失，与对话页输入框交互一致；
+                // AA 达标占位色 composerPlaceholder（价值主张已上移到问候句 + 建议 chips）
                 if draft.isEmpty && !inputFocused {
-                    Text(
-                        "说说你的产品想法——帮你澄清需求、调研竞品、撰写 PRD、生成可点击原型，交付带门禁质量分的完整方案。"
-                    )
+                    Text("说说你的产品想法，或直接粘贴需求材料……")
                     .font(DS.Font.bodyBase)
-                    .foregroundStyle(Color.ink300)
+                    .foregroundStyle(Color.composerPlaceholder)
                     // TextEditor 内建 inset 约 (5, 8)，加上卡内 16/16 对齐
                     .padding(.leading, DS.Spacing.s16 + 5)
                     .padding(.top, DS.Spacing.s16 + 8)
@@ -159,9 +221,11 @@ struct NewTaskView: View {
         } action: { width in
             cardWidth = width
         }
+        // 深色海拔：composerSurface（比页面底 #0D0D0F 抬亮一档 #161618）——
+        // 与对话页输入坞同令牌；surfaceBase 会让卡与底同色零分层（深色下阴影不可见）
         .background(
             RoundedRectangle(cornerRadius: DS.Radius.xxl)
-                .fill(Color.surfaceBase)
+                .fill(Color.composerSurface)
         )
         .overlay(
             RoundedRectangle(cornerRadius: DS.Radius.xxl)
@@ -247,6 +311,47 @@ struct NewTaskView: View {
         .help("发送，开始任务")
     }
 
+    // MARK: - Launch center（建议 chips）
+
+    /// 时间感知问候（早上好/中午好/下午好/晚上好）。
+    private static var greeting: String {
+        switch Calendar.current.component(.hour, from: Date()) {
+        case 5..<11: return "早上好"
+        case 11..<13: return "中午好"
+        case 13..<18: return "下午好"
+        default: return "晚上好"
+        }
+    }
+
+    /// 四个高频意图建议（澄清 / 竞品调研 / 原型 / PRD）：整句点击填入草稿，
+    /// 是首页的「能力陈列」——placeholder 不再承担价值主张。
+    private static let suggestions: [(icon: DSIcon.Name, text: String)] = [
+        (.lightBulb, "帮我澄清一个模糊的产品想法"),
+        (.search, "调研竞品并输出对比分析"),
+        (.code, "把想法做成可点击的原型"),
+        (.doc, "为当前方案撰写一份 PRD"),
+    ]
+
+    /// 建议 chips（2×2，与输入卡同 640 列宽对齐）。
+    private var suggestionChips: some View {
+        LazyVGrid(
+            columns: [
+                GridItem(.flexible(), spacing: DS.Spacing.s8),
+                GridItem(.flexible(), spacing: DS.Spacing.s8),
+            ],
+            spacing: DS.Spacing.s8
+        ) {
+            ForEach(Array(Self.suggestions.enumerated()), id: \.offset) { _, item in
+                SuggestionChip(icon: item.icon, text: item.text) {
+                    draft = item.text
+                    inputFocused = true
+                }
+            }
+        }
+        .frame(maxWidth: 640)
+        .padding(.horizontal, DS.Spacing.s24)
+    }
+
     // MARK: - chips（展开行：环境 + 项目）
 
     /// 运行环境 chip（本地优先是产品特性）。
@@ -289,9 +394,11 @@ struct NewTaskView: View {
             }
             .padding(.horizontal, DS.Spacing.s8)
             .padding(.vertical, DS.Spacing.s3)
+            // 透明底（与共用 Composer 按钮 .clear 底一致）：深色 composerSurface
+            // 卡上不再出现凹进黑块，浅色观感不变（白卡上白 chip）
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.md)
-                    .fill(Color.surfaceBase)
+                    .fill(Color.clear)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: DS.Radius.md)
@@ -423,9 +530,11 @@ struct NewTaskView: View {
             }
             .padding(.horizontal, DS.Spacing.s8)
             .padding(.vertical, DS.Spacing.s3)
+            // 透明底（与共用 Composer 按钮 .clear 底一致）：深色 composerSurface
+            // 卡上不再出现凹进黑块，浅色观感不变（白卡上白 chip）
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.md)
-                    .fill(Color.surfaceBase)
+                    .fill(Color.clear)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: DS.Radius.md)
@@ -729,5 +838,46 @@ private struct RecentFolderRow: View {
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
         .animation(DS.Motion.springFast, value: hovered)
+    }
+}
+
+/// 建议 chip（launch center）：图标 + 整句意图，点击填入首页输入卡草稿并聚焦。
+/// overlayL1 底 + 发丝边，hover 提亮（overlayL2 · 图标/箭头 brandAccent）。
+private struct SuggestionChip: View {
+    let icon: DSIcon.Name
+    let text: String
+    let action: () -> Void
+
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: DS.Spacing.s8) {
+                DSIcon(icon, size: 14)
+                    .foregroundStyle(hovered ? Color.brandAccent : Color.ink500)
+                Text(text)
+                    .font(DS.Font.bodySM)
+                    .foregroundStyle(hovered ? Color.ink900 : Color.ink700)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                DSIcon(.arrowRight, size: 11)
+                    .foregroundStyle(hovered ? Color.brandAccent : Color.ink300)
+            }
+            .padding(.horizontal, DS.Spacing.s12)
+            .padding(.vertical, DS.Spacing.s10)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
+                    .fill(hovered ? Color.overlayL2 : Color.overlayL1)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
+                    .strokeBorder(Color.borderL1, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .animation(DS.Motion.springFast, value: hovered)
+        .help("点击填入输入框，补充细节后发送")
     }
 }

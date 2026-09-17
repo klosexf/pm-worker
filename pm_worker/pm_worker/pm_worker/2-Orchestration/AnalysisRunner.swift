@@ -21,6 +21,24 @@ final class AnalysisRunner: ObservableObject {
         return keywords.contains { text.localizedCaseInsensitiveContains($0) }
     }
 
+    // MARK: - 分支执行前确认（意图误触发防护，design.md §12）
+
+    /// 「分支执行前先确认」持久化 key（UserDefaults：UI 偏好不入 ~/PMAgent 产品数据目录）。
+    static let confirmBeforeRunKey = "pm.worker.branch.confirmBeforeRun"
+
+    /// 意图命中后是否先弹分支确认卡（默认开：关键词是粗筛，闲聊/表述都可能误命中，
+    /// 直接后台联网执行代价大；设置 → 通用可关，关 = 命中即直接执行）。
+    static var confirmBeforeRunEnabled: Bool {
+        UserDefaults.standard.object(forKey: confirmBeforeRunKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: confirmBeforeRunKey)
+    }
+
+    /// 唯一写入路径（设置开关写穿；仅在窗口构建 / 发送分流 / 设置行读写，非热路径）。
+    static func setConfirmBeforeRun(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: confirmBeforeRunKey)
+    }
+
     /// 运行竞品分析：搜索（可配）→ 抓正文 → LLM 五要素分析 → 落盘 05-analysis/竞品分析.md。
     /// - Returns: 产物 URL；模型未按协议输出有效 analysis 块时返回 nil。
     func run(

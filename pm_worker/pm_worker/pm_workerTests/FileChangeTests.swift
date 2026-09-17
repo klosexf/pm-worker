@@ -144,7 +144,11 @@ final class FileChangeTests: XCTestCase {
             project: project, version: version
         )
         let written = try XCTUnwrap(result)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: written.url.path))
+        XCTAssertEqual(written.slots.map(\.relPath), [ArtifactPath.prototype])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: PMAgentStore.versionURL(project: project, version: version)
+                .appendingPathComponent(ArtifactPath.prototype).path
+        ))
         let change = try XCTUnwrap(written.changes.first)
         XCTAssertEqual(change.path, ArtifactPath.prototype)
         XCTAssertTrue(change.isNew)
@@ -168,6 +172,130 @@ final class FileChangeTests: XCTestCase {
         // LCS（"<html>","</html>"）= 2 → 新增 2 行、删除 1 行
         XCTAssertEqual(change.added, 2)
         XCTAssertEqual(change.removed, 1)
+    }
+
+    // MARK: - ③ 多端槽位落盘（prototype / prototype-<slug> 分端块）
+
+    private func block(_ name: String, _ html: String) -> ArtifactParser.ArtifactBlock {
+        .init(name: name, content: html)
+    }
+
+    func testMultiSlotPrototypeWritesSeparateFiles() throws {
+        let result = try ArtifactParser.writePrototypeArtifact(
+            blocks: [
+                block("prototype-mobile", "<html>m</html>"),
+                block("prototype-desktop", "<html>d</html>"),
+            ],
+            project: project, version: version
+        )
+        let written = try XCTUnwrap(result)
+        XCTAssertEqual(written.changes.count, 2)
+        XCTAssertEqual(
+            written.slots.map(\.relPath),
+            ["03-prototypes/移动端原型.html", "03-prototypes/桌面端原型.html"]
+        )
+        XCTAssertEqual(
+            written.slots.map(\.display),
+            ["交互原型 · 移动端", "交互原型 · 桌面端"]
+        )
+        XCTAssertTrue(written.changes.allSatisfy(\.isNew))
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        XCTAssertEqual(
+            try String(contentsOf: dir.appendingPathComponent("03-prototypes/移动端原型.html"),
+                       encoding: .utf8),
+            "<html>m</html>"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: dir.appendingPathComponent("03-prototypes/桌面端原型.html"),
+                       encoding: .utf8),
+            "<html>d</html>"
+        )
+    }
+
+    func testDuplicatePrototypeBlockFirstWins() throws {
+        let result = try ArtifactParser.writePrototypeArtifact(
+            blocks: [
+                block("prototype-mobile", "<html>first</html>"),
+                block("prototype-mobile", "<html>second</html>"),
+            ],
+            project: project, version: version
+        )
+        let written = try XCTUnwrap(result)
+        XCTAssertEqual(written.changes.count, 1)
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        XCTAssertEqual(
+            try String(contentsOf: dir.appendingPathComponent("03-prototypes/移动端原型.html"),
+                       encoding: .utf8),
+            "<html>first</html>"
+        )
+    }
+
+    func testUnknownSlugSlotUsesGenericFilename() throws {
+        let result = try ArtifactParser.writePrototypeArtifact(
+            blocks: [block("prototype-watch", "<html>w</html>")],
+            project: project, version: version
+        )
+        let written = try XCTUnwrap(result)
+        XCTAssertEqual(written.slots.first?.relPath, "03-prototypes/原型-watch.html")
+        XCTAssertEqual(written.slots.first?.display, "交互原型 · watch")
+    }
+
+    func testMixedDefaultAndPerPlatformBlocksAllWritten() throws {
+        // prompt 已禁止混出；一旦混出仍全部落盘（按块名各落各文件，不静默丢弃）
+        let result = try ArtifactParser.writePrototypeArtifact(
+            blocks: [
+                block("prototype", "<html>base</html>"),
+                block("prototype-mobile", "<html>m</html>"),
+            ],
+            project: project, version: version
+        )
+        let written = try XCTUnwrap(result)
+        XCTAssertEqual(written.changes.count, 2)
+        XCTAssertEqual(
+            written.slots.map(\.relPath),
+            [ArtifactPath.prototype, "03-prototypes/移动端原型.html"]
+        )
+    }
+
+    func testNoPrototypeBlockReturnsNil() throws {
+        XCTAssertNil(try ArtifactParser.writePrototypeArtifact(
+            blocks: [block("architecture", "graph TD\nA-->B")],
+            project: project, version: version
+        ))
+    }
+
+    func testPrototypeSlotMappingRoundTrip() {
+        // 已知槽位正反双向
+        for slot in ArtifactPath.knownPrototypeSlots {
+            XCTAssertEqual(
+                ArtifactPath.prototypeSlot(forBlockName: slot.block)?.relPath, slot.rel
+            )
+            XCTAssertEqual(ArtifactPath.prototypeBlockName(forRelativePath: slot.rel), slot.block)
+        }
+        // 未知 slug round-trip；非法 slug（路径注入）拒绝
+        XCTAssertEqual(
+            ArtifactPath.prototypeSlot(forBlockName: "prototype-watch")?.relPath,
+            "03-prototypes/原型-watch.html"
+        )
+        XCTAssertEqual(
+            ArtifactPath.prototypeBlockName(forRelativePath: "03-prototypes/原型-watch.html"),
+            "prototype-watch"
+        )
+        // 多方案对比槽位：中文文件名 + 方案显示名
+        XCTAssertEqual(
+            ArtifactPath.prototypeSlot(forBlockName: "prototype-plan-a")?.relPath,
+            "03-prototypes/原型-方案A.html"
+        )
+        XCTAssertEqual(
+            ArtifactPath.prototypeSlot(forBlockName: "prototype-plan-a")?.display,
+            "交互原型 · 方案 A"
+        )
+        XCTAssertNil(ArtifactPath.prototypeSlot(forBlockName: "prototype-../x"))
+        XCTAssertNil(ArtifactPath.prototypeSlot(forBlockName: "prototype-"))
+        XCTAssertNil(ArtifactPath.prototypeSlot(forBlockName: "prd"))
+        XCTAssertFalse(ArtifactPath.isPrototypeBlock("prd"))
+        XCTAssertTrue(ArtifactPath.isPrototypeBlock("prototype"))
+        XCTAssertTrue(ArtifactPath.isPrototypeBlock("prototype-mobile"))
     }
 
     func testStructureWriteReturnsThreeChangeSummaries() throws {

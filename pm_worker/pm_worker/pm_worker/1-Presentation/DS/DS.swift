@@ -208,6 +208,27 @@ nonisolated enum AppearanceMode: String, CaseIterable, Identifiable {
         let mode = AppearanceMode(rawValue: raw ?? "") ?? .system
         NSApplication.shared.appearance = mode.appKitAppearanceName.flatMap { NSAppearance(named: $0) }
     }
+
+    /// 外观偏好变更广播。**视图侧只订阅这条自定义通知，绝不观察 UserDefaults**：
+    /// SwiftUI 的 WindowGroup 在每次窗口 resize（frame 自动保存）时都会写
+    /// UserDefaults 并同步派发 didChangeNotification，任何 UserDefaults 观察
+    /// （@AppStorage / didChangeNotification）都会逐帧触发一次 CFPreferences
+    /// search-list 合并读取（采样实测占 resize 每帧成本一半以上——拖拽边框卡顿主因）。
+    static let changedNotification = Notification.Name("pm.worker.appearance.changed")
+
+    /// 当前持久化偏好（只在窗口构建 / 设置弹框初始化时读，热路径不读）。
+    static func currentRawValue() -> String {
+        UserDefaults.standard.string(forKey: storageKey) ?? AppearanceMode.system.rawValue
+    }
+
+    /// 唯一写入路径：持久化 + 应用外观 + 广播（设置弹框改外观走这里）。
+    @MainActor
+    static func setAppearance(_ raw: String) {
+        let mode = AppearanceMode(rawValue: raw) ?? .system
+        UserDefaults.standard.set(mode.rawValue, forKey: storageKey)
+        applyAppKitAppearance(mode.rawValue)
+        NotificationCenter.default.post(name: changedNotification, object: mode.rawValue)
+    }
 }
 
 /// 外观应用修饰符：读外观偏好 → 驱动应用级 appearance（NSApplication.shared）+ 切换过渡动画（0.28s 交叉淡化）。
@@ -219,15 +240,23 @@ nonisolated enum AppearanceMode: String, CaseIterable, Identifiable {
 /// defaults 写 dark 启动仍全浅色）。改用 AppKit 单一事实源 NSApplication.shared.appearance：
 /// 应用级覆盖所有窗口（含后开窗口）与浮层，材质/动态颜色/环境 colorScheme 全链路生效。
 private struct AppAppearanceModifier: ViewModifier {
-    @AppStorage(AppearanceMode.storageKey) private var rawValue: String = AppearanceMode.system.rawValue
+    /// 外观偏好镜像：初值在窗口构建时读一次，之后只跟着自定义通知走——
+    /// **热路径（resize 每帧重算 body）零 UserDefaults 读取**。
+    /// 反面教材见 AppearanceMode.changedNotification 注释：直接观察 UserDefaults
+    /// 会被 SwiftUI 的窗口 frame 自动保存逐帧唤醒，每次读取走 CFPreferences
+    /// search-list 合并慢路径，是拖拽边框卡顿的主因。
+    @State private var rawValue: String = AppearanceMode.currentRawValue()
 
     func body(content: Content) -> some View {
         content
             // rawValue 变化 → 窗口外观切换 → 令牌重解析 → 子树颜色交叉淡化（非颜色属性不受影响）
             .animation(.easeInOut(duration: 0.28), value: rawValue)
             .onAppear { AppearanceMode.applyAppKitAppearance(rawValue) }
-            .onChange(of: rawValue) { _, newValue in
-                AppearanceMode.applyAppKitAppearance(newValue)
+            .onReceive(
+                NotificationCenter.default.publisher(for: AppearanceMode.changedNotification)
+            ) { note in
+                guard let latest = note.object as? String else { return }
+                rawValue = latest
             }
     }
 }
@@ -258,6 +287,8 @@ enum DS {
         static let s32: CGFloat = 32
         static let s40: CGFloat = 40
         static let s48: CGFloat = 48
+        /// 2026-09 对话呼吸感改版：轮与轮间距（HTML 方案 B+C 定稿值）。
+        static let s52: CGFloat = 52
         static let s64: CGFloat = 64
     }
 
@@ -270,6 +301,11 @@ enum DS {
         static let xl: CGFloat = 10
         static let xxl: CGFloat = 12
         static let big: CGFloat = 16
+        /// 2026-09 呼吸感改版新增（阶梯语义名之外的大圆角，数值自释）：
+        /// 产物卡。
+        static let r18: CGFloat = 18
+        /// 用户气泡 / 输入坞。
+        static let r20: CGFloat = 20
         static let full: CGFloat = 999
     }
 
@@ -286,6 +322,8 @@ enum DS {
         static let bodyMDStrong = SwiftUI.Font.system(size: 14, weight: .medium)
         static let bodyBase = SwiftUI.Font.system(size: 15, weight: .regular)
         static let bodyBaseStrong = SwiftUI.Font.system(size: 15, weight: .medium)
+        /// 对话注脚行（2026-09 呼吸感改版：摘要条降噪）。
+        static let bodyFootnote = SwiftUI.Font.system(size: 12.5)
         /// 对话阅读字号（2026-09-13 方案 B「清晰梯度」：17 → 15 收敛正文——
         /// 17 与表格 15 并置是「忽大忽小」的根源之一；层级改由导语 / 章节 /
         /// 表格的收敛阶梯承担，见 DS.Typography 对话令牌组与 MarkdownText 映射。
@@ -308,6 +346,8 @@ enum DS {
         static let displayLG = SwiftUI.Font.system(size: 34, weight: .semibold, design: .serif)
         /// 档案索引衬线小号（侧栏任务列表项目行 · 档案方案）：display 系最小档。
         static let display2XS = SwiftUI.Font.system(size: 15, weight: .semibold, design: .serif)
+        /// 对话内 Markdown 章节标题（2026-09 呼吸感改版）：display 系中档。
+        static let displaySM = SwiftUI.Font.system(size: 19, weight: .semibold, design: .serif)
 
         /// 等宽（--code-editor：JetBrains Mono 打包进 bundle · OFL 许可 ·
         /// pm_workerApp.init 显式注册；非拉丁字符自动级联系统字体（中文回落苹方））。
@@ -341,26 +381,42 @@ enum DS {
         static let tableRatio: CGFloat = 1.45
         /// 中文正文微字距（+0.2）：字与字之间轻微透气，去挤压感。
         static let bodyTracking: CGFloat = 0.2
-        /// 段落间距（Markdown block 间）：≈0.82 行高@17pt——段落分组感清晰不散。
+        /// 段落间距（Markdown block 间）：2026-09-15 方案 A「阅读栏 · 刻度阶梯」
+        /// 18 → 22——段距须显著大于行距，否则段落粘连成一整块文字墙。
         ///（排版节奏值，非布局网格——不在 DS.Spacing 阶梯内）
-        static let paragraphSpacing: CGFloat = 14
-        /// Markdown 标题上方额外间距（叠加在 paragraphSpacing 之上 → 实际 26 ≈ 1.05 行高）：
+        static let paragraphSpacing: CGFloat = 22
+        /// Markdown 标题上方额外间距（叠加在 paragraphSpacing 之上 → 实得 34）：
         /// 标题「上远下近」倒挂节奏——远离上文、贴近所辖内容。
         static let headingTop: CGFloat = DS.Spacing.s12
+        /// Markdown 标题下方间距（方案 A 新增）：实得 34 : 8 ≈ 4:1 的倒挂比，
+        /// 标题明确贴住它所辖的内容。
+        static let headingBottom: CGFloat = DS.Spacing.s8
         /// 列表行间距。
-        static let listRowSpacing: CGFloat = DS.Spacing.s8
+        static let listRowSpacing: CGFloat = DS.Spacing.s6
+        /// 列表悬挂缩进（方案 A 新增）：标记列定宽，文本列自 22 起排——
+        /// 换行回到文本列而不是第 0 列，长条目才读得成「一条」。
+        static let listHangingIndent: CGFloat = 22
 
-        // 对话 Markdown 排版（2026-09-13 方案 B「清晰梯度」）：
-        // 层级 = 收敛字号阶梯 + 样式差协同，替代旧六级 1px 微差梯度——
-        // 16 导语（首段加粗 / h1·h2）/ 15 正文与章节（h3·h4 带品牌刻度线）/
-        // 13 小节标签（h5·h6 次级色）/ 13.5 表格 / 12.5 行内代码 / 13 代码块。
-        // 规则：相邻可见级差 ≥1px 且必伴一样样式差（刻度线 / 颜色 / 字重）。
-        /// 对话正文行高比例（比全局 body 1.45 宽松一档，15pt 长读舒适线）。
-        static let chatRatio: CGFloat = 1.62
-        /// 导语 / 结论行（消息首段含加粗，或 h1 / h2）。
+        // 对话 Markdown 排版（2026-09-13 方案 B「清晰梯度」→ 2026-09-15 呼吸感改版
+        // → 2026-09-15 方案 A「阅读栏 · 刻度阶梯」）：层级 = 字级刻度阶梯 + 样式差
+        // 协同 + 阅读栏宽——26 / 21 衬线章节 / 17 / 15 条目标题 / 13 小节标签 /
+        // 15 正文 / 13.5 表格 / 12.5 行内代码 / 13 代码块。
+        // 规则：相邻可见级差 ≥2pt 且必伴一样样式差（衬线在 h3 退场、刻度线随 h4、
+        // 颜色 / 字重）。
+        /// 对话正文行高比例（呼吸感改版 1.62 → 1.78；方案 A 1.78 → 1.72——
+        /// 行宽收窄到阅读栏后行数增多，行距略收，整段高度不至于失控）。
+        static let chatRatio: CGFloat = 1.72
+        /// 对话正文阅读栏宽度上限（方案 A 新增）：散文（标题 / 段落 / 列表 / 引用 /
+        /// 分隔线）自适应宽度 640——CJK ≈42 字。列宽 720 时每行约 48 字，超出
+        /// 30–40 字舒适区，回行容易丢行。表格 / 代码 / 图表不入阅读栏（数据块需要
+        /// 横向空间）——「读的」与「看的」两条宽度线。
+        static let chatMeasure: CGFloat = 640
+        /// 导语 / 结论行（消息首段含加粗）。
         static let chatLeadSize: CGFloat = 16
-        /// 章节标题（h3 / h4，前置 3×13 品牌刻度线）。
-        static let chatSectionSize: CGFloat = 15
+        /// 标题字级阶梯（h1…h6，方案 A「刻度阶梯」）：h1 / h2 衬线章节标题，
+        /// h3 起退场回无衬线条目档。取代原 chatHeadingSize（h1–h4 同为 19——
+        /// AI 大量使用 ## 与 ###，排出来却分不出「章」与「条」）。
+        static let chatHeadingLadder: [CGFloat] = [26, 21, 17, 15, 13, 13]
         /// 小节标签（h5 / h6，次级色）。
         static let chatLabelSize: CGFloat = 13
         /// 表格单元格字号（表头再小一档）。
@@ -394,8 +450,8 @@ extension Text {
 
 // MARK: - 高度令牌（Xcode 纪律：窗内零影，投影只属于模态）
 
-/// 浮起层级：贴地卡片 < 浮层 < 弹框。
-enum DSElevation { case card, floating, overlay }
+/// 浮起层级：贴地卡片 < 浮层 < 弹框 < 输入坞。
+enum DSElevation { case card, floating, overlay, dock }
 
 extension View {
     /// 分层阴影（2026-09-12 Xcode 质感 P0-③ 降档）：窗内内容零投影——层次由
@@ -411,6 +467,11 @@ extension View {
             shadow(color: Color.shadowInk.opacity(0.05), radius: 8, y: 2)
         case .overlay:   // 弹框 / 抽屉 / 菜单（最强层级）：单一黑影
             shadow(color: Color.shadowInk.opacity(0.22), radius: 16, y: 6)
+        case .dock:      // 输入坞 / 大浮层：双层大软阴影（2026-09 呼吸感改版，
+                         // 参数沿 DSMenu 原型投影 0 12/32 12% + 0 2/8 8%）
+            self
+                .shadow(color: Color.shadowInk.opacity(0.12), radius: 32, y: 12)
+                .shadow(color: Color.shadowInk.opacity(0.08), radius: 8, y: 2)
         }
     }
 }

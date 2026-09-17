@@ -68,34 +68,65 @@ nonisolated enum ArtifactParser {
         var content: String
     }
 
-    /// 解析 ```artifact:<name> ... ``` 围栏块。
+    // MARK: 闭合围栏口径（嵌套围栏安全协议）
+
+    /// artifact 块解析共用正则：开栏反引号数 ≥3（PRD 等需内嵌围栏的产物用四反引号），
+    /// 闭栏必须是「独行反引号围栏行且反引号数 = 开栏」（CommonMark：闭合围栏不得带
+    /// info string）。如此 ```text / ```mermaid 等三反引号内嵌围栏（PRD 线框图）属于
+    /// 正文，不会提前闭合产物块——旧正则 lazy 到第一个 ``` 就闭栏，任何带线框图的
+    /// PRD 都会在第一张图处被截断，后续章节游离在块外落不了盘。
+    /// lookbehind (?<!`)：禁止从更长反引号串的中间起配（四反引号块闭栏丢失时不得
+    /// 退化为三反引号解析，否则截断块会绕过 prdTruncatedDraft 草稿兜底）。
+    /// 捕获组：1 = 开栏围栏，2 = 块名，3 = 正文。
+    private static let artifactBlockPattern =
+        "(?sm)(?<!`)(`{3,})artifact:([a-zA-Z0-9_-]+)[ \\t]*\\n(.*?)^[ \\t]*\\1[ \\t]*(?=$|\\n)"
+
+    /// 文本中是否存在「独行反引号围栏行且反引号数 ≥ minLength」
+    /// （parseIncompleteArtifact 的流式闭栏口径，与 artifactBlockPattern 一致）。
+    static func containsClosingFence(_ text: String, minLength: Int) -> Bool {
+        text.split(separator: "\n", omittingEmptySubsequences: false).contains { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.count >= minLength && trimmed.allSatisfy { $0 == "`" }
+        }
+    }
+
+    /// 解析 ```artifact:<name> / ````artifact:<name> ... 围栏块。
     static func parseArtifactBlocks(in text: String) -> [ArtifactBlock] {
         var results: [ArtifactBlock] = []
-        // (?s) dot-all；标记在围栏语言位
-        let pattern = "(?s)```artifact:([a-zA-Z0-9_-]+)[ \\t]*\\n(.*?)```"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        guard let regex = try? NSRegularExpression(pattern: artifactBlockPattern) else {
+            return []
+        }
         let ns = text as NSString
         let matches = regex.matches(
             in: text, range: NSRange(location: 0, length: ns.length)
         )
-        for match in matches where match.numberOfRanges >= 3 {
-            let name = ns.substring(with: match.range(at: 1))
-            let body = ns.substring(with: match.range(at: 2))
+        for match in matches where match.numberOfRanges >= 4 {
+            let name = ns.substring(with: match.range(at: 2))
+            let body = ns.substring(with: match.range(at: 3))
             results.append(ArtifactBlock(name: name, content: body.dropTrailingNewline()))
         }
         return results
     }
 
-    /// 流式中未闭合的 artifact 围栏（最后一个 ```artifact: 标记到文末无闭合 ```）。
+    /// 流式中未闭合的 artifact 围栏（最后一个 ```artifact: 标记到文末无闭合围栏）。
     /// 返回块名与已生成正文；nil = 无进行中的产物块（块已完成或后续还有正文）。
     /// 用途：流式渲染时收起进行中的长代码；隐藏哪些块名由调用方按策略过滤
     /// （prototype / prd 收进进度卡，其余文字型产物保留原文流式）。
+    /// 闭栏口径与 parseArtifactBlocks 一致：独行反引号围栏行且反引号数 ≥ 开栏
+    /// （四反引号产物块内的 ```text / 裸 ``` 三反引号围栏都是正文，不闭栏）。
     static func parseIncompleteArtifact(
         in text: String
     ) -> (name: String, partial: String)? {
+        // 向后找标记；开栏可能是更长反引号（````artifact:），把前缀反引号数齐定闭栏长度
         guard let marker = text.range(of: "```artifact:", options: .backwards) else {
             return nil
         }
+        var fenceStart = marker.lowerBound
+        while fenceStart > text.startIndex,
+              text[text.index(before: fenceStart)] == "`" {
+            fenceStart = text.index(before: fenceStart)
+        }
+        let openingLength = text.distance(from: fenceStart, to: marker.lowerBound) + 3
         let afterMarker = text[marker.upperBound...]
         // 块名尚未流完（标记后还没有换行）→ 视为刚开始生成，正文为空
         guard let newline = afterMarker.firstIndex(of: "\n") else {
@@ -107,9 +138,38 @@ nonisolated enum ArtifactParser {
               name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") })
         else { return nil }
         let body = String(afterMarker[afterMarker.index(after: newline)...])
-        // 已出现闭合围栏 → 该块已完成（后续可能有正文），不算进行中
-        guard !body.contains("```") else { return nil }
+        // 已出现闭栏围栏 → 该块已完成（后续可能有正文），不算进行中
+        guard !containsClosingFence(body, minLength: openingLength) else { return nil }
         return (name: name, partial: body)
+    }
+
+    // MARK: 占位模仿残留清洗
+
+    /// 模型把历史回灌占位当格式模仿的残留特征串（两次实测：2026-09-15 抄
+    /// 「（产物已生成并落盘）」伪造落盘声明；2026-09-16 整句照抄反模仿标注）。
+    /// 这些串是系统私有文案，业务正文不会合法包含，含任一特征的整行删除。
+    /// （前缀匹配同时覆盖展示态长占位「（产物已生成并落盘——点击下方标签预览…）」。）
+    nonisolated static let imitationMarkerPrefixes: [String] = [
+        "【历史回复中的产物块已剥离省略",
+        "（产物已生成并落盘",
+    ]
+
+    /// 清洗回复正文里的占位模仿残留（整行删除 + 收敛连续空行）。
+    /// 消费点 = 历史回灌 / 气泡展示 / 抽取底稿等所有读取侧；落盘原文不动
+    /// （文件系统仍是事实源），已污染的旧会话条目读取时同样受益。
+    static func scrubImitatedPlaceholders(in text: String) -> String {
+        guard imitationMarkerPrefixes.contains(where: { text.contains($0) }) else {
+            return text
+        }
+        let cleaned = text
+            .components(separatedBy: "\n")
+            .filter { line in !imitationMarkerPrefixes.contains(where: { line.contains($0) }) }
+            .joined(separator: "\n")
+        var result = cleaned
+        while result.contains("\n\n\n") {
+            result = result.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+        return result
     }
 
     /// 从回复中剥离 artifact 块后的正文（对用户展示）。
@@ -121,16 +181,17 @@ nonisolated enum ArtifactParser {
         placeholder: String = "（产物已生成并落盘）",
         placeholderFor: ((String) -> String?)? = nil
     ) -> String {
-        let pattern = "(?s)```artifact:([a-zA-Z0-9_-]+)[ \\t]*\\n.*?```"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        guard let regex = try? NSRegularExpression(pattern: artifactBlockPattern) else {
+            return text
+        }
         let ns = text as NSString
         let matches = regex.matches(
             in: text, range: NSRange(location: 0, length: ns.length)
         )
         var result = text
         // 从后往前逐块替换：前面区间的 range 在已替换串中仍然有效
-        for match in matches.reversed() where match.numberOfRanges >= 2 {
-            let name = ns.substring(with: match.range(at: 1))
+        for match in matches.reversed() where match.numberOfRanges >= 3 {
+            let name = ns.substring(with: match.range(at: 2))
             let ph = placeholderFor?(name) ?? placeholder
             result = (result as NSString).replacingCharacters(
                 in: match.range(at: 0), with: ph
@@ -233,19 +294,44 @@ nonisolated enum ArtifactParser {
         return Set(["architecture", "core-flows", "module-page-map"]).isSubset(of: names)
     }
 
-    /// 原型 HTML 落盘到 03-prototypes/可点击原型.html（附变更摘要）。
+    /// 多端原型落盘结果：逐槽位（块名 / 相对路径 / 显示名）+ 全部文件变更摘要。
+    nonisolated struct PrototypeArtifacts: Equatable {
+        struct Slot: Equatable {
+            var blockName: String
+            var relPath: String
+            var display: String
+        }
+        var slots: [Slot]
+        var changes: [FileChangeSummary]
+    }
+
+    /// 原型 HTML 落盘：原型类块（artifact:prototype / prototype-<slug> 分端槽位）
+    /// 逐块落独立文件（按回复中出现顺序，同名块 first-wins，附行级变更摘要）；
+    /// 零合法块（无原型块 / 内容不含 "<"）返回 nil。部分截断天然降级：
+    /// parseArtifactBlocks 只收已闭合块，闭合的槽位照常落盘，未闭合的由调用方单独提示。
     @discardableResult
     static func writePrototypeArtifact(
         blocks: [ArtifactBlock], project: String, version: String
-    ) throws -> (url: URL, changes: [FileChangeSummary])? {
-        guard let html = blocks.first(where: { $0.name == "prototype" })?.content,
-              html.contains("<") else { return nil }
-        let url = PMAgentStore.versionURL(project: project, version: version)
-            .appendingPathComponent(ArtifactPath.prototype)
-        let change = try writeMeasured(
-            html, to: url, relativePath: ArtifactPath.prototype
-        )
-        return (url: url, changes: [change])
+    ) throws -> PrototypeArtifacts? {
+        var seen = Set<String>()
+        var ordered: [(name: String, html: String)] = []
+        for block in blocks where ArtifactPath.isPrototypeBlock(block.name) {
+            guard block.content.contains("<"), !seen.contains(block.name) else { continue }
+            seen.insert(block.name)
+            ordered.append((block.name, block.content))
+        }
+        guard !ordered.isEmpty else { return nil }
+        var slots: [PrototypeArtifacts.Slot] = []
+        var changes: [FileChangeSummary] = []
+        for (name, html) in ordered {
+            guard let slot = ArtifactPath.prototypeSlot(forBlockName: name) else { continue }
+            let url = PMAgentStore.versionURL(project: project, version: version)
+                .appendingPathComponent(slot.relPath)
+            let change = try writeMeasured(html, to: url, relativePath: slot.relPath)
+            slots.append(.init(blockName: name, relPath: slot.relPath, display: slot.display))
+            changes.append(change)
+        }
+        return PrototypeArtifacts(slots: slots, changes: changes)
     }
 
     // MARK: - M3：漏项雷达 / 决策 WHY / 评分卡 / PRD
@@ -258,7 +344,7 @@ nonisolated enum ArtifactParser {
         }
         struct Fatal: Codable, Equatable {
             var hypothesis: String
-            /// 炸了会怎样——具体后果（方案 A 台账行内展示）
+            /// 后果——具体影响（方案 A 台账行内展示）
             var impact: String?
             /// 建议应对方案（采纳后挂起等验证）
             var plan: String?
@@ -284,16 +370,24 @@ nonisolated enum ArtifactParser {
     }
 
     /// 决策 WHY 草稿（artifact:decision 块，五要素，design.md 附录 B）。
+    /// 2026-09-16 写入时富化：话题闭合时可选携带 topic / user_ask /
+    /// turning_points 与备选所有权标注（owner）——全部可选，旧格式不受影响。
     struct DecisionDraft: Codable, Equatable {
         var decision: String
         var why: String
         var rejected: [RejectedAlternative]?
         var confidence: Double?
         var toBeVerified: Bool?
+        var topic: String?
+        var userAsk: String?
+        var turningPoints: [TurningPoint]?
 
         enum CodingKeys: String, CodingKey {
             case decision, why, rejected, confidence
             case toBeVerified = "to_be_verified"
+            case topic
+            case userAsk = "user_ask"
+            case turningPoints = "turning_points"
         }
 
         /// 补全默认值 → DecisionRecord（version 由调用侧填）。
@@ -304,7 +398,10 @@ nonisolated enum ArtifactParser {
                 why: why,
                 rejectedAlternatives: rejected ?? [],
                 confidence: confidence.map { min(max($0, 0), 1) } ?? 1.0,
-                toBeVerified: toBeVerified ?? false
+                toBeVerified: toBeVerified ?? false,
+                topic: topic,
+                userAsk: userAsk,
+                turningPoints: turningPoints
             )
         }
     }
@@ -342,15 +439,22 @@ nonisolated enum ArtifactParser {
         return LenientJSON.decode([DecisionDraft].self, from: content) ?? []
     }
 
-    /// 回退请求（artifact:backtrack 块）：③④ 阶段 LLM 识别用户要重做上游产物时输出，
-    /// 不产出本阶段产物。App 校验 target 白名单（AppModel.backtrackStage）后回退状态机，
-    /// 并按 instruction 透传诉求自动重生成——LLM 只请求，不裁决。
-    /// mode：revise（默认，改上一版）= App 注入旧产物作修订基底；
-    ///       redo（推翻重来）= 不注入旧版，从零重画。
+    /// 变更提案请求（artifact:backtrack 块）：③④ 阶段 LLM 识别新需求/重做上游意图时输出，
+    /// 不产出本阶段产物。App 校验 target 白名单（AppModel.backtrackStage）后**不直接执行**——
+    /// 转成变更提案卡（影响清单 + 建议）交用户裁决：纳入 / 进池 / 继续讨论。
+    /// LLM 只分诊提案，不裁决执行。
+    /// suggestion：now（建议立即回退，target 必填）| pool（建议进候选池，target 可省略）；
+    ///             缺省按 now（向后兼容旧协议块）。
+    /// impacts：受影响产物引用清单——suggestion=now 时的防轻描淡写硬约束：
+    ///          缺失/为空则 App 侧不采信 target（提案卡降级为无回退建议，仅登记）。
     struct BacktrackRequest: Codable, Equatable {
-        var target: String       // structure | prototype
+        var suggestion: String?  // "now" | "pool"（缺省 now）
+        var target: String?      // structure | prototype | clarify（pool 块可省略）
+        var idea: String?        // 新想法/诉求一句话概述
+        var category: String?    // 局部修订 | 页面流程 | 模块核心 | 目标范围 | 需验证
+        var impacts: [String]?   // 受影响产物引用清单
         var instruction: String? // 用户的具体修改要求（重生成合成指令的载荷）
-        var mode: String?       // "revise" | "redo"（缺省按 revise）
+        var mode: String?        // "revise" | "redo"（缺省按 revise）
     }
 
     /// 从回复块中解析回退请求（无块或 JSON 不合法 → nil）。
@@ -437,19 +541,21 @@ nonisolated enum ArtifactParser {
         return normalizeQuestionCard(raw)
     }
 
+    /// 自评审对账条目（self-review.jsonl 行类型）：Inspector 对账 trace 与
+    /// 跨轮新增 diff 共用（B3 事件驱动改版——契约四档保留，落盘全量审计）。
+    struct SelfReviewEntry: Codable, Equatable {
+        var stage: String
+        var radar: RadarReport
+        var createdAt: String
+    }
+
     /// 自评摘要落盘：append 到对应阶段目录 self-review.jsonl（UI 可追溯）。
+    /// 直接 appendLine(entry) 单层 JSON 行——旧实现经 appendLine(String) 传预编码
+    /// 文本会二次编码（外层 JSON 字符串包裹），readSelfReviews 已做双格式兼容。
     static func writeSelfReview(
         _ radar: RadarReport, stage: String, project: String, version: String
     ) throws {
-        struct ReviewEntry: Codable {
-            var stage: String
-            var radar: RadarReport
-            var createdAt: String
-        }
-        let entry = ReviewEntry(stage: stage, radar: radar, createdAt: ISO8601.timestamp())
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(entry)
+        let entry = SelfReviewEntry(stage: stage, radar: radar, createdAt: ISO8601.timestamp())
         let dir: String
         switch stage {
         case "clarify": dir = "01-requirements"
@@ -459,7 +565,77 @@ nonisolated enum ArtifactParser {
         }
         let url = PMAgentStore.versionURL(project: project, version: version)
             .appendingPathComponent("\(dir)/self-review.jsonl")
-        try PMAgentStore.appendLine(String(decoding: data, as: UTF8.self), to: url)
+        try PMAgentStore.appendLine(entry, to: url)
+    }
+
+    /// 对账 trace 读取：四个阶段目录的 self-review.jsonl 合并，按时间正序
+    /// （covered 全量明细的审计归宿——对话流事件化后 Inspector 承载可审计性）。
+    /// 行格式双兼容：新格式单层 JSON；旧格式 appendLine(String) 双重编码行
+    /// （外层 JSON 字符串），先解条目、失败剥一层再解。秒级时间戳同秒时按
+    /// 落盘顺序 tie-break（jsonl 行序即时间序，append-only）。
+    static func readSelfReviews(project: String, version: String) -> [SelfReviewEntry] {
+        let base = PMAgentStore.versionURL(project: project, version: version)
+        let decoder = JSONDecoder()
+        var entries: [(offset: Int, entry: SelfReviewEntry)] = []
+        for dir in ["01-requirements", "02-structure", "03-prototypes", "04-prd"] {
+            let url = base.appendingPathComponent("\(dir)/self-review.jsonl")
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            for line in text.split(separator: "\n") {
+                guard !line.isEmpty else { continue }
+                let data = Data(line.utf8)
+                if let entry = try? decoder.decode(SelfReviewEntry.self, from: data) {
+                    entries.append((entries.count, entry))
+                } else if let inner = try? decoder.decode(String.self, from: data),
+                          let entry = try? decoder.decode(
+                              SelfReviewEntry.self, from: Data(inner.utf8)
+                          ) {
+                    entries.append((entries.count, entry))
+                }
+            }
+        }
+        return entries
+            .sorted { a, b in
+                a.entry.createdAt == b.entry.createdAt
+                    ? a.offset < b.offset
+                    : a.entry.createdAt < b.entry.createdAt
+            }
+            .map(\.entry)
+    }
+
+    // MARK: - 声明归一化与跨轮 diff（B3 事件驱动：对话流只报新增）
+
+    /// 匹配口径：大小写折叠 + 全部空白移除（中文场景空白插入是重播微差的
+    /// 主要形态，删除比规范化更有效；英文多词声明的重组误合并风险可忽略）。
+    /// 模型重播同一声明时字面常有微差，归一化精确匹配先挡大头（语义级近似
+    /// 不做，避免误杀）。
+    static func normalizedText(_ text: String) -> String {
+        text.lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined()
+    }
+
+    /// 文本数组的新增项：不在上轮集合中的条目（保持本轮顺序）。
+    static func newItems(current: [String], previous: [String]) -> [String] {
+        let seen = Set(previous.map(normalizedText))
+        return current.filter { !seen.contains(normalizedText($0)) }
+    }
+
+    /// ⏭️ skipped 的新增项（point 归一化匹配）。
+    static func newSkipped(
+        current: [RadarReport.Skipped], previous: [RadarReport.Skipped]
+    ) -> [RadarReport.Skipped] {
+        let seen = Set(previous.map { normalizedText($0.point) })
+        return current.filter { !seen.contains(normalizedText($0.point)) }
+    }
+
+    /// 💀 fatal 的新增项：与既有风险记录（任意状态）的 hypothesis 归一化匹配
+    /// 去重——重播不重复登记（字面相同的重播不进台账；文本有变的复发视作新声明）。
+    static func newFatals(
+        current: [RadarReport.Fatal], existingHypotheses: [String]
+    ) -> [RadarReport.Fatal] {
+        let seen = Set(existingHypotheses.map(normalizedText))
+        return current.filter { !seen.contains(normalizedText($0.hypothesis)) }
     }
 
     /// 决策条目 append 到 decisions.jsonl（write-then-verify 由 appendLine 保证）。
@@ -518,26 +694,115 @@ nonisolated enum ArtifactParser {
         var options: [String]
     }
 
-    /// 解析回复末尾的「A) xxx」选项行（2-4 行才有效；0-1 行视为开放问题）。
-    static func parseClarifyOptions(in text: String) -> ClarifyOptions? {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+    /// 选项行问题组（选项式提问路径的一组）：题干收尾行 + 连续 2-4 行 A-D 选项。
+    /// 模型未走问题卡协议一次抛多问时，回复里会出现多组——逐组解析后转问题卡向导逐题作答。
+    struct OptionLineQuestionGroup: Equatable {
+        var title: String      // 题干收尾行（尾部代码围栏块 / 围栏残行已剥离）
+        var options: [String]
+    }
+
+    /// 选项行问题组解析结果：问题组按出现顺序 + 剥除所有组选项行后的正文（消息流折叠用）。
+    struct OptionLineQuestionGroups: Equatable {
+        var questions: [OptionLineQuestionGroup]
+        /// 所有组选项行剥除后的回复正文（题干与散文保留）。
+        var bodyText: String
+        /// 回复带「[收尾确认]」标记（① 澄清收尾确认问协议）：单组时用户点选
+        /// 「确认」开头选项即视为闸口确认（一次确认，AppModel.confirmStageByAnswer）。
+        var gateConfirm: Bool
+    }
+
+    /// 收尾确认标记行（① 澄清收尾确认问独占尾行；兼容全角括号变体）。
+    static let gateConfirmMarkers: Set<String> = ["[收尾确认]", "【收尾确认】"]
+
+    /// 解析回复中的选项行问题组：每组 = 连续 2-4 行「A) xxx」；最后一组必须收尾在回复末尾
+    /// （选项式提问历史口径：选项行连续在末尾，中途出现不触发）。题干取组前最近的有效文字行。
+    /// 尾部「[收尾确认]」标记行先剥离再解析（剥离后选项行重新收尾在末尾）。
+    /// 无有效组 → nil。
+    static func parseOptionLineQuestionGroups(in text: String) -> OptionLineQuestionGroups? {
+        var lines = text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        let gateConfirm = lines.contains(where: { Self.gateConfirmMarkers.contains($0) })
+        if gateConfirm {
+            lines = lines.filter { !Self.gateConfirmMarkers.contains($0) }
+        }
         guard !lines.isEmpty else { return nil }
-        var optionLines: [String] = []
-        var questionEnd = lines.count
-        for (index, line) in lines.enumerated().reversed() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if let option = matchOptionLine(trimmed) {
-                optionLines.insert(option, at: 0)
-                questionEnd = index
-            } else if !optionLines.isEmpty {
-                break  // 选项行必须连续在末尾
+
+        // 前向扫描：连续 2-4 行 A-D 选项行 = 一组（超 4 行视为列表散文，不成组；
+        // 组间至少隔一行非选项行，相邻会并成一组）
+        var runs: [(start: Int, end: Int, options: [String])] = []
+        var i = 0
+        while i < lines.count {
+            if matchOptionLine(lines[i]) != nil {
+                var j = i
+                var opts: [String] = []
+                while j < lines.count, let opt = matchOptionLine(lines[j]), opts.count < 5 {
+                    opts.append(opt)
+                    j += 1
+                }
+                if opts.count >= 2, opts.count <= 4 {
+                    runs.append((i, j, opts))
+                }
+                i = max(j, i + 1)
+            } else {
+                i += 1
             }
         }
-        guard optionLines.count >= 2, optionLines.count <= 4 else { return nil }
-        let question = lines[..<questionEnd]
+        // 最后一组必须收尾在回复末尾
+        guard let lastRun = runs.last, lastRun.end == lines.count else { return nil }
+
+        // 每组题干 = 组前最近的有效文字行（首组取其前的正文；后续组取上一组选项行之后的收尾段）
+        var questions: [OptionLineQuestionGroup] = []
+        var optionLineIndexes = Set<Int>()
+        for run in runs {
+            for k in run.start..<run.end { optionLineIndexes.insert(k) }
+        }
+        for (runIndex, run) in runs.enumerated() {
+            let stemSlice: Array<String>
+            if runIndex == 0 {
+                stemSlice = Array(lines[..<run.start])
+            } else {
+                stemSlice = Array(lines[runs[runIndex - 1].end..<run.start])
+            }
+            let title = stemTitle(from: stemSlice) ?? "问题 \(runIndex + 1)"
+            questions.append(OptionLineQuestionGroup(title: title, options: run.options))
+        }
+
+        let body = lines.enumerated()
+            .filter { !optionLineIndexes.contains($0.offset) }
+            .map(\.element)
             .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return ClarifyOptions(question: question, options: optionLines)
+        return OptionLineQuestionGroups(
+            questions: questions,
+            bodyText: body.trimmingCharacters(in: .whitespacesAndNewlines),
+            gateConfirm: gateConfirm
+        )
+    }
+
+    /// 题干收尾行：切片最后一行非围栏文字。尾部若收着代码块（``` 围栏成对）整块跳过，
+    /// 未配对的孤立围栏残行（流式截断 / 双围栏收尾）也跳过——题干不能显示成「```」。
+    private static func stemTitle(from lines: [String]) -> String? {
+        guard !lines.isEmpty else { return nil }
+        var end = lines.count
+        if lines[end - 1].hasPrefix("```") {
+            var depth = 1
+            var index = end - 2
+            while index >= 0, depth > 0 {
+                if lines[index].hasPrefix("```") { depth -= 1 }
+                index -= 1
+            }
+            end = index + 1  // 开启围栏之前的正文收尾段
+        }
+        while end > 0, lines[end - 1].hasPrefix("```") { end -= 1 }
+        return lines[..<end].last
+    }
+
+    /// 单组视图（兼容旧口径）：末尾连续 A)/B) 选项行作为一道题，题干 = 剥除选项行后的正文。
+    /// 多组回复返回 nil（多组由 parseOptionLineQuestionGroups 消费、转问题卡向导）。
+    static func parseClarifyOptions(in text: String) -> ClarifyOptions? {
+        guard let groups = parseOptionLineQuestionGroups(in: text), groups.questions.count == 1
+        else { return nil }
+        return ClarifyOptions(question: groups.bodyText, options: groups.questions[0].options)
     }
 
     private static func matchOptionLine(_ line: String) -> String? {

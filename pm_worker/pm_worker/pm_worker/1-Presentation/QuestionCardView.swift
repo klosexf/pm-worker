@@ -2,12 +2,12 @@
 //  QuestionCardView.swift
 //  pm_worker
 //
-//  澄清问题卡（① 阶段）：LLM 输出 artifact:question-card 块 → 右缘作答抽屉
-//  （ClarifyAnswerDrawer）承载。多题逐答：单选 radio / 多选 checkbox（题型由
+//  澄清问题卡（① 阶段）：LLM 输出 artifact:question-card 块 → 输入区上方作答坞
+//  （StageDockCard 统一停靠卡的作答段）承载。多题逐答：单选 radio / 多选 checkbox（题型由
 //  schema multiple 字段或题干启发式判定，头部徽标标注）+ 自定义输入 + 跳过 →
 //  上一步回改（答案保留）→ 回顾页可跳题修改 → 确认提交 → 拼装【问题卡作答】
 //  用户消息走 sendMessage 通道。页脚按钮右对齐，顺序 = 跳过此题 | 上一步 | 下一道题。
-//  本视图只产出抽屉内容（无卡片外壳，chrome / 标题由抽屉头部承载）。
+//  本视图只产出坞内内容（无卡片外壳，chrome / 标题由作答坞头部承载）。
 //
 
 import SwiftUI
@@ -61,24 +61,23 @@ struct ClarifyQuestionCard: View {
             headerArea
             DSDivider()
 
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: DS.Spacing.s8) {
-                    if isReview {
-                        reviewPage
-                    } else {
-                        questionPage(step)
-                    }
+            // 自然高度布局（停靠坞内不设滚动，防与消息流 ScrollView 抢弹性空间）
+            VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+                if isReview {
+                    reviewPage
+                } else {
+                    questionPage(step)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(DS.Spacing.s12)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DS.Spacing.s12)
             .background(Color.surfaceSecondary)
 
             footerRow
         }
     }
 
-    // MARK: 头部（步数 + 进度 hairline；卡片身份由抽屉头部承载）
+    // MARK: 头部（步数 + 进度 hairline；卡片身份由作答坞头部承载）
 
     private var headerArea: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
@@ -187,6 +186,7 @@ struct ClarifyQuestionCard: View {
                     .foregroundStyle(Color.ink900)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: DS.Spacing.s8)
+                numberBadge(optIndex + 1, selected: selected)
             }
             .padding(.horizontal, DS.Spacing.s10)
             .padding(.vertical, DS.Spacing.s8)
@@ -296,6 +296,19 @@ struct ClarifyQuestionCard: View {
                 .strokeBorder(selected ? Color.brand600 : Color.borderL3, lineWidth: 1)
         )
         .animation(DS.Motion.springFast, value: selected)
+    }
+
+    /// 数字徽章：右侧圆角小方块（未选灰底 / 选中品牌紫底白字，视觉同 ConfirmDock optionCard）。
+    private func numberBadge(_ index: Int, selected: Bool) -> some View {
+        Text("\(index)")
+            .font(DS.Font.monoSM)
+            .foregroundStyle(selected ? Color.white : Color.ink500)
+            .frame(width: 20, height: 20)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.md)
+                    .fill(selected ? Color.brand600 : Color.surfaceTertiary)
+            )
+            .animation(DS.Motion.springFast, value: selected)
     }
 
     // MARK: 回顾页

@@ -7,6 +7,8 @@
 //  - scope 隔离（E12）：跨项目卡被过滤、全局卡可命中
 //  - 技能渐进式披露（E11）：命中只给 when_to_use 摘要，未命中技能正文不注入
 //  - 近重复去重（窄的赢） / 增量索引幂等
+//  - 确定性哈希向量器：跨进程稳定（快照锚定 FNV-1a 桶位，防换回随机种子的 Hasher）
+//  - trace 技能索引可用性（skillIndexReady——锚点兜底判据）
 //  - pitfalls 确定性路由
 //  - EmbeddingClient 响应解析（不发网络）
 //  不依赖网络：DeterministicHashEmbedder + 临时 AppDatabase，直接 INSERT 测试行，
@@ -270,7 +272,48 @@ final class RetrievalTests: XCTestCase {
         XCTAssertTrue(trace.hits.contains { $0.id == "访谈提纲技能" && $0.library == .skills })
     }
 
-    // MARK: - 6. PitfallsRouter 确定性路由
+    // MARK: - 6. 确定性哈希向量器：跨进程稳定 + trace 索引可用性
+
+    func testHashEmbedderBucketsAreStableAcrossLaunches() {
+        // 快照锚定占用桶位（FNV-1a）：技能向量持久化在索引里、查询向量每次启动
+        // 新进程现算——若换回 Swift Hasher（每进程随机种子），两者跨启动不可比，
+        // 相关度退化为噪声（2026-09-15 修复的真实坑）。本断言防该回归。
+        let vector = DeterministicHashEmbedder.vector(for: "锚点")
+        let occupied = vector.indices.filter { vector[$0] != 0 }
+        XCTAssertEqual(occupied, [13, 20, 220])
+        // 空文本兜底单位分量（防除零）
+        XCTAssertEqual(DeterministicHashEmbedder.vector(for: "")[0], 1)
+    }
+
+    func testTraceReportsSkillIndexReadiness() async throws {
+        let retriever = Retriever(database: database, embedder: embedder)
+        // 空技能表 → 索引失效（锚点兜底判据据此放行）
+        let empty = try await retriever.search(query: "任意查询", project: "项目B")
+        XCTAssertEqual(empty.skillIndexReady, false)
+
+        try insertSkill(id: "技能A", name: "技能A", whenToUse: "摸清竞品格局时")
+        let ready = try await retriever.search(query: "任意查询", project: "项目B")
+        XCTAssertEqual(ready.skillIndexReady, true)
+
+        // 零长度占位向量行（旧重建路径遗留）不参与可用性判定——
+        // 只要存在带向量的技能行，通道即视为可用
+        try await database.dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO skills
+                        (id, name, type, when_to_use, best_for, tags, pitfalls,
+                         doc_path, embedding, hit_count, enabled)
+                    VALUES ('技能B', '技能B', 'component', '', '[]', '[]', '[]',
+                            '/nonexistent/b.md', ?, 0, 1)
+                    """,
+                arguments: [Data()]
+            )
+        }
+        let stillReady = try await retriever.search(query: "任意查询", project: "项目B")
+        XCTAssertEqual(stillReady.skillIndexReady, true, "有向量行即视为通道可用")
+    }
+
+    // MARK: - 7. PitfallsRouter 确定性路由
 
     func testPitfallsRouterDeterministicRouting() throws {
         try insertSkill(
@@ -299,7 +342,7 @@ final class RetrievalTests: XCTestCase {
         XCTAssertTrue(try PitfallsRouter.pitfalls(for: .review, database: database).isEmpty)
     }
 
-    // MARK: - 7. EmbeddingClient 响应解析（不发网络）
+    // MARK: - 8. EmbeddingClient 响应解析（不发网络）
 
     func testEmbeddingResponseParsing() throws {
         // 乱序 index 对齐：data 中 index=1 在前，结果仍按输入顺序排列

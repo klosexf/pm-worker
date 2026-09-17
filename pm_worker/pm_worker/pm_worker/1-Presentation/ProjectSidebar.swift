@@ -3,8 +3,8 @@
 //  pm_worker
 //
 //  左栏（Task 1.1，design.md §5.1.1 · 对齐 Trae 参考图顶栏结构）：
-//  首行贴顶 = 自绘红绿灯 + 搜索图标；其下模式胶囊（PM 激活，数据/复盘
-//  V2 占位）→ 功能导航（新建任务/技能库/知识库/决策日志）→ 任务/空间
+//  首行贴顶 = 自绘红绿灯 + 搜索图标；其下功能导航（新建任务/技能库/知识库/
+//  决策日志）→ 任务/空间
 //  双模块（方案 B：列表区顶部分段胶囊切换，单区视口只显示当前模块；
 //  任务 = 默认/unversioned 轻会话平铺，空间 = 项目-版本-会话三级档案树，
 //  选中驱动自动落段）。系统标题栏与红绿灯已隐藏（WindowChromeConfigurator），
@@ -172,12 +172,6 @@ struct ProjectSidebar: View {
                 .help("搜索任务")
             }
 
-            // 模式胶囊（参考图：Work / Code / Design 形制；PM 激活白底浮起）
-            modeCapsule
-                .padding(.horizontal, DS.Spacing.s12)
-                .padding(.top, DS.Spacing.s8)
-                .padding(.bottom, DS.Spacing.s6)
-
             // 搜索行（红绿灯搜索图标点击展开）
             if searchVisible {
                 searchField
@@ -235,6 +229,7 @@ struct ProjectSidebar: View {
             .listStyle(.sidebar)
             // 隐藏 List 默认底色，透出外层 vibrancy
             .scrollContentBackground(.hidden)
+            .dsScrollbar()
 
             // 底部账户区（原型 Sidebar 底部：ds-avatar 形制 + 本地优先 + MIT 开源）
             accountSection
@@ -367,40 +362,6 @@ struct ProjectSidebar: View {
         .buttonStyle(.plain)
         .accessibilityLabel("\(title)模块")
         .accessibilityHint("切换到\(title)列表")
-    }
-
-    // MARK: - 模式胶囊（PM / 数据 V2 / 复盘 V2）
-
-    private var modeCapsule: some View {
-        HStack(spacing: DS.Spacing.s2) {
-            // PM 激活段：白底浮起（Seg 同规格：28 高 · medium）
-            Text("PM")
-                .font(DS.Font.bodySM)
-                .fontWeight(.medium)
-                .foregroundStyle(Color.ink900)
-                .frame(maxWidth: .infinity, minHeight: 28)
-                .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.md)
-                        .fill(Color.surfaceBase)
-                        .shadow(color: .black.opacity(0.16), radius: 2.5, y: 1)
-                )
-
-            // 数据 / 复盘：V2 占位（未实装，不响应点击）
-            ForEach(["数据", "复盘"], id: \.self) { title in
-                HStack(spacing: DS.Spacing.s3) {
-                    Text(title)
-                        .font(DS.Font.bodySM)
-                        .foregroundStyle(Color.ink300)
-                    Text("V2")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Color.ink300)
-                }
-                .frame(maxWidth: .infinity, minHeight: 28)
-            }
-        }
-        .padding(DS.Spacing.s2)
-        .background(Color.overlayL1, in: RoundedRectangle(cornerRadius: DS.Radius.lg))
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
     }
 
     // MARK: - 底部账户区（本地优先声明 + 设置入口；原型「本地 Agent」）
@@ -612,8 +573,10 @@ struct ProjectSidebar: View {
         let isSelected = model.selection
             == .session(project: project.name, version: version.name, sessionId: session.id)
         // 生成指示：流归属 = 该会话时行右缘亮呼吸点（流是全局单份的，
-        // streamingSessionID 钉在发起会话上，切到别的会话也能看出谁在生成）
-        let isGenerating = store.isStreaming && store.streamingSessionID == session.id
+        // streamingSessionID 钉在发起会话上，切到别的会话也能看出谁在生成）。
+        // 待回复期（消息已上屏、回复未开流）同样亮点，与会话内思考占位卡同步。
+        let isGenerating = (store.isStreaming && store.streamingSessionID == session.id)
+            || (store.isPreparingReply && store.preparingSessionID == session.id)
 
         return ArchiveSessionRow(
             title: session.title,
@@ -652,7 +615,8 @@ struct ProjectSidebar: View {
                 project: PMAgentStore.defaultProjectName, version: "unversioned",
                 sessionId: session.id
             )
-        let isGenerating = store.isStreaming && store.streamingSessionID == session.id
+        let isGenerating = (store.isStreaming && store.streamingSessionID == session.id)
+            || (store.isPreparingReply && store.preparingSessionID == session.id)
 
         return ArchiveSessionRow(
             title: session.title,

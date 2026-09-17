@@ -22,6 +22,9 @@ nonisolated protocol EmbeddingProviding: Sendable {
 /// 确定性哈希向量器：无网络环境下保证管线不断（语义质量无意义，仅保活），
 /// 也是单测的假向量源——可复现、无网络依赖。
 /// 原理：把文本按 2-gram 哈希进固定 256 维桶（中文友好），再 L2 归一化。
+/// 哈希用 FNV-1a（跨进程稳定）：索引里的技能向量是持久化的，查询向量在
+/// 每次启动的新进程里现算——若用 Swift `Hasher`（每进程随机种子），
+/// 两者跨启动不可比、相关度退化为噪声。勿换回 Hasher。
 nonisolated struct DeterministicHashEmbedder: EmbeddingProviding {
     static let dimensions = 256
 
@@ -38,9 +41,9 @@ nonisolated struct DeterministicHashEmbedder: EmbeddingProviding {
         }
         // 字符级 + 字符级 2-gram 双通道，增强局部区分度
         for i in scalars.indices {
-            bump(&v, bucket: hash(scalars[i]))
+            v[bucket(of: scalars[i])] += 1
             if i + 1 < scalars.count {
-                bump(&v, bucket: hash(scalars[i], scalars[i + 1]))
+                v[bucket(of: scalars[i], scalars[i + 1])] += 1
             }
         }
         // L2 归一化（零向量兜底给一个单位分量，防除零）
@@ -52,14 +55,15 @@ nonisolated struct DeterministicHashEmbedder: EmbeddingProviding {
         return v.map { $0 / norm }
     }
 
-    private static func bump(_ v: inout [Float], bucket: Int) {
-        v[abs(bucket) % dimensions] += 1
-    }
-
-    private static func hash(_ s: Unicode.Scalar...) -> Int {
-        var hasher = Hasher()
-        for scalar in s { hasher.combine(scalar.value) }
-        return hasher.finalize()
+    /// 桶位（0..<dimensions）：FNV-1a 64 位，仅依赖 Unicode 标量值——
+    /// 同输入在任何进程/任何启动上落同一桶（稳定哈希，勿用 Hasher）。
+    private static func bucket(of scalars: Unicode.Scalar...) -> Int {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for scalar in scalars {
+            hash ^= UInt64(scalar.value)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return Int(hash % UInt64(dimensions))
     }
 }
 
@@ -139,4 +143,9 @@ nonisolated struct RetrievalTrace: Codable, Equatable {
     /// stage query）；nil = 未分流（技能与卡片同 query）。Optional 缺键解码为 nil，
     /// 旧 trace 数据可继续解码。
     var skillQuery: String? = nil
+    /// 技能索引可用性（本次检索时技能表是否存在可解码向量）：false / nil = 失效态
+    ///（零长度占位向量、空表、embedder 抛错）——Context Builder 阶段锚点兜底判据。
+    /// 语义为准（2026-09-15）：索引可用时零命中即不注入技能，失效态才由阶段锚点保底。
+    /// Optional 缺键解码为 nil，旧 trace 数据可继续解码。
+    var skillIndexReady: Bool? = nil
 }

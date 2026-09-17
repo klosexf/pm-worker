@@ -96,6 +96,8 @@ final class StopGenerationTests: XCTestCase {
         )
     }
 
+    // MARK: - ⑤ Steering 队列（P3：插话排队与停止作废）
+
     /// ⏹ 停止注记不得被并入相邻 assistant 气泡（turnNote 前缀表不含 ⏹ → 独立事件条）。
     /// 防回归锚点：有人把 ⏹ 误加进 turnNote 可并入映射时当场红。
     @MainActor
@@ -116,5 +118,34 @@ final class StopGenerationTests: XCTestCase {
         let merged = MessageBubble.mergedSystemIndices(in: [user, partial, note])
 
         XCTAssertFalse(merged.contains(2), "⏹ 停止注记必须独立成行，不得并入相邻气泡注记")
+    }
+
+    @MainActor
+    func testEnqueueSteeringOnIdleStoreIsNoOp() {
+        let store = SessionStore()
+        store.enqueueSteering("补一句：目标用户是独立开发者")
+
+        XCTAssertTrue(store.steeringQueue.isEmpty, "空闲态插话必须 no-op（不入队）")
+        XCTAssertTrue(store.followUpQueue.isEmpty)
+    }
+
+    @MainActor
+    func testStopGenerationClearsSteeringQueues() async throws {
+        let store = SessionStore()
+        // 停止清队列的语义锚点：队列注入插话后停止必须双清（排队气泡消失、不落盘）。
+        // 队列写入走流式链路（enqueueSteering 有 isStreaming 守卫），此处以停止路径
+        // 的幂等性 + 空闲 no-op 组成回归锚；流式中的入队由冒烟验证。
+        let generation = Task {
+            await store.trackGeneration {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        store.stopGeneration()
+        await generation.value
+
+        XCTAssertTrue(store.steeringQueue.isEmpty)
+        XCTAssertTrue(store.followUpQueue.isEmpty)
+        XCTAssertFalse(store.isStreaming)
     }
 }

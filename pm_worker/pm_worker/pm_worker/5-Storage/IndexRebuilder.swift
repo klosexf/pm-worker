@@ -23,6 +23,10 @@ nonisolated enum IndexRebuilder {
     /// 全量重建（零 embedding 占位路径，M0 兼容）：
     /// 先清空 knowledge_points / skills，再从文件扫描 upsert。
     /// risks / pipeline_runs / mcp_tasks 各有事实源或运行时写入方，不在此重建范围。
+    /// **仅供测试使用**：占位向量（空 blob）会让检索层跳过整行——生产入口
+    /// （AppModel.reindexStaleSkills / SettingsDialog.rebuildIndex）必须走下面
+    /// 带 embeddingProvider 的真实向量版，否则技能语义检索恒零命中，
+    /// 路由退化为阶段锚点每轮兜底（2026-09-15 真实踩坑，勿回退）。
     static func rebuild(database: AppDatabase) throws -> RebuildReport {
         var report = RebuildReport()
 

@@ -300,4 +300,211 @@ final class MarkdownTests: XCTestCase {
             return XCTFail("末块应为表格")
         }
     }
+
+    // MARK: - 渲染段聚合（segments）：长文档分块封顶
+
+    /// 无封顶时（默认对话路径）连续 prose 块合并为单段——回归锚点：分块改动
+    /// 不得影响流式对话的合并选取行为。
+    func testSegmentsDefaultMergesAllProseIntoOneSegment() {
+        let blocks: [MarkdownParser.Block] = (0..<20).map { .paragraph(text: "第\($0)段内容") }
+        let segments = MarkdownText.segments(from: blocks)
+        XCTAssertEqual(segments.count, 1)
+        guard case .prose(let merged, let firstIndex) = segments[0] else {
+            return XCTFail("应为 prose 段")
+        }
+        XCTAssertEqual(merged.count, 20)
+        XCTAssertEqual(firstIndex, 0)
+    }
+
+    /// 封顶：块数上限触发切分（8 块/段），firstIndex 记录真实绝对序号。
+    func testSegmentsChunkCapByBlockCount() {
+        // 20 段 × 10 字 = 200 字 < 字数上限 1200 → 只由块数上限切分
+        let blocks: [MarkdownParser.Block] = (0..<20).map { _ in .paragraph(text: String(repeating: "段", count: 10)) }
+        let segments = MarkdownText.segments(from: blocks, proseChunkLimit: 8, proseCharLimit: 1200)
+        XCTAssertEqual(segments.count, 3)
+        guard case .prose(let first, let firstStart) = segments[0] else {
+            return XCTFail("首段应为 prose")
+        }
+        XCTAssertEqual(first.count, 8)
+        XCTAssertEqual(firstStart, 0)
+        guard case .prose(let middle, let middleStart) = segments[1] else {
+            return XCTFail("中段应为 prose")
+        }
+        XCTAssertEqual(middle.count, 8)
+        XCTAssertEqual(middleStart, 8)
+        guard case .prose(let tail, let tailStart) = segments[2] else {
+            return XCTFail("尾段应为 prose")
+        }
+        XCTAssertEqual(tail.count, 4)
+        XCTAssertEqual(tailStart, 16)
+    }
+
+    /// 封顶：字数上限触发切分（块数未达上限也切）。
+    func testSegmentsChunkCapByCharCount() {
+        // 20 段 × 400 字：3 段 = 1200 字触顶，第 4 段加入会超 → 按 3 块切
+        let blocks: [MarkdownParser.Block] = (0..<20).map { _ in .paragraph(text: String(repeating: "字", count: 400)) }
+        let segments = MarkdownText.segments(from: blocks, proseChunkLimit: 8, proseCharLimit: 1200)
+        XCTAssertEqual(segments.count, 7)
+        for segment in segments.dropLast() {
+            guard case .prose(let chunk, _) = segment else {
+                return XCTFail("应为 prose 段")
+            }
+            XCTAssertEqual(chunk.count, 3)
+        }
+        guard case .prose(let tail, _) = segments[6] else {
+            return XCTFail("尾段应为 prose")
+        }
+        XCTAssertEqual(tail.count, 2)  // 20 = 6×3 + 2
+    }
+
+    /// 列表独立成段（方案 A 悬挂缩进）：列表不再并入 prose 合并 Text——
+    /// 合并 Text 里「行首标记 + 空格」做不到悬挂缩进（换行会回到第 0 列）。
+    /// 回归锚点：前后 prose 被列表切开，列表本身为 single 段。
+    func testSegmentsListBecomesStandaloneBlock() {
+        let blocks: [MarkdownParser.Block] = [
+            .heading(level: 2, text: "章节"),
+            .paragraph(text: "前一段"),
+            .list(items: [MarkdownParser.ListItem(ordered: false, number: 0, level: 0, text: "一项")]),
+            .paragraph(text: "后一段"),
+        ]
+        let segments = MarkdownText.segments(from: blocks)
+        XCTAssertEqual(segments.count, 3)
+        guard case .prose(let head, 0) = segments[0] else {
+            return XCTFail("列表前的标题+段落应合并为 prose 段")
+        }
+        XCTAssertEqual(head.count, 2)
+        guard case .single(.list) = segments[1] else {
+            return XCTFail("列表应为独立结构段")
+        }
+        guard case .prose(let tail, 3) = segments[2] else {
+            return XCTFail("列表后的段落应单独成 prose 段")
+        }
+        XCTAssertEqual(tail.count, 1)
+    }
+
+    /// 结构块（表格/代码等）终止 prose 聚合并独立成段——封顶模式下行为不变。
+    func testSegmentsChunkingRespectsStructuralBlocks() {
+        let blocks: [MarkdownParser.Block] = [
+            .paragraph(text: String(repeating: "前", count: 500)),
+            .table(header: ["A", "B"], rows: [["1", "2"]], aligns: [.left, .left]),
+            .paragraph(text: String(repeating: "后", count: 500)),
+        ]
+        let segments = MarkdownText.segments(from: blocks, proseChunkLimit: 8, proseCharLimit: 1200)
+        XCTAssertEqual(segments.count, 3)
+        guard case .single(.table) = segments[1] else {
+            return XCTFail("表格应为独立结构段")
+        }
+        // firstIndex 0 的 prose 段首块参与导语判定（isMessageFirst）
+        guard case .prose(_, 0) = segments[0] else {
+            return XCTFail("首 prose 段 firstIndex 应为 0")
+        }
+    }
+
+    // MARK: - 表格数值列（方案 A：纯数值列自动右对齐 + 等宽数字）
+
+    /// 数值判据：剥前后缀符号（≈ ~ > < + $ %）与千分位后能被 Double 解析。
+    func testTableCellNumericDetection() {
+        for numeric in ["0.75", "0.7", "85", "-3.5", "1,200", "≈0.75", "~0.7", ">90", "+12", "60%", " $1,200 "] {
+            XCTAssertTrue(MarkdownTableView.isNumeric(numeric), "\(numeric) 应判为数值")
+        }
+        for text in ["", "未采集", "0.75（推断）", "约 0.7", "A", "1 项"] {
+            XCTAssertFalse(MarkdownTableView.isNumeric(text), "\(text) 不应判为数值")
+        }
+    }
+
+    // MARK: - 标题刻度阶梯（方案 A：相邻级差 ≥2pt）
+
+    /// 阶梯规则锚点：h1–h4 严格递减且相邻差 ≥2pt（层级必须看得出来），
+    /// h5/h6 落回小节标签档。
+    func testHeadingLadderKeepsVisibleSteps() {
+        let ladder = DS.Typography.chatHeadingLadder
+        XCTAssertEqual(ladder.count, 6)
+        for level in 0..<4 {
+            XCTAssertGreaterThanOrEqual(
+                ladder[level] - ladder[level + 1], 2,
+                "h\(level + 1) 与 h\(level + 2) 的级差须 ≥2pt"
+            )
+        }
+        XCTAssertEqual(ladder[4], DS.Typography.chatLabelSize)
+        XCTAssertEqual(ladder[5], DS.Typography.chatLabelSize)
+    }
+
+    // MARK: - 语义分节（方案 B：heading 驱动 splitSections）
+
+    func testSplitSectionsNoH2ReturnsSingleUntitledSection() {
+        let blocks = MarkdownParser.parseBlocks("第一段\n\n第二段")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertNil(sections[0].title)
+        XCTAssertEqual(sections[0].startIndex, 0)
+        XCTAssertEqual(sections[0].blocks, blocks)
+    }
+
+    func testSplitSectionsSplitsOnLevel2Heading() {
+        let blocks = MarkdownParser.parseBlocks("## 先说结论\n质量是系统属性。\n\n## 怎么修\n标 nonisolated。")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections.count, 2)
+        XCTAssertEqual(sections[0].title, "先说结论")
+        XCTAssertEqual(sections[0].blocks, [.paragraph(text: "质量是系统属性。")])
+        XCTAssertEqual(sections[1].title, "怎么修")
+        XCTAssertEqual(sections[1].blocks, [.paragraph(text: "标 nonisolated。")])
+    }
+
+    func testSplitSectionsLeadingContentBeforeFirstH2() {
+        let blocks = MarkdownParser.parseBlocks("前导结论段\n\n## 怎么修\n改 struct。")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections.count, 2)
+        XCTAssertNil(sections[0].title)
+        XCTAssertEqual(sections[0].blocks, [.paragraph(text: "前导结论段")])
+        XCTAssertEqual(sections[1].title, "怎么修")
+        XCTAssertEqual(sections[1].blocks, [.paragraph(text: "改 struct。")])
+    }
+
+    func testSplitSectionsOtherHeadingLevelsStayInBlocks() {
+        // h1/h3-h6 不开节——首版只认 level 2
+        let blocks = MarkdownParser.parseBlocks("# 大标题\n## 节名\n### 小标题\n正文")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections.count, 2)
+        XCTAssertEqual(sections[0].title, nil)
+        XCTAssertEqual(sections[0].blocks, [.heading(level: 1, text: "大标题")])
+        XCTAssertEqual(sections[1].title, "节名")
+        XCTAssertEqual(sections[1].blocks, [
+            .heading(level: 3, text: "小标题"),
+            .paragraph(text: "正文"),
+        ])
+    }
+
+    func testSplitSectionsTracksAbsoluteStartIndex() {
+        // 第二节 startIndex = 其 h2 的绝对序号（导语升档按消息级 firstIndex==0 判定）
+        let blocks = MarkdownParser.parseBlocks("前导段\n\n## 节名\n正文")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections[1].startIndex, 1)
+    }
+
+    func testSplitSectionsEmptyTitleOpensUntitledSection() {
+        // 空标题防御（splitSections 接受手工构造的数组）：开节但不出标签
+        let sections = MarkdownParser.splitSections([
+            .heading(level: 2, text: ""),
+            .paragraph(text: "内容"),
+        ])
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertNil(sections[0].title)
+        XCTAssertEqual(sections[0].blocks, [.paragraph(text: "内容")])
+    }
+
+    func testSplitSectionsKeepsCodeAndQuoteInsideSection() {
+        let blocks = MarkdownParser.parseBlocks("## 怎么修\n\n> 注意别按回归处理。\n\n```yaml\na: 1\n```\n\n改完跑测试。")
+        let sections = MarkdownParser.splitSections(blocks)
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].title, "怎么修")
+        XCTAssertEqual(sections[0].blocks, [
+            .quote(text: "注意别按回归处理。"),
+            .code(language: "yaml", text: "a: 1"),
+            .paragraph(text: "改完跑测试。"),
+        ])
+    }
+
+    func testSplitSectionsEmptyInputReturnsEmpty() {
+        XCTAssertTrue(MarkdownParser.splitSections([]).isEmpty)
+    }
 }

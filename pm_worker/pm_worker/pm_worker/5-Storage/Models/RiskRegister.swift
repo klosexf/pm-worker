@@ -11,7 +11,7 @@
 import Foundation
 
 /// 风险登记册条目。四态语义（方案 A）：
-/// - open：待处理（自评审登记，带「炸了会怎样」与建议方案）
+/// - open：待处理（自评审登记，带「后果」与建议方案）
 /// - mitigating：已挂方案（采纳 ≠ 解除——方案落地并确认没出事才算数）
 /// - resolved：已解除（验证通过，风险关闭；回写决策日志）
 /// - accepted：已接受（风险自留，封板时带入 PRD 已知风险）
@@ -48,7 +48,7 @@ struct RiskRecord: Codable, Equatable {
     var stage: Stage
     /// 风险一句话（哪个假设一旦不成立会出事）
     var hypothesis: String
-    /// 炸了会怎样——对用户 / 进度的具体后果（缺省 = 旧版条目）
+    /// 后果——对用户 / 进度的具体影响（缺省 = 旧版条目）
     var impact: String?
     /// 建议应对方案——可执行的一句话（缺省 = 旧版条目）
     var plan: String?

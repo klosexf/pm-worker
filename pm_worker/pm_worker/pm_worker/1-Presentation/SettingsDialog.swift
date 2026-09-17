@@ -107,8 +107,11 @@ struct SettingsDialog: View {
     /// 模型编辑器弹框：nil = 收起；非 nil = 正在新增（profile 为草稿）或编辑（含原档案）。
     @State private var modelEditor: ModelEditorTarget?
     @State private var rebuildResult: String?
-    /// 外观模式（通用页）：@AppStorage 直写 UserDefaults，四窗口 appAppearance 即时联动。
-    @AppStorage(AppearanceMode.storageKey) private var appearanceRaw: String = AppearanceMode.system.rawValue
+    /// 外观模式（通用页）：内存镜像 + AppearanceMode.setAppearance 写穿（持久化 +
+/// 应用 + 广播自定义通知），四窗口 appAppearance 即时联动。
+    /// 不用 @AppStorage：SwiftUI 窗口 resize 每帧都会保存 frame 写 UserDefaults，
+    /// AppStorage 会被逐帧唤醒走 CFPreferences 慢路径（拖拽卡顿主因，见 DS.swift 注释）。
+    @State private var appearanceRaw: String = AppearanceMode.currentRawValue()
 
     var body: some View {
         ZStack {
@@ -228,7 +231,7 @@ struct SettingsDialog: View {
 
     /// 外观模式三分段（跟随系统 / 浅色 / 深色）：写 AppStorage → 四窗口即时联动。
     private var generalPage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 section(
                     "外观",
@@ -241,6 +244,15 @@ struct SettingsDialog: View {
                             compact: true
                         )
                         .frame(width: 210)
+                    }
+                }
+
+                section(
+                    "分支执行",
+                    footer: "识别到调研类请求（如「帮我调研下竞品」）时先弹确认卡，你确认后才在后台执行；关闭则命中即直接执行。"
+                ) {
+                    settingsRow("执行前先确认", detail: "防止闲聊表述误触发联网调研") {
+                        DSSwitch(isOn: branchConfirmBinding)
                     }
                 }
 
@@ -323,22 +335,32 @@ struct SettingsDialog: View {
         }
     }
 
-    /// 切换即写 AppStorage；easeInOut 事务令全窗口颜色交叉淡化（appAppearance 挂动画）。
+    /// 切换即写穿（持久化 + 应用 + 广播）；easeInOut 事务令全窗口颜色交叉淡化
+    /// （appAppearance 挂动画）。
     private var appearanceBinding: Binding<AppearanceMode> {
         Binding(
             get: { AppearanceMode(rawValue: appearanceRaw) ?? .system },
             set: { newValue in
                 withAnimation(.easeInOut(duration: 0.28)) {
                     appearanceRaw = newValue.rawValue
+                    AppearanceMode.setAppearance(newValue.rawValue)
                 }
             }
+        )
+    }
+
+    /// 分支执行前确认开关（意图误触发防护）：读静态助手（默认开），写穿 UserDefaults。
+    private var branchConfirmBinding: Binding<Bool> {
+        Binding(
+            get: { AnalysisRunner.confirmBeforeRunEnabled },
+            set: { AnalysisRunner.setConfirmBeforeRun($0) }
         )
     }
 
     // MARK: - 模型页（Xcode 偏好面板扁平形制：区头 + 行 + 发丝分隔，零卡片零投影）
 
     private var modelPage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 modelSection
                 budgetSection
@@ -706,7 +728,7 @@ struct SettingsDialog: View {
     // MARK: - 用量页（原「模型」Tab 内的 DisclosureGroup 独立成页）
 
     private var usagePage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 section(
                     "用量与成本",
@@ -723,7 +745,7 @@ struct SettingsDialog: View {
     // MARK: - 数据页（原 SettingsView「数据」Tab 平移）
 
     private var dataPage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 section(
                     "文件系统是唯一事实源",
@@ -765,7 +787,7 @@ struct SettingsDialog: View {
     // MARK: - 关于页（参考图「关于 TraeWork」）
 
     private var aboutPage: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 section(
                     "应用",
@@ -1040,15 +1062,26 @@ struct SettingsDialog: View {
         model.saveSettings()
     }
 
+    /// 全量重建（真实向量路径，2026-09-15 修复）：卡片 / 技能四字段由向量端点编码后
+    /// 写索引。旧实现调同步 rebuild 只写零长度占位向量 → 技能语义检索恒零命中 →
+    /// 技能路由退化为阶段锚点每轮兜底（离题提问也被注入阶段技能）。端点未配 Key /
+    /// 断网时 SettingsBackedEmbedder 落到确定性哈希兜底（管线保活），不阻塞。
+    /// 配好新向量端点后点此重建即用真实向量重嵌入（启动补偿只在缺失时才自动重建）。
     private func rebuildIndex() {
-        let dbURL = PMAgentStore.root.appendingPathComponent("index.sqlite")
-        do {
-            let db = try AppDatabase(indexURL: dbURL)
-            let report = try IndexRebuilder.rebuild(database: db)
-            rebuildResult =
-                "已重建：知识点 \(report.knowledgePoints) · 技能 \(report.skills)"
-        } catch {
-            rebuildResult = "重建失败：\(error.localizedDescription)"
+        rebuildResult = "重建中…"
+        Task {
+            let dbURL = PMAgentStore.root.appendingPathComponent("index.sqlite")
+            do {
+                let db = try AppDatabase(indexURL: dbURL)
+                let report = try await IndexRebuilder.rebuild(
+                    database: db,
+                    embeddingProvider: SettingsBackedEmbedder(settings: settings)
+                )
+                rebuildResult =
+                    "已重建：知识点 \(report.knowledgePoints) · 技能 \(report.skills)"
+            } catch {
+                rebuildResult = "重建失败：\(error.localizedDescription)"
+            }
         }
     }
 }
@@ -1138,7 +1171,7 @@ private struct ModelEditorSheet: View {
             VStack(spacing: 0) {
                 header
                 DSDivider()
-                ScrollView {
+                DSScroll {
                     form
                         .padding(.horizontal, DS.Spacing.s24)
                         .padding(.vertical, DS.Spacing.s20)

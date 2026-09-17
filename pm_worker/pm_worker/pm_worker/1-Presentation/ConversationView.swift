@@ -42,20 +42,19 @@ struct ConversationView: View {
     @State private var imeComposing = false
     /// 记忆抽屉（Task 4.7）：头部 brain 按钮 → 右缘滑出浮动卡。
     @State private var showMemoryDrawer = false
-    /// 澄清作答抽屉（右缘滑出，记忆抽屉同停靠位互斥）：所有点选作答统一收口。
-    /// 待答问题出现自动滑出一次；显式关闭后同问题不再自动滑出（触发 chip 兜底）。
+    /// 作答段开关（统一停靠卡 StageDockCard 内）：待答问题出现自动弹出一次；
+    /// 显式关闭后同问题不再自动弹出（触发 chip 兜底）。
     @State private var showClarifyDrawer = false
     @State private var clarifyAutoOpenedId: String?
     @State private var clarifyDismissedId: String?
-    /// 抽屉渲染缓存：提交后 pending 先清（用户消息入库），缓存内容撑完滑出动画。
-    /// 常驻隐藏挂载（opacity 0 + 滑出屏 + 禁命中），开销可忽略。
-    @State private var clarifyDrawerCache: PendingQuestion?
     /// 瞬态提示。
     @State private var notif: DSNotifMessage?
     /// 深浅色切换过渡动画的值锚点（对话框平滑变色的观察源）。
     @Environment(\.colorScheme) private var colorScheme
     /// 待发送附图（已拷入 attachments/，文件名引用 + 缩略预览）。
     @State private var pendingImages: [PendingImage] = []
+    /// 待发送的引用文件（相对版本目录路径；正文在发送时读盘注入本轮上下文）。
+    @State private var pendingFileRefs: [String] = []
     /// 吸底跟随开关：流式增量只在「视口本就在底部」时自动跟随。
     /// 用户向上滚动（滚轮/触控板/滚动条/键盘）即解除，滚回底部或新回合开始时恢复——
     /// 否则每次追底的 scrollTo 会把视口钉死在底部，表现为「生成中无法向上滚动」。
@@ -101,12 +100,24 @@ struct ConversationView: View {
                 )
                 DSDivider()
             }
-            // 确认坞（闸口确认）：与作答抽屉不冲突（抽屉浮于右缘，坞在输入区上方）。
-            // 弹出纪律（每阶段弹一次）：已「稍后再说」静默的阶段不挂载坞，
-            // 推进改由自由作答发起（design.md §6.1）
-            if let target = model.confirmTarget, !store.isStreaming,
-               !model.isConfirmGateDeferred(target) {
-                ConfirmDock(model: model, target: target)
+            // 统一停靠卡（作答段 → 确认段，同卡分步切换）：待答问题先作答，
+            // 答毕 / 显式关闭后同卡切换为阶段确认（闸口）。两段弹出纪律均不变——
+            // 作答段：新问题自动弹出一次，显式关闭后由触发 chip 兜底重开；
+            // 确认段：每版本每阶段弹一次，「稍后再说」持久静默，推进改由自由作答发起
+            //（design.md §6.1）。一次确认：① 的收尾确认问点选「确认」项即闸口确认
+            //（confirmStageByAnswer），答案留痕后直接收束，不再切确认段二次确认
+            if stageDockVisible {
+                StageDockCard(
+                    model: model,
+                    store: store,
+                    pending: pendingQuestion,
+                    showAnswerSection: showClarifyDrawer,
+                    confirmTarget: confirmDockTarget,
+                    branchPending: branchPending,
+                    stageLabel: stageShortName,
+                    onCloseAnswer: closeClarifyDrawer,
+                    onSubmitAnswer: submitClarifyAnswer
+                )
                 DSDivider()
             }
             // ④ 回退坞：显性入口——不必知道「魔法话术」也能重做上游，
@@ -117,8 +128,8 @@ struct ConversationView: View {
                 BacktrackDock(model: model)
                 DSDivider()
             }
-            // 澄清作答触发 chip：作答统一收口到右缘抽屉（ClarifyAnswerDrawer），
-            // 抽屉已关（显式关闭 / 收起动画完）但问题仍待答时的兜底入口，点击滑出抽屉
+            // 作答触发 chip：作答段已收起（显式关闭）但问题仍待答时的兜底入口，
+            // 点击重新弹出作答段（同卡切回作答）
             if pendingQuestion != nil, !showClarifyDrawer {
                 clarifyDrawerTrigger
                 DSDivider()
@@ -138,12 +149,9 @@ struct ConversationView: View {
         .onChange(of: pipeline.stage) { _, _ in
             Task { await model.refreshRecommendations() }
         }
-        // 作答抽屉：新待答问题出现（entry id 变化）→ 刷新缓存并自动滑出一次；
-        // 已答 / 已岔开（pending 清空）→ 抽屉收起（缓存撑完滑出动画）
+        // 作答坞：新待答问题出现（entry id 变化）→ 自动弹出一次；
+        // 已答 / 已岔开（pending 清空）→ 坞收起
         .onChange(of: pendingQuestion?.entryId) { _, newId in
-            if let pending = pendingQuestion {
-                clarifyDrawerCache = pending
-            }
             if newId == nil {
                 if showClarifyDrawer {
                     withAnimation(DS.Motion.spring) { showClarifyDrawer = false }
@@ -152,16 +160,18 @@ struct ConversationView: View {
                 syncClarifyDrawerAutoOpen()
             }
         }
-        // 流结束才判定新问题（流式写一半的末尾选项行不触发），并刷新缓存到终态
+        // 流结束才判定新问题（流式写一半的末尾选项行不触发）
         .onChange(of: store.isStreaming) { _, streaming in
             guard !streaming else { return }
-            if let pending = pendingQuestion {
-                clarifyDrawerCache = pending
-            }
             syncClarifyDrawerAutoOpen()
         }
-        // 打开会话即有待答问题 → 滑出一次
+        // 打开会话即有待答问题 → 自动弹出一次
         .task { syncClarifyDrawerAutoOpen() }
+        // 产物右键「添加到对话」：消费待插文件引用（onAppear 兜底跨页排队场景）
+        .onAppear { consumePendingFileReference() }
+        .onChange(of: model.pendingFileReference) { _, _ in
+            consumePendingFileReference()
+        }
         // 「这条记下来」归属分流弹窗（E10）
         .sheet(isPresented: bookmarkSheetPresented) {
             if let text = model.bookmarkDraft {
@@ -183,26 +193,6 @@ struct ConversationView: View {
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        // 澄清作答抽屉：右缘滑出（记忆抽屉同停靠位，互斥打开）。
-        // 挂载条件 = 有待答问题（或收起动画期间的缓存内容）；开合由 offset/opacity
-        // 驱动（提交后 pending 先清，缓存撑完滑出动画再等下次问题复用挂载）
-        .overlay(alignment: .trailing) {
-            if let content = clarifyDrawerContent {
-                ClarifyAnswerDrawer(
-                    wizard: content.wizard,
-                    options: content.options,
-                    entryId: content.entryId,
-                    isStreaming: store.isStreaming,
-                    onClose: closeClarifyDrawer,
-                    onSubmit: submitClarifyAnswer
-                )
-                .padding(.vertical, DS.Spacing.s12)
-                .padding(.trailing, DS.Spacing.s12)
-                .offset(x: showClarifyDrawer ? 0 : 480)
-                .opacity(showClarifyDrawer ? 1 : 0)
-                .allowsHitTesting(showClarifyDrawer)
-            }
-        }
     }
 
     /// bookmarkDraft ≠ nil → 弹窗展示（收起 = cancelBookmarkCapture）。
@@ -221,7 +211,8 @@ struct ConversationView: View {
         NSWorkspace.shared.open(url)
     }
 
-    // MARK: - 顶栏（原型 vibrancy 44 高：返回 · 项目名 · 版本下拉 · 会话胶囊 · 目标 · 成本）
+    // MARK: - 顶栏（原型 vibrancy 44 高：返回 · 项目名 · 会话胶囊 · 目标 · 成本；
+    //  版本切换下拉已摘除——版本归属由左栏树 / 项目主页表达，顶栏不再重复）
 
     private var header: some View {
         HStack(spacing: DS.Spacing.s10) {
@@ -241,14 +232,10 @@ struct ConversationView: View {
             Text(project)
                 .font(DS.Font.bodyMDStrong)
                 .foregroundStyle(Color.ink900)
-
-            versionMenu
+                .lineLimit(1)
+                .truncationMode(.tail)
 
             sessionChip
-
-            if pipeline.prdStale {
-                DSTag(title: "PRD 已过期", variant: .warning)
-            }
 
             if let goal = projectGoal, !goal.isEmpty {
                 Text(goal)
@@ -290,7 +277,7 @@ struct ConversationView: View {
     }
 
     /// 记忆抽屉开合（右缘滑出 / 收回，动画驱动 transition）。
-    /// 与澄清作答抽屉同停靠位（右缘浮层）：开一个关另一个，防双层堆叠。
+    /// 与澄清作答坞互斥：作答时开记忆抽屉会遮住底部作答坞，开一个关另一个。
     private func toggleMemoryDrawer() {
         withAnimation(DS.Motion.spring) {
             showMemoryDrawer.toggle()
@@ -300,9 +287,36 @@ struct ConversationView: View {
         }
     }
 
-    // MARK: - 澄清作答抽屉（开合 / 提交 / 触发 chip）
+    // MARK: - 统一停靠卡（作答段开合 / 提交 / 触发 chip）
 
-    /// 待答问题出现 → 自动滑出一次；显式关闭后同问题不再自动滑出
+    /// 确认段闸口（非 nil 即挂载确认段）：闸口就绪 + 非流式 + 非待回复 + 未静默。
+    /// （待回复期挂上会在「正在思考」上方叠确认卡、开流后又藏——闪现；一律等流结束再挂）
+    private var confirmDockTarget: AppModel.ConfirmTarget? {
+        guard let target = model.confirmTarget, !store.isStreaming,
+              !store.isPreparingReply,
+              !model.isConfirmGateDeferred(target) else { return nil }
+        return target
+    }
+
+    /// 分支确认待决（意图误触发防护）：归属本会话才可见（挂起态绑定发起会话），
+    /// 非流式 / 非待回复（同确认段防闪现口径——流中挂上会与「正在思考」叠卡）。
+    private var branchPending: AppModel.PendingBranchConfirmation? {
+        guard !store.isStreaming, !store.isPreparingReply else { return nil }
+        guard let pending = model.pendingBranchConfirmation,
+              pending.sessionId == store.sessionId else { return nil }
+        return pending
+    }
+
+    /// 统一停靠卡可见性：作答段 / 分支确认段 / 确认段任一成立（卡内按优先级切段）；
+    /// 确认链进行中（要点表抽取 / 下游生成）整卡抑制——防推进空窗内确认卡闪现。
+    private var stageDockVisible: Bool {
+        !model.stageConfirmRunning
+            && ((pendingQuestion != nil && showClarifyDrawer)
+                || branchPending != nil
+                || confirmDockTarget != nil)
+    }
+
+    /// 待答问题出现 → 自动弹出一次；显式关闭后同问题不再自动弹出
     /// （兜底入口 = 输入区上方触发 chip）。流式中不判定（写一半的选项行）。
     private func syncClarifyDrawerAutoOpen() {
         guard let pending = pendingQuestion, !store.isStreaming else { return }
@@ -315,20 +329,37 @@ struct ConversationView: View {
         }
     }
 
-    /// 显式关闭（X / 跳过此题）：记下当前问题 id，同问题不再自动滑出。
+    /// 显式关闭（X / 跳过此题）：记下当前问题 id，同问题不再自动弹出。
     private func closeClarifyDrawer() {
         withAnimation(DS.Motion.spring) { showClarifyDrawer = false }
         clarifyDismissedId = pendingQuestion?.entryId
     }
 
-    /// 抽屉提交（多题向导拼装消息 / 单题点选即发 / 自由输入）：
-    /// 走 sendMessage 通道，答案随用户消息留痕，pending 清空后抽屉收起。
+    /// 作答坞提交（多题向导拼装消息 / 单题点选即发 / 自由输入）：
+    /// 走 sendMessage 通道，答案随用户消息留痕，pending 清空后坞收起。
+    /// 一次确认（① 澄清）：收尾确认问点选「确认」开头选项 = 闸口确认——答案留痕后
+    /// 直接收束（要点表 + 进②），AI 不再应答一轮、确认段不再二次弹出。
     private func submitClarifyAnswer(_ text: String) {
         withAnimation(DS.Motion.spring) { showClarifyDrawer = false }
+        if let pending = pendingQuestion, pending.wizard == nil, pending.isGateConfirm,
+           AppModel.isGateConfirmSelection(text, options: pending.options?.options ?? []) {
+            Task { await model.confirmStageByAnswer(text) }
+            return
+        }
         Task { await model.sendMessage(text) }
     }
 
-    /// 触发 chip：抽屉已收起但问题仍待答时的兜底入口。
+    /// 当前阶段短名（作答坞题干系统行的 mono 眉标：追问 · ③ 原型）。
+    private var stageShortName: String {
+        switch pipeline.stage {
+        case .clarify: "① 澄清"
+        case .structure: "② 结构"
+        case .prototype: "③ 原型"
+        case .prd: "④ PRD"
+        }
+    }
+
+    /// 触发 chip：作答坞已收起但问题仍待答时的兜底入口。
     private var clarifyDrawerTrigger: some View {
         let count = pendingQuestion?.wizard?.questions.count ?? 1
         return Button {
@@ -350,68 +381,6 @@ struct ConversationView: View {
             .overlay(Capsule().strokeBorder(Color.brand300, lineWidth: 1))
         }
         .buttonStyle(.plain)
-    }
-
-    /// 项目下的版本列表（含封板态，用于顶栏下拉）。
-    private var versionNodes: [VersionNode] {
-        model.projects.first { $0.name == project }?.versions ?? []
-    }
-
-    /// 版本切换（原型 select）：mono 边框胶囊；封板版本警示色 + 只读标注。
-    private var versionMenu: some View {
-        Menu {
-            ForEach(versionNodes) { node in
-                Button {
-                    switchVersion(node.name)
-                } label: {
-                    if node.isReleased {
-                        Text("\(node.displayName) · 只读")
-                    } else {
-                        Text(node.displayName)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: DS.Spacing.s4) {
-                Text(currentVersionNode?.displayName ?? version)
-                    .font(DS.Font.monoSM)
-                    .foregroundStyle(
-                        // 坑：三元必须写全类型，隐式成员语法会让重载解析崩溃
-                        model.currentVersionReleased ? Color.statusWarning : Color.ink700
-                    )
-                DSIcon(.down, size: 10)
-                    .foregroundStyle(Color.ink300)
-            }
-            .padding(.horizontal, DS.Spacing.s8)
-            .padding(.vertical, DS.Spacing.s3)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.md)
-                    .fill(Color.surfaceBase)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.md)
-                    .strokeBorder(Color.borderL1, lineWidth: 1)
-            )
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("切换版本（封板版本只读）")
-    }
-
-    private var currentVersionNode: VersionNode? {
-        versionNodes.first { $0.name == version }
-    }
-
-    /// 切版本：目标版本有会话 → 打开其最近活跃会话；否则进项目主页。
-    private func switchVersion(_ target: String) {
-        guard target != version else { return }
-        let sessions = SessionStore.sessions(in: project, version: target)
-        if let latest = sessions.first {
-            model.selection = .session(project: project, version: target, sessionId: latest.id)
-        } else {
-            model.selection = .projectHome(project)
-        }
     }
 
     /// 当前会话胶囊（原型第三层节点：run 状态点 + 标题，边框胶囊 maxWidth 240）。
@@ -463,14 +432,16 @@ struct ConversationView: View {
         return String(format: "本月 ¥%.2f", agg.costCNY)
     }
 
-    // MARK: - 消息流（纯文字回答块 · maxWidth 720 居中 · 消息间距 24 呼吸感）
+    // MARK: - 消息流（纯文字回答块 · maxWidth 720 居中 · 消息间距 52 呼吸感）
 
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
+            DSScroll {
                 // LazyVStack：长对话只实例化视口附近的消息（虚拟化）——
                 // 旧 VStack 全量持有全部气泡视图，是长会话内存与滚动开销的主因。
-                LazyVStack(alignment: .leading, spacing: DS.Spacing.s24) {
+                // 间距 0：轮距 52 改由逐项 topInset 承载（2026-09 呼吸感改版 B+C；
+                // 提示行簇内 12–16，不吃整段轮距）。
+                LazyVStack(alignment: .leading, spacing: 0) {
                     if store.entries.isEmpty && !store.isStreaming {
                         emptyState
                     }
@@ -482,6 +453,7 @@ struct ConversationView: View {
                             headerNotes: item.headerNotes,
                             footerNotes: item.footerNotes,
                             chainContinuation: item.chainContinuation,
+                            handover: item.handover,
                             project: project,
                             version: version,
                             onOpenSink: { tab in
@@ -507,21 +479,38 @@ struct ConversationView: View {
                         // 未变消息跳过 body 重算（流式期间每秒十次重渲染，
                         // 历史消息的内容/产物解析全部短路，长会话不随流式变卡）
                         .equatable()
+                        .padding(.top, item.topInset)
                         .dsSlideIn()
                         .id(item.entry.id)
                     }
                     // 流式气泡只在归属会话内渲染：流是全局单份的，生成途中切到
-                    // 其他会话不得显示同一份生成内容（回复完成自动落回发起会话）
-                    if store.isStreaming, store.streamingSessionID == store.sessionId {
+                    // 其他会话不得显示同一份生成内容（回复完成自动落回发起会话）。
+                    // 待回复期（消息已上屏、提示词组装中）同位渲染同一气泡——
+                    // 此时思考占位卡即「正在思考」，开流转正后无切换感。
+                    if (store.isStreaming && store.streamingSessionID == store.sessionId)
+                        || (store.isPreparingReply && store.preparingSessionID == store.sessionId) {
                         streamingBubble
+                            .padding(.top, streamingTopInset)
                             .dsSlideIn()
                             .id("streaming")
+                    }
+                    // P3 插话排队气泡：未注入生效的插话（user 气泡半透明 + 「已排队」）。
+                    // 注入生效 / 续发落盘后队列清空，由正式气泡替代。
+                    if (store.streamingSessionID == store.sessionId && store.isStreaming)
+                        || (store.preparingSessionID == store.sessionId && store.isPreparingReply),
+                       !store.steeringQueue.isEmpty || !store.followUpQueue.isEmpty {
+                        ForEach(store.steeringQueue + store.followUpQueue) { entry in
+                            steeringBubble(entry)
+                                .padding(.top, DS.Spacing.s12)
+                                .dsSlideIn()
+                                .id(entry.id)
+                        }
                     }
                 }
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity)
                 .padding(.top, DS.Spacing.s20)
-                .padding(.horizontal, DS.Spacing.s32)
+                .padding(.horizontal, DS.Spacing.s48)
                 .padding(.bottom, DS.Spacing.s12)
             }
             .onChange(of: store.entries.count) { _, _ in
@@ -533,8 +522,26 @@ struct ConversationView: View {
                 proxy.scrollTo("streaming", anchor: .bottom)
             }
             .onChange(of: store.isStreaming) { old, new in
-                // 新回合开始（发送 / 采纳推荐 / 确认推进）→ 恢复吸底跟随
-                if !old && new { stickToBottom = true }
+                // 新回合开始（发送 / 采纳推荐 / 确认推进）→ 恢复吸底跟随，并立刻
+                // 追到流式气泡（「正在思考…」卡）：思考阶段只有 streamingThink 在变
+                // （卡片高度固定），若不在此追底，首个正文 token 前视口纹丝不动，
+                // 用户无从得知已在回答（采纳推荐 / 确认推进回合没有新用户气泡，
+                // entries.count 追底也不会触发）。
+                guard new, !old else { return }
+                stickToBottom = true
+                // 流式气泡只在本会话渲染（见 messageList 同款条件），他会话回合不追
+                guard store.streamingSessionID == store.sessionId else { return }
+                // 异步一帧等条件分支（streamingBubble）完成挂载再滚，LazyVStack 才找得到 id
+                DispatchQueue.main.async { scrollToBottom(proxy, animated: true) }
+            }
+            .onChange(of: store.isPreparingReply) { old, new in
+                // 待回复态开始（发送 / followUp 续发）：思考占位卡与流式气泡同位，
+                // 挂载即追底——followUp 续发无新 entries、isStreaming 尚未翻转，
+                // 不在此追底则占位卡出现在视口外（发送轮有 entries.count 追底兜底）。
+                guard new, !old else { return }
+                stickToBottom = true
+                guard store.preparingSessionID == store.sessionId else { return }
+                DispatchQueue.main.async { scrollToBottom(proxy, animated: true) }
             }
             // 点击侧栏切换会话 / 首次进入对话页 → 自动定位到最后一条问答。
             // 视图身份在会话间切换时被 SwiftUI 复用（onAppear 不再触发），
@@ -582,9 +589,11 @@ struct ConversationView: View {
         return maxOffset - geo.contentOffset.y
     }
 
-    /// 滚到消息流底部：流式气泡在渲染时锚它，否则锚最后一条可见消息。
+    /// 滚到消息流底部：流式气泡（含待回复占位，同锚 id）在渲染时锚它，否则锚最后一条可见消息。
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        let target: String = if store.isStreaming, store.streamingSessionID == store.sessionId {
+        let streamingHere = store.isStreaming && store.streamingSessionID == store.sessionId
+        let preparingHere = store.isPreparingReply && store.preparingSessionID == store.sessionId
+        let target: String = if streamingHere || preparingHere {
             "streaming"
         } else {
             displayItems.last?.id ?? "streaming"
@@ -614,10 +623,17 @@ struct ConversationView: View {
     }
 
     /// 流式中的回答内容（头部注记 + 思考 spinner + 增量正文），与最终消息同构。
+    /// handover / live：链式续段顶部的交接条（值班单）；非链为 nil。
     @ViewBuilder
-    private var streamingInner: some View {
+    private func streamingInner(
+        handover: DutyHandover?, live: DutyHandoverBar.Live?
+    ) -> some View {
         let headerAssembly = MessageBubble.milestoneAssembly(from: streamingHeaderNotes)
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+            // 系统代答链交接条（值班单）：流式期即并入续段顶部（进行态计时 + 字数）
+            if let handover {
+                DutyHandoverBar(data: handover, live: live)
+            }
             // 回合注记（阶段推进/切档）在流式开始时即并入气泡顶部；
             // 携带里程碑载荷的行（评分卡）渲染为交付摘要条
             ForEach(Array(headerAssembly.leftovers.enumerated()), id: \.offset) { _, note in
@@ -634,11 +650,19 @@ struct ConversationView: View {
                     }
                 )
             }
-            // 原型：思考中 spinner + 流光扫字（含本轮引用技能）；文本开始输出后仅展示增量
-            if store.streamingThink.isEmpty && store.streamingText.isEmpty {
-                ThinkingCard(data: nil, skills: store.streamingSkills)
+            // 原型：思考中 spinner + 流光扫字（含本轮引用技能）；文本开始输出后仅展示增量。
+            // 瞬时故障自动重试中（429/5xx）：琥珀状态行替代思考卡——等待显性化，不像假死
+            if let retryNote = store.streamingRetry {
+                HStack(spacing: DS.Spacing.s8) {
+                    DSPulseDot(tint: .statusWarning)
+                    Text(retryNote)
+                        .font(DS.Font.bodySM)
+                        .foregroundStyle(Color.ink500)
+                }
+            } else if store.streamingThink.isEmpty && store.streamingText.isEmpty {
+                ThinkingCard(data: nil, reasoning: store.streamingThink, skills: store.streamingSkills, phase: store.streamingPhase)
             } else if !store.streamingThink.isEmpty {
-                ThinkingCard(data: nil, skills: store.streamingSkills)
+                ThinkingCard(data: nil, reasoning: store.streamingThink, skills: store.streamingSkills, phase: store.streamingPhase)
             }
             if !store.streamingText.isEmpty {
                 // 与最终消息同构的产物渲染；进行中的产物块（原型 HTML 等长代码）
@@ -659,30 +683,75 @@ struct ConversationView: View {
         let chained = MessageBubble.isFastForwardChainedBefore(
             store.entries.count, in: store.entries
         )
+        // 交接条（值班单）与链判定同集：段序号按已落盘段数顺延，
+        // 实时计量取本轮流数据（起始时刻 + 已生成字数）
+        let handover = chained
+            ? MessageBubble.dutyHandover(for: store.entries.count, in: store.entries)
+            : nil
+        let live = handover == nil ? nil : DutyHandoverBar.Live(
+            startedAt: store.streamingStartedAt,
+            charCount: store.streamingText.count
+        )
         return Group {
             if chained {
-                streamingInner
+                streamingInner(handover: handover, live: live)
             } else {
                 AgentMessageShell(stage: pipeline.stage, time: nil) {
-                    streamingInner
+                    streamingInner(handover: nil, live: nil)
                 }
             }
         }
     }
 
+    /// 插话排队气泡（P3）：user 气泡同形制（深底白字、右下角小圆角）但半透明，
+    /// 右上角「已排队」小标——注入生效 / 续发落盘后由正式气泡替代。
+    private func steeringBubble(_ entry: DiscussionEntry) -> some View {
+        HStack {
+            Spacer(minLength: 60)
+            VStack(alignment: .leading, spacing: DS.Spacing.s6) {
+                Text("已排队")
+                    .font(DS.Font.bodySMStrong)
+                    .foregroundStyle(Color.brand400)
+                Text(entry.content)
+                    .font(DS.Font.chatBase)
+                    .foregroundStyle(Color.white)
+                    .textSelection(.enabled)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 21)
+            .padding(.vertical, 16)
+            .background(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: DS.Radius.r20,
+                    bottomLeadingRadius: DS.Radius.r20,
+                    bottomTrailingRadius: DS.Radius.md,
+                    topTrailingRadius: DS.Radius.r20
+                )
+                .fill(Color.userBubble.opacity(0.55))
+            )
+        }
+    }
+
+    /// 流式气泡顶距（与 displayItems 共用 MessageBubble.topInset 口径）：
+    /// 链式续段并入上一条回答（簇内 16），常规回合吃 52 轮距。
+    /// 口径不一致会让续段在落盘瞬间跳开一段空白。
+    private var streamingTopInset: CGFloat {
+        let chained = MessageBubble.isFastForwardChainedBefore(
+            store.entries.count, in: store.entries
+        )
+        return MessageBubble.topInset(
+            for: .assistant, isFirst: displayItems.isEmpty,
+            previousWasSystem: false, isContinuation: chained
+        )
+    }
+
     private func isLastAssistant(_ entry: DiscussionEntry) -> Bool {
         // 全阶段放开（不止澄清）：②③④ 的歧义处理规则同样以末尾 A)/B) 选项行
-        // 收尾。末条 AI 回复的选项行统一折叠进右缘作答抽屉（ClarifyAnswerDrawer），
+        // 收尾。末条 AI 回复的选项行统一折叠进统一停靠卡的作答段（StageDockCard），
         // 消息流不再渲染点选项；该消息不再是末条后选项行随原文回归留痕。
         guard entry.role == .assistant else { return false }
         return entry.id == store.entries.last(where: { $0.role == .assistant })?.id
-    }
-
-    /// 待答问题快照（作答抽屉数据源）：多题问题卡优先，否则单题末尾选项行。
-    private struct PendingQuestion {
-        let entryId: String
-        let wizard: ArtifactParser.QuestionCardRequest?
-        let options: ArtifactParser.ClarifyOptions?
     }
 
     /// ① 多题问题卡待答：最新 assistant 回复中的 artifact:question-card 块，限澄清阶段。
@@ -700,20 +769,24 @@ struct ConversationView: View {
         return request
     }
 
-    /// 单题待答：末条 assistant 回复末尾的连续 A)/B) 选项行（全阶段放开——
+    /// 选项行问题组待答：末条 assistant 回复末尾的连续 A)/B) 选项行组（全阶段放开——
     /// ②③④ 的歧义处理同样以选项行收尾，与原流内 chips 同口径）。
     /// 该回复之后已存在任何用户消息（已作答 / 已岔开）→ 不再算待答。
-    private var pendingClarifyOptions: ArtifactParser.ClarifyOptions? {
+    private var pendingOptionLineGroups: ArtifactParser.OptionLineQuestionGroups? {
         guard let lastAssistantIndex = store.entries.lastIndex(where: { $0.role == .assistant }),
-              let options = ArtifactParser.parseClarifyOptions(in: store.entries[lastAssistantIndex].content)
+              let groups = ArtifactParser.parseOptionLineQuestionGroups(
+                  in: store.entries[lastAssistantIndex].content
+              )
         else { return nil }
         if store.entries.dropFirst(lastAssistantIndex + 1).contains(where: { $0.role == .user }) {
             return nil
         }
-        return options
+        return groups
     }
 
-    /// 待答问题（作答抽屉数据源）：多题问题卡优先，否则单题选项行。
+    /// 待答问题（作答坞数据源）：多题问题卡优先；选项行组 ≥2 转问题卡向导
+    /// （逐题作答：第 1 题 → 下一道题 → 第 2 题，与问题卡同一流程同一样式）；
+    /// 单组保持单题点选即发表单。
     private var pendingQuestion: PendingQuestion? {
         guard let lastAssistantIndex = store.entries.lastIndex(where: { $0.role == .assistant })
         else { return nil }
@@ -721,15 +794,39 @@ struct ConversationView: View {
         if let wizard = pendingQuestionCard {
             return PendingQuestion(entryId: entryId, wizard: wizard, options: nil)
         }
-        if let options = pendingClarifyOptions {
-            return PendingQuestion(entryId: entryId, wizard: nil, options: options)
+        if let groups = pendingOptionLineGroups {
+            if groups.questions.count >= 2 {
+                // 选项行多组 → 问题卡向导：每组成一题（单选 + 自定义输入，题型按题干启发式）
+                let request = ArtifactParser.normalizeQuestionCard(
+                    ArtifactParser.QuestionCardRequest(
+                        questions: groups.questions.map { group in
+                            ArtifactParser.QuestionCardRequest.Question(
+                                id: nil, title: group.title, detail: nil,
+                                options: group.options, allowCustom: true, multiple: nil
+                            )
+                        }
+                    )
+                )
+                if let request {
+                    return PendingQuestion(entryId: entryId, wizard: request, options: nil)
+                }
+            }
+            if let single = groups.questions.first {
+                return PendingQuestion(
+                    entryId: entryId, wizard: nil,
+                    options: ArtifactParser.ClarifyOptions(
+                        question: groups.bodyText, options: single.options
+                    ),
+                    // 一次确认（① 澄清）：收尾确认问标记 + 单组 + 闸口就绪才生效
+                    //（多组转问题卡 / 非①阶段 / 闸口未就绪 → 常规作答）
+                    isGateConfirm: groups.gateConfirm
+                        && groups.questions.count == 1
+                        && pipeline.stage == .clarify
+                        && model.confirmTarget == .clarify
+                )
+            }
         }
         return nil
-    }
-
-    /// 抽屉渲染内容：活体待答优先，提交后收起动画期间走缓存。
-    private var clarifyDrawerContent: PendingQuestion? {
-        pendingQuestion ?? clarifyDrawerCache
     }
 
     // MARK: - 系统事件三分层（独立可见 / 融入回答 / 静默）
@@ -741,6 +838,11 @@ struct ConversationView: View {
         let footerNotes: [TurnNote]
         /// 快速通道链式续段：不出独立回答头，内容衔接上一回合（一条消息一条回答）。
         var chainContinuation: Bool = false
+        /// 系统代答链交接条（值班单）：仅链式续段有值（首段 / 非链为 nil）。
+        var handover: DutyHandover? = nil
+        /// 顶距（按相邻项类型算，见 displayItems）：提示行不吃 52 轮距，
+        /// 簇内紧凑（消息→提示 16、提示→提示 12），消息轮间仍 52。
+        var topInset: CGFloat = 0
         var id: String { entry.id }
     }
 
@@ -760,20 +862,39 @@ struct ConversationView: View {
             ? MessageBubble.streamingAbsorbedIndices(in: entries)
             : []
         var items: [DisplayItem] = []
+        // 顶距按「上一个已渲染项」的类别算：提示行（💬 留痕 / 事件胶囊）是
+        // 前一条回答的脚注簇，簇内 12–16，不摊 52 的轮距；消息轮间恒 52。
+        var previousWasSystem = false
         for (index, entry) in entries.enumerated() {
             if entry.role == .system && entry.memory != nil { continue }
             if entry.role == .system && streamingAbsorbed.contains(index) { continue }
             if entry.role == .assistant {
+                // 交接条与「续段不出独立回答头」同判据，门控在 chained——
+                // 避免每条 assistant 都跑一次链回溯
+                let chained = MessageBubble.isFastForwardChainedBefore(index, in: entries)
                 items.append(DisplayItem(
                     entry: entry,
                     headerNotes: MessageBubble.mergeableNotes(before: index, in: entries),
                     footerNotes: MessageBubble.mergeableNotes(after: index, in: entries),
-                    chainContinuation: MessageBubble.isFastForwardChainedBefore(index, in: entries)
+                    chainContinuation: chained,
+                    handover: chained ? MessageBubble.dutyHandover(for: index, in: entries) : nil,
+                    topInset: MessageBubble.topInset(
+                        for: .assistant, isFirst: items.isEmpty,
+                        previousWasSystem: previousWasSystem, isContinuation: chained
+                    )
                 ))
+                previousWasSystem = false
             } else if entry.role == .system && merged.contains(index) {
                 continue
             } else {
-                items.append(DisplayItem(entry: entry, headerNotes: [], footerNotes: []))
+                items.append(DisplayItem(
+                    entry: entry, headerNotes: [], footerNotes: [],
+                    topInset: MessageBubble.topInset(
+                        for: entry.role, isFirst: items.isEmpty,
+                        previousWasSystem: previousWasSystem, isContinuation: false
+                    )
+                ))
+                previousWasSystem = true
             }
         }
         return items
@@ -786,9 +907,9 @@ struct ConversationView: View {
 
     // MARK: - 输入区（对话框组件 · 参考图 Trae 输入卡两段式布局）
 
-    /// 输入卡：radius 16 浮起卡（composerSurface）+ 渐进描边（idle L1 → focus L3）
-    /// + 贴地阴影；卡内自上而下 = 待发附图条 → 编辑区 → 工具栏
-    /// （左：附件 + / 记下来 · 右：当前模型 → 设置模型页 / 发送钮 32×32 r10 品牌紫）。
+    /// 输入卡：radius 20 悬浮坞（composerSurface + overlayBorder 发丝边 + .dock 双层大软阴影，
+    /// 2026-09 呼吸感改版）；卡内自上而下 = 待发附图条 → 待发引用文件 chips →
+    /// 编辑区 → 工具栏（左：附件 + / 记下来 · 右：当前模型 → 设置模型页 / 发送钮 32×32 r10 品牌紫）。
     /// 深浅色由 DS 动态令牌承载，卡上挂 colorScheme 动画保证切换平滑过渡。
     private var inputBar: some View {
         VStack(spacing: 0) {
@@ -805,6 +926,21 @@ struct ConversationView: View {
                     .padding(.horizontal, DS.Spacing.s2)
                     .padding(.bottom, DS.Spacing.s8)
                 }
+            }
+
+            // 待发送引用文件条（产物台账右键「添加到对话」；正文发送时读盘注入）
+            if !pendingFileRefs.isEmpty {
+                FlowLayout(spacing: DS.Spacing.s6) {
+                    ForEach(pendingFileRefs, id: \.self) { ref in
+                        ReferencedFileChip(relativePath: ref) {
+                            withAnimation(DS.Motion.springFast) {
+                                pendingFileRefs.removeAll { $0 == ref }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, DS.Spacing.s2)
+                .padding(.bottom, DS.Spacing.s8)
             }
 
             inputEditor
@@ -844,14 +980,20 @@ struct ConversationView: View {
                 // （写透 stages 即时生效，「添加模型…」直达设置模型页）
                 ComposerModelButton(model: model)
 
-                // 流式回复中（本会话为发起者）→ 停止钮（红色，点击即终止生成）；
-                // 其余状态 → 发送钮（空闲/他人会话流式时维持原禁用逻辑）
+                // 流式回复中（本会话为发起者）→ 单钮互替：草稿有字 = 插话发送钮，
+                // 清空即翻回停止钮（插话仅支持文本，附件不参与判据）；其余状态 → 发送钮
                 if store.isStreaming, store.streamingSessionID == store.sessionId {
-                    ComposerStopButton {
-                        store.stopGeneration()
+                    if canInterject {
+                        ComposerSendButton(enabled: true, help: "插话：不打断生成，生成结束后自动送达") {
+                            send()
+                        }
+                    } else {
+                        ComposerStopButton {
+                            store.stopGeneration()
+                        }
                     }
                 } else {
-                    ComposerSendButton(enabled: canSend && !store.isStreaming) {
+                    ComposerSendButton(enabled: canSend) {
                         send()
                     }
                 }
@@ -861,30 +1003,28 @@ struct ConversationView: View {
         .padding(.horizontal, DS.Spacing.s16)
         .padding(.top, DS.Spacing.s12)
         .padding(.bottom, DS.Spacing.s10)
+        // 2026-09 呼吸感改版：悬浮输入坞——去渐进描边，双层大软阴影 + overlayBorder
+        // 发丝边勾轮廓（DSMenu 同款写法）；聚焦反馈由 accent 焦点环独立承担
         .background(
-            RoundedRectangle(cornerRadius: DS.Radius.big)
+            RoundedRectangle(cornerRadius: DS.Radius.r20)
                 .fill(Color.composerSurface)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.big)
-                .strokeBorder(
-                    // 坑：三元必须写全类型
-                    inputFocused ? Color.borderL3 : Color.borderL1,
-                    lineWidth: 1
-                )
+            RoundedRectangle(cornerRadius: DS.Radius.r20)
+                .strokeBorder(Color.overlayBorder, lineWidth: 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.big))
-        .dsShadow(.card)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.r20))
+        .dsShadow(.dock)
         // Xcode 语义焦点环：accent 环绕取代描边式焦点（P0-①）
-        .dsFocusRing(focused: inputFocused, radius: DS.Radius.big)
+        .dsFocusRing(focused: inputFocused, radius: DS.Radius.r20)
         // 深浅色切换平滑过渡（与 appAppearance 根 0.28s 交叉淡化同参数）
         .animation(.easeInOut(duration: 0.28), value: colorScheme)
-        // 响应式：与消息流同列宽（720 + 64 页边距）居中，窄窗口随 min 480 收缩
-        .frame(maxWidth: 720 + DS.Spacing.s64)
+        // 响应式：与消息流同宽（720）居中，窄窗口随 min 480 收缩
+        .frame(maxWidth: 720)
         .frame(maxWidth: .infinity)
         .padding(.top, DS.Spacing.s10)
-        .padding(.horizontal, DS.Spacing.s32)
-        .padding(.bottom, DS.Spacing.s16)
+        .padding(.horizontal, DS.Spacing.s48)
+        .padding(.bottom, DS.Spacing.s24)
     }
 
     /// 编辑区：占位左上（composerPlaceholder AA 达标）+ 随内容增高
@@ -915,12 +1055,12 @@ struct ConversationView: View {
                 if !focused { imeComposing = false }
             }
             .onKeyPress { press in
-                // ⏎ 直接发送（⇧⏎ 换行）；不可发送时回车保持系统换行行为
+                // ⏎ 直接发送（⇧⏎ 换行；发起会话流式中 = 插话，send 内部分流）；
+                // 不可发送时回车保持系统换行行为
                 guard press.key == .return,
                       press.phase == .down,
                       !press.modifiers.contains(.shift),
-                      canSend,
-                      !store.isStreaming
+                      canSend
                 else { return .ignored }
                 send()
                 return .handled
@@ -935,18 +1075,53 @@ struct ConversationView: View {
         return "回复 Agent…（\(pipeline.stage.proto.num) 每轮只问一个最关键的问题）"
     }
 
-    /// 可发送：有文本或有待发附图（纯图消息也允许）。
+    /// 可发送：有文本、有待发附图或待发引用文件（纯附件消息也允许）。
     private var canSend: Bool {
         !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !pendingImages.isEmpty
+            || !pendingFileRefs.isEmpty
+    }
+
+    /// 流式中单钮互替判据：草稿有字 → 显示插话发送钮，清空 → 翻回停止钮。
+    /// （插话仅支持文本：附件/引用文件流式期间不可送达，不参与判据）
+    private var canInterject: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 产物右键「添加到对话」：把待引用文件追加进输入坞 chips 并聚焦输入框。
+    /// 追加而非覆盖（保留已输入内容与既有引用）；同一文件重复添加是 no-op。
+    private func consumePendingFileReference() {
+        guard let path = model.pendingFileReference else { return }
+        model.pendingFileReference = nil
+        guard !pendingFileRefs.contains(path) else {
+            inputFocused = true
+            return
+        }
+        pendingFileRefs.append(path)
+        inputFocused = true
     }
 
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = pendingImages
-        guard !text.isEmpty || !images.isEmpty, !store.isStreaming else { return }
+        let fileRefs = pendingFileRefs
+        guard !text.isEmpty || !images.isEmpty || !fileRefs.isEmpty else { return }
+
+        // P3 Steering：发起会话生成进行中（含回复流未开的待回复期）→
+        // 文本插话入队（不打断生成）。附件/引用文件不支持插话携带：
+        // 保留在输入坞，正文为空时不动作。
+        if (store.isStreaming && store.streamingSessionID == store.sessionId)
+            || (store.isPreparingReply && store.preparingSessionID == store.sessionId) {
+            guard !text.isEmpty else { return }
+            draft = ""
+            Task { await model.sendMessage(text) }
+            return
+        }
+
+        guard !store.isStreaming else { return }
         draft = ""
         pendingImages = []
+        pendingFileRefs = []
 
         // 自由作答「进入下一个阶段」等价选①（design.md §6.1）
         if model.confirmTarget != nil && !text.isEmpty
@@ -955,7 +1130,9 @@ struct ConversationView: View {
             return
         }
         Task {
-            await model.sendMessage(text, imageFiles: images.map(\.fileName))
+            await model.sendMessage(
+                text, imageFiles: images.map(\.fileName), fileRefs: fileRefs
+            )
         }
     }
 
@@ -976,11 +1153,14 @@ struct ConversationView: View {
                   let image = NSImage(data: data) else { return nil }
             return PendingImage(fileName: file, preview: image)
         }
+        pendingFileRefs = origin.files
         send()
     }
 
-    /// 触发指定 AI 回答的原始用户消息（含附图）：委托可测静态实现。
-    private func originalUserMessage(before entry: DiscussionEntry) -> (content: String, images: [String])? {
+    /// 触发指定 AI 回答的原始用户消息（含附图 / 引用文件）：委托可测静态实现。
+    private func originalUserMessage(
+        before entry: DiscussionEntry
+    ) -> (content: String, images: [String], files: [String])? {
         MessageBubble.originalUserMessage(before: entry.id, in: store.entries)
     }
 
@@ -1026,21 +1206,20 @@ struct AgentMessageShell<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // 名称行：头像 + Agent（600）+ 时间（mono tertiary）；阶段身份由头像编号/主色表达
+            // 名称行：头像 + Agent（600）+ 时间（mono tertiary）；阶段身份由头像编号/主色表达。
+            // 2026-09 呼吸感改版：去 hairline 分隔线 + 名称降次级灰（降噪——
+            // 轮次分隔交给 52pt 纯留白，名称行不再与正文抢层级）。
             HStack(spacing: DS.Spacing.s8) {
                 StageAvatar(stage: stage, size: 22)
                 Text("Agent")
                     .font(DS.Font.bodySMStrong)
-                    .foregroundStyle(Color.ink900)
+                    .foregroundStyle(Color.ink500)
                 if let time {
                     Text(time)
                         .font(DS.Font.monoSM)
                         .foregroundStyle(Color.ink300)
                 }
             }
-            // 名称行下的 hairline：行距 8 / 线到正文 12（参考图非对称节奏，精确控制）
-            DSDivider()
-                .padding(.top, DS.Spacing.s8)
             // 正文：纯文字直接铺在画布上（无背景 / 无描边 / 无限宽收缩），层级靠排版
             content
                 .padding(.top, DS.Spacing.s12)
@@ -1207,6 +1386,9 @@ struct MilestoneRow: Identifiable {
     var isNext: Bool = false
     /// 评分卡专用：三维度分数条（非空时 detail 理由改为 hover 才展开）。
     var dims: [MilestoneDim]? = nil
+    /// 方案 A 回执脚注：快速通道自动确认句（「快速通道 · 自动确认，继续生成 ③ 原型」）。
+    /// 非空时回执脚注走自动确认态（快速通道链无确认坞，禁指路确认坞）。
+    var autoNote: String? = nil
 }
 
 /// 回合注记行（安静 meta 行：12px 图标 + bodyXS 次要文字，不与正文争夺注意力）。
@@ -1259,8 +1441,8 @@ private struct ScoreDimChip: View {
     }
 }
 
-/// 回合交付摘要条（方案 B：默认展开，可点击整行折叠）：默认展出审计明细行 +
-/// 机器初审等待态，摘要行点击折叠为一行——✓ 已交付产物 + 审计计数段。
+/// 回合交付摘要条（方案 B：默认展开，可点击整行折叠）：默认展出审计明细行，
+/// 摘要行点击折叠为一行——✓ 已交付产物 + 审计计数段。
 /// 落盘文件卡独立渲染在摘要条外部（不内嵌）。
 /// 展开态纯 UI 状态不落盘（刷新回默认展开）。行 hover 点亮去向，点击直达右栏对应 Tab。
 struct DigestBar: View {
@@ -1268,7 +1450,6 @@ struct DigestBar: View {
     var openSink: ((InspectorPanel.InspectorTab) -> Void)? = nil
 
     @State private var expanded = true
-    @State private var hovered = false
     @State private var hoveredRowID: String?
 
     var body: some View {
@@ -1278,15 +1459,15 @@ struct DigestBar: View {
                 panel
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.lg).fill(Color.surfaceSecondary)
-        )
+        // 2026-09-15 钦定：外框回归——发丝边框圈出模块边界（无 bg 无阴影，保持注脚安静感），
+        // 摘要行降字号降灰与展开面板明细行交互、hover 跳转高亮（hoveredRowID）全部保留。
+        // 2026-09-15 呼吸感：内衬横向 s12→s16，摘要行/分隔线/明细行留白整体放大一档。
+        .padding(.horizontal, DS.Spacing.s16)
         .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.lg)
-                .strokeBorder(hovered ? Color.borderL2 : Color.borderL1, lineWidth: 1)
+            RoundedRectangle(cornerRadius: DS.Radius.xxl)
+                .strokeBorder(Color.borderL1, lineWidth: 1)
         )
         .animation(DS.Motion.spring, value: expanded)
-        .onHover { hovered = $0 }
     }
 
     // MARK: 摘要行（默认态，整行可点）
@@ -1295,16 +1476,16 @@ struct DigestBar: View {
         Button {
             withAnimation(DS.Motion.spring) { expanded.toggle() }
         } label: {
-            HStack(spacing: DS.Spacing.s8) {
+            HStack(spacing: DS.Spacing.s10) {
                 DSIcon(.circleCheck, size: 14)
                     .foregroundStyle(Color.statusSuccess)
                 Text(title)
-                    .font(DS.Font.bodySMStrong)
-                    .foregroundStyle(Color.ink800)
+                    .font(DS.Font.bodyFootnote.weight(.medium))
+                    .foregroundStyle(Color.ink500)
                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                     HStack(spacing: 4) {
                         Text(seg.label)
-                            .font(DS.Font.bodyXS)
+                            .font(DS.Font.bodyFootnote)
                             .foregroundStyle(seg.warn ? Color.statusWarning : Color.ink500)
                         if let count = seg.count {
                             Text(count)
@@ -1313,7 +1494,7 @@ struct DigestBar: View {
                         }
                         if seg.warn {
                             Text("超限")
-                                .font(DS.Font.bodyXS)
+                                .font(DS.Font.bodyFootnote)
                                 .foregroundStyle(Color.statusWarning)
                         }
                     }
@@ -1323,8 +1504,8 @@ struct DigestBar: View {
                     .foregroundStyle(Color.ink300)
                     .rotationEffect(.degrees(expanded ? 0 : 180))
             }
-            .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s8)
+            .padding(.horizontal, 0)
+            .padding(.vertical, DS.Spacing.s12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1395,20 +1576,19 @@ struct DigestBar: View {
                     Rectangle()
                         .fill(Color.borderL1)
                         .frame(height: 1)
-                        .padding(.vertical, DS.Spacing.s3)
+                        .padding(.vertical, DS.Spacing.s8)
                 }
                 detailRow(row)
             }
-            footer
         }
-        .padding(.bottom, DS.Spacing.s6)
+        .padding(.bottom, DS.Spacing.s10)
     }
 
     /// 明细行：图标 + 主体名 + mono 计数 + 同行尾注，去向右置（hover 点亮，点击跳右栏）；
     /// 次行补注 / 评分卡维度条随行展开。
     private func detailRow(_ row: MilestoneRow) -> some View {
-        VStack(alignment: .leading, spacing: DS.Spacing.s2) {
-            HStack(spacing: DS.Spacing.s8) {
+        VStack(alignment: .leading, spacing: DS.Spacing.s6) {
+            HStack(spacing: DS.Spacing.s10) {
                 DSIcon(row.icon, size: 13)
                     .foregroundStyle(row.tint)
                 Text(row.name)
@@ -1448,8 +1628,204 @@ struct DigestBar: View {
                 }
             }
         }
-        .padding(.horizontal, DS.Spacing.s12)
-        .padding(.vertical, DS.Spacing.s4)
+        .padding(.horizontal, 0)
+        .padding(.vertical, DS.Spacing.s8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            guard row.tab != nil else { return }
+            hoveredRowID = hovering ? row.id : nil
+        }
+        .onTapGesture {
+            guard let tab = row.tab, let openSink else { return }
+            openSink(tab)
+        }
+    }
+}
+
+// MARK: - 交付回执卡（系统消息改版 · 方案 A「一次交付，一张回执」）
+
+/// 阶段完成后的所有交付信息收进一张结构化卡：产物是主行，沉淀是次行，下一步是脚注。
+/// 取代回合尾部的交付摘要条 + 独立落盘文件卡 + 机器初审居中注脚——散落的 chips、
+/// 注记、胶囊收编进卡，每条信息只出现一次。文案从「机器播报」改写为「交付对账」：
+/// 短句、数量前置、去向可点。
+/// - 主行：📦 注记携带的 fileChanges（含原型——回执承载期产物块文件卡静默防双卡）；
+/// - 沉淀行：里程碑装配行（自评审 / 风险 / 决策记录，点击直达右栏对应 Tab）；
+/// - 脚注三态由 `MessageBubble.receiptFooter` 推导（机器初审中 / 确认坞指路 /
+///   快速通道自动确认），推进动作只活在确认坞，回执只指路不替按。
+private struct DeliveryReceiptCard: View {
+    let stage: PipelineRun.Stage
+    /// 回执时间（HH:mm，与回答头时间同源）。
+    let time: String?
+    /// 里程碑装配行（全量；沉淀行与脚注各自过滤派生）。
+    let rows: [MilestoneRow]
+    /// 📦 注记携带的落盘文件（组内去重保序）。
+    let files: [FileChangeSummary]
+    let project: String
+    let version: String
+    /// 沉淀行点击 → 右栏对应 Tab；nil = 行仅展示。
+    var openSink: ((InspectorPanel.InspectorTab) -> Void)? = nil
+    /// 主行点击 → 预览；nil = 非交互态（无预览入口，仍展示交付事实）。
+    var onOpenFile: ((FileNode) -> Void)? = nil
+
+    @State private var hoveredRowID: String?
+    @State private var hoveredFile: String?
+
+    /// 阶段短名（kicker 用：③ 原型 · 交付回执）。
+    private var stageName: String {
+        switch stage {
+        case .clarify: "澄清"
+        case .structure: "结构"
+        case .prototype: "原型"
+        case .prd: "PRD"
+        }
+    }
+
+    /// 沉淀行 = 装配行滤除下一节点数据行（脚注承载）。
+    private var sinks: [MilestoneRow] {
+        rows.filter { $0.id != "next" }
+    }
+
+    /// 主行文件去重（防御同回合重复路径），顺序保持落盘顺序。
+    private var mainFiles: [FileChangeSummary] {
+        var seen: Set<String> = []
+        return files.filter { seen.insert($0.path).inserted }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            kicker
+            if !mainFiles.isEmpty {
+                hairline
+                ForEach(mainFiles, id: \.path) { mainRow($0) }
+            }
+            let sinkRows = sinks
+            if !sinkRows.isEmpty {
+                hairline
+                ForEach(sinkRows, id: \.id) { sinkRow($0) }
+            }
+            if let footer = MessageBubble.receiptFooter(for: rows) {
+                hairline
+                footerRow(footer)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.xxl)
+                .fill(Color.surfaceSecondary)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.xxl)
+                .strokeBorder(Color.borderL1, lineWidth: 1)
+        )
+    }
+
+    private var hairline: some View {
+        Rectangle().fill(Color.borderL1).frame(height: 1)
+    }
+
+    // MARK: kicker（交付回执眉标）
+
+    private var kicker: some View {
+        HStack(spacing: DS.Spacing.s8) {
+            Circle().fill(Color.statusSuccess).frame(width: 5, height: 5)
+            Text("\(stage.proto.num) \(stageName) · 交付回执")
+                .font(DS.Font.mono2XS)
+                .kerning(1.2)
+                .foregroundStyle(Color.ink300)
+            Spacer(minLength: 0)
+            if let time {
+                Text(time)
+                    .font(DS.Font.mono2XS)
+                    .foregroundStyle(Color.ink300)
+            }
+        }
+        .padding(.horizontal, DS.Spacing.s16)
+        .padding(.vertical, DS.Spacing.s10)
+    }
+
+    // MARK: 主行（本轮交付物，吸收产物块文件卡）
+
+    private func mainRow(_ change: FileChangeSummary) -> some View {
+        let url = PMAgentStore.versionURL(project: project, version: version)
+            .appendingPathComponent(change.path)
+        let title = artifactCardTitle(change.path)
+        return Button {
+            onOpenFile?(FileNode(name: title, url: url, isDirectory: false, children: nil))
+        } label: {
+            HStack(spacing: DS.Spacing.s12) {
+                DSIcon(fileIcon(change.path), size: 16)
+                    .foregroundStyle(Color.brandAccent)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.Radius.lg)
+                            .fill(Color.brand100)
+                    )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(DS.Font.bodyMDStrong)
+                        .foregroundStyle(Color.ink900)
+                    Text("\(fileTypeLabel(change.path)) · \(fileSizeText(url))")
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink500)
+                        .monospacedDigit()
+                }
+                Spacer(minLength: DS.Spacing.s8)
+                if onOpenFile != nil {
+                    HStack(spacing: DS.Spacing.s4) {
+                        Text("预览")
+                        DSIcon(.arrowUpRight, size: 11)
+                    }
+                    .font(DS.Font.bodySM)
+                    .foregroundStyle(hoveredFile == change.path ? Color.brandAccent : Color.ink500)
+                }
+            }
+            .padding(.horizontal, DS.Spacing.s16)
+            .padding(.vertical, DS.Spacing.s12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(onOpenFile == nil)
+        .onHover { hovering in
+            guard onOpenFile != nil else { return }
+            hoveredFile = hovering ? change.path : nil
+        }
+        .help("点击预览（弹窗内置「在浏览器打开」兜底）")
+    }
+
+    // MARK: 沉淀行（随本轮落盘的横切产物，可点 → 右栏）
+
+    private func sinkRow(_ row: MilestoneRow) -> some View {
+        VStack(alignment: .leading, spacing: DS.Spacing.s4) {
+            HStack(spacing: DS.Spacing.s10) {
+                DSIcon(row.icon, size: 13)
+                    .foregroundStyle(row.tint)
+                Text(row.name)
+                    .font(DS.Font.bodySMStrong)
+                    .foregroundStyle(Color.ink800)
+                if let count = row.countText {
+                    Text(count)
+                        .font(DS.Font.mono2XS)
+                        .foregroundStyle(Color.ink500)
+                }
+                Spacer(minLength: DS.Spacing.s8)
+                if let destination = row.destination {
+                    HStack(spacing: 3) {
+                        Text(destination)
+                        DSIcon(.chevronRight, size: 9)
+                    }
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(hoveredRowID == row.id ? Color.brandAccent : Color.ink300)
+                }
+            }
+            if let detail = row.detail, row.dims == nil {
+                Text(detail)
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink500)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, DS.Spacing.s16)
+        .padding(.vertical, DS.Spacing.s10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .onHover { hovering in
@@ -1462,22 +1838,27 @@ struct DigestBar: View {
         }
     }
 
-    /// 面板脚注：机器初审等待态（结论稍后并入本摘要）。
-    /// 阶段推进不再由摘要条承载（确认坞 / 自由作答「进入下一阶段」发起）。
-    @ViewBuilder
-    private var footer: some View {
-        if rows.contains(where: { $0.name == "机器初审中" }) {
-            HStack(spacing: DS.Spacing.s8) {
-                DSIcon(.clock, size: 12)
-                    .foregroundStyle(Color.ink300)
-                Text("机器初审中——结论稍后并入本摘要")
-                    .font(DS.Font.bodyXS)
-                    .foregroundStyle(Color.ink500)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, DS.Spacing.s12)
-            .padding(.top, DS.Spacing.s8)
+    // MARK: 脚注（下一步：指路，不替按）
+
+    private func footerRow(_ footer: (text: String, waiting: Bool)) -> some View {
+        let auto = rows.first(where: { $0.id == "next" })?.autoNote != nil
+        return HStack(alignment: .top, spacing: DS.Spacing.s8) {
+            DSIcon(
+                auto ? .bolt : (footer.waiting ? .clock : .circleCheck),
+                size: 13
+            )
+            .foregroundStyle(
+                auto ? Color.statusWarning : (footer.waiting ? Color.ink500 : Color.statusSuccess)
+            )
+            Text(footer.text)
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.ink500)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
         }
+        .padding(.horizontal, DS.Spacing.s16)
+        .padding(.vertical, DS.Spacing.s10)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1485,7 +1866,7 @@ struct MessageBubble: View {
     let entry: DiscussionEntry
     /// 助手消息的阶段（决定头像与名称行）。
     let stage: PipelineRun.Stage
-    /// 末条 assistant：末尾选项行折叠进右缘作答抽屉（不再流内渲染点选项）。
+    /// 末条 assistant：末尾选项行折叠进作答坞（不再流内渲染点选项）。
     let showOptions: Bool
     /// 融入气泡顶部的回合注记（阶段推进/切档/进度）。
     let headerNotes: [TurnNote]
@@ -1494,6 +1875,8 @@ struct MessageBubble: View {
     /// 快速通道链式续段：跳过 AgentMessageShell 头部，内容直接衔接上一回合
     ///（一条用户消息只出一条连续回答；分段推进注记由 headerNotes 承载）。
     var chainContinuation: Bool = false
+    /// 系统代答链交接条（值班单）：仅链式续段有值；nil = 首段 / 非链。
+    var handover: DutyHandover? = nil
     /// 附图归属（attachments/ 定位；空串时附图不渲染，仅文本）。
     let project: String
     let version: String
@@ -1558,7 +1941,8 @@ struct MessageBubble: View {
         }
     }
 
-    /// 用户气泡（原型：深反色底白字，radius 12 + 右下角 4，maxWidth 72%，无时间戳）。
+    /// 用户气泡（原型：深反色底白字，maxWidth 72%，无时间戳）。
+    /// 2026-09 呼吸感改版：内衬 21/16 + radius 20（右下角 6 保留发言方向语义）。
     private var userBubble: some View {
         HStack {
             Spacer(minLength: 60)
@@ -1575,6 +1959,14 @@ struct MessageBubble: View {
                         }
                     }
                 }
+                // 引用文件 chips（产物台账「添加到对话」；与输入坞同款胶囊，深底反色）
+                if let refs = entry.files, !refs.isEmpty {
+                    FlowLayout(spacing: DS.Spacing.s6) {
+                        ForEach(refs, id: \.self) { ref in
+                            ReferencedFileChip(relativePath: ref, tone: .bubble)
+                        }
+                    }
+                }
                 if !entry.content.isEmpty {
                     let clipped = foldEnabled && !isExpanded
                     Text(entry.content)
@@ -1584,21 +1976,23 @@ struct MessageBubble: View {
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
                         .lineLimit(clipped ? Self.previewLineLimit : nil)
-                        .mask {
+                        // 折叠渐隐（原用 .mask：macOS 上 compositing 会拍平 Text、
+                        // 击穿 textSelection 拖选——用户消息永远选不中）。改用
+                        // overlay 淡入气泡底色：userBubble 纯色底，视觉等价；
+                        // allowsHitTesting(false) 不挡文字命中。渐隐色取 mask 的
+                        // alpha 互补（clear→1.0）， stops 中点对齐原遮罩参数。
+                        .overlay(alignment: .bottom) {
                             if clipped {
-                                // 折叠态底部渐隐：「下面还有」的视觉信号（原型遮罩参数）
                                 LinearGradient(
                                     stops: [
-                                        .init(color: .black, location: 0),
-                                        .init(color: .black, location: 0.55),
-                                        .init(color: .black.opacity(0.45), location: 0.82),
-                                        .init(color: .clear, location: 1.0),
+                                        .init(color: Color.userBubble.opacity(0), location: 0),
+                                        .init(color: Color.userBubble.opacity(0), location: 0.55),
+                                        .init(color: Color.userBubble.opacity(0.55), location: 0.82),
+                                        .init(color: Color.userBubble, location: 1.0),
                                     ],
                                     startPoint: .top, endPoint: .bottom
                                 )
-                            } else {
-                                // 展开态恒等遮罩（保持布局稳定，不参与视觉）
-                                Rectangle().fill(Color.black)
+                                .allowsHitTesting(false)
                             }
                         }
                 }
@@ -1607,14 +2001,15 @@ struct MessageBubble: View {
                     foldBar
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            // HTML 定稿值；本组件既有 14/10 字面量先例
+            .padding(.horizontal, 21)
+            .padding(.vertical, 16)
             .background(
                 UnevenRoundedRectangle(
-                    topLeadingRadius: DS.Radius.xxl,
-                    bottomLeadingRadius: DS.Radius.xxl,
-                    bottomTrailingRadius: DS.Radius.sm,
-                    topTrailingRadius: DS.Radius.xxl
+                    topLeadingRadius: DS.Radius.r20,
+                    bottomLeadingRadius: DS.Radius.r20,
+                    bottomTrailingRadius: DS.Radius.md,
+                    topTrailingRadius: DS.Radius.r20
                 )
                 // 原型 userBubble：浅 ink900 深底 / Dark --bg-invert #32323A，白字
                 .fill(Color.userBubble)
@@ -1682,18 +2077,27 @@ struct MessageBubble: View {
         content.hasPrefix("💬")
     }
 
-    /// 独立系统事件条分流：安静留痕（💬）居中纯文本（方案 A：无图标无容器，12px ink500，
-    /// 上方拉开一档留白，像时间戳一样隐入对话流）；其余走左对齐语义胶囊。
+    /// 独立系统事件条分流：变更提案卡（载荷行）> 压缩注记（居中灰字）>
+    /// 安静留痕（💬）居中纯文本 > 语义胶囊。
     @ViewBuilder
     private var systemPill: some View {
-        if Self.isQuietNotice(entry.content) {
+        if let proposal = entry.changeProposal {
+            ChangeProposalCard(proposal: proposal)
+        } else if entry.compaction != nil {
+            // 压缩注记：只留一行居中灰字提示；摘要全文在 CompactionData 载荷
+            // （冷启动恢复 / Finder 可读），不在聊天流里刷屏。
+            Text("上下文已压缩")
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.ink500)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity)
+        } else if Self.isQuietNotice(entry.content) {
             Text(Self.stripEventEmoji(entry.content))
                 .font(DS.Font.bodyXS)
                 .foregroundStyle(Color.ink500)
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity)
-                .padding(.top, DS.Spacing.s12)   // 与上一条消息拉开留白（列表 24 + 12 = 36px）
         } else {
             eventPill
         }
@@ -1730,31 +2134,38 @@ struct MessageBubble: View {
 
     @ViewBuilder
     private var assistantContent: some View {
-        let blocks = ArtifactParser.parseArtifactBlocks(in: entry.content)
+        // 先清洗占位模仿残留（模型照抄的系统剥离标注/落盘占位行），再解析展示
+        let rawContent = ArtifactParser.scrubImitatedPlaceholders(in: entry.content)
+        let blocks = ArtifactParser.parseArtifactBlocks(in: rawContent)
         // 未闭合产物块 = 输出撞 max_tokens 被截断（历史会话兜底渲染，新会话已自动续写）。
         // 收起断点后的长代码，换成截断提示卡，避免整屏 HTML 刷屏。
-        let incomplete = ArtifactParser.parseIncompleteArtifact(in: entry.content)
+        let incomplete = ArtifactParser.parseIncompleteArtifact(in: rawContent)
         // ViewBuilder 属性内不能写「if + 赋值」语句（if 会被当作视图节点），
         // 截断兜底裁剪收进立即执行的闭包，产出仍是单个 let
         let displayText = {
             var text = blocks.isEmpty
-                ? entry.content
+                ? rawContent
                 : ArtifactParser.stripArtifactBlocks(
-                    in: entry.content,
+                    in: rawContent,
                     placeholder: "（产物已生成并落盘——点击下方标签预览，或见右栏「文件」面板）",
                     // 所有产物块不插正文占位：图表块直接渲染，其余块底部有胶囊提示，
                     // 避免多条块落多条重复引导文字
                     placeholderFor: { _ in "" }
                 )
             if incomplete != nil, let marker = text.range(of: "```artifact:", options: .backwards) {
-                text = String(text[..<marker.lowerBound])
+                // 开栏可能是更长反引号（````artifact:），前缀反引号一并裁掉
+                var cutStart = marker.lowerBound
+                while cutStart > text.startIndex, text[text.index(before: cutStart)] == "`" {
+                    cutStart = text.index(before: cutStart)
+                }
+                text = String(text[..<cutStart])
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            // 末尾选项行折叠：点选作答统一收口到右缘作答抽屉，正文不再重复渲染
-            // 点不了的 A)/B) 原文行（parseClarifyOptions 的 question 即去掉末尾
-            // 选项行后的正文）；该消息不再是末条后选项行随原文回归留痕。
-            if showOptions, let options = ArtifactParser.parseClarifyOptions(in: text) {
-                text = options.question
+            // 末尾选项行折叠：点选作答统一收口到输入区上方作答坞，正文不再重复渲染
+            // 点不了的 A)/B) 原文行（多组问题全部进坞——单组单题表单 / 多组问题卡向导；
+            // bodyText 即剥除所有组选项行后的正文）；该消息不再是末条后选项行随原文回归留痕。
+            if showOptions, let groups = ArtifactParser.parseOptionLineQuestionGroups(in: text) {
+                text = groups.bodyText
             }
             return text
         }()
@@ -1771,6 +2182,10 @@ struct MessageBubble: View {
         )
 
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+            // 系统代答链交接条（值班单）：续段顶部的段级计量（点击展开交接明细）
+            if let handover {
+                DutyHandoverBar(data: handover)
+            }
             // 回合注记（阶段推进/切档）：并入气泡顶部的安静 meta 行
             ForEach(Array(headerAssembly.leftovers.enumerated()), id: \.offset) { _, note in
                 TurnNoteRow(note: note)
@@ -1785,14 +2200,20 @@ struct MessageBubble: View {
                 ThinkingCard(data: think)
             }
             // Markdown 渲染：标题/粗斜体/列表/代码块/表格/引用分层排版
-            MarkdownText(displayText)
+            // （散文收在 chatMeasure 阅读栏内，表格/代码/图表留列宽）
+            // semanticSections：## 节名渲染成 mono 标签 + hairline（方案 B 语义分节）
+            MarkdownText(
+                displayText, readingMeasure: DS.Typography.chatMeasure,
+                semanticSections: true
+            )
 
-            // 产物区：图表内联渲染 + 文件产物卡片（与流式视图共用同一渲染）
+            // 产物区：图表内联渲染（回执承载期文件类产物卡静默——主行收进交付回执卡，
+            // 防同文件「块卡 + 回执主行」双渲染）
             ArtifactBlocksSection(
                 blocks: blocks,
                 project: project,
                 version: version,
-                hideSinkChips: !assembly.rows.isEmpty,
+                hideFileCards: !assembly.rows.isEmpty,
                 onOpen: { previewTarget = $0 }
             )
 
@@ -1805,25 +2226,20 @@ struct MessageBubble: View {
                 )
             }
 
-            // 回合交付摘要条（方案 B）：✓ 已交付 + 计数段一行收束；展开面板为
-            // 审计明细（点击直达右栏对应 Tab）+ 机器初审等待态。
-            // 落盘文件卡独立渲染在条外。
+            // 交付回执卡（方案 A「一次交付，一张回执」）：产物是主行，沉淀是次行，
+            // 下一步是脚注——取代旧交付摘要条 / 独立落盘文件卡 / 机器初审居中注脚
+            // 三处散落渲染。机器初审等待态也统一收进脚注行（两版漂移文案归一）。
             if !assembly.rows.isEmpty {
-                DigestBar(
+                DeliveryReceiptCard(
+                    stage: stage,
+                    time: hhmm(entry.createdAt),
                     rows: assembly.rows,
-                    openSink: onOpenSink
+                    files: assembly.absorbedCards.compactMap(\.fileChanges).flatMap { $0 },
+                    project: project,
+                    version: version,
+                    openSink: onOpenSink,
+                    onOpenFile: { previewTarget = $0 }
                 )
-            }
-
-            // 落盘文件卡（📦 注记携带 fileChanges）：每个文件一张生成文件卡，
-            // 独立渲染在摘要条下方；产物块结果卡已承载的文件跳过（防同文件双卡）
-            ForEach(Array(assembly.absorbedCards.enumerated()), id: \.offset) { _, note in
-                if let changes = note.fileChanges, !changes.isEmpty {
-                    FileChangeCards(
-                        changes: changes, project: project, version: version,
-                        skipPaths: cardSkipPaths
-                    ) { previewTarget = $0 }
-                }
             }
 
             // 无里程碑载荷的注记：原样渲染（携带 fileChanges 的行保留落盘文件卡 + 门控提示行）
@@ -1906,6 +2322,22 @@ struct MessageBubble: View {
                 text: stripEventEmoji(content), icon: .search, tint: .ink500
             )
         }
+        // 方法论自动沉淀行（🧠，①→② 收束时落卡）：归**上一回合尾部注记**（aftermath，
+        // 刻意不登记 isTurnPreamble）。amending 场景紧随其后的「✅ 要点表已按新功能
+        // 诉求更新——进入」已是 preamble（归下一回合顶部），两向行走各归其位互不打断。
+        if content.hasPrefix("🧠") {
+            return TurnNote(
+                text: stripEventEmoji(content), icon: .mem, tint: .ink500
+            )
+        }
+        // 风险台账采纳落实受理行（2026-09-15 闭环）：并入落实回合注记。
+        // ⚡ 不入 eventEmojis（快速通道 ⚡ 行仍走独立事件条），此处手工剥前缀。
+        if content.hasPrefix("⚡ 风险台账") {
+            return TurnNote(
+                text: String(content.dropFirst(2)).trimmingCharacters(in: .whitespaces),
+                icon: .bolt, tint: .statusWarning
+            )
+        }
         // ⚠️ 可并入的两类风险行：活跃超软上限警示（旧）、自评审风险登记通知（携 risk
         // milestones 载荷 → 摘要条琥珀「风险 +N 条」行）。漏登记会截断合并行走——
         // 其后本应并入的 🔍 雷达 / 📝 决策行全部回退独立旧卡、气泡产物块回退灰胶囊。
@@ -1931,9 +2363,16 @@ struct MessageBubble: View {
     fileprivate static func isTurnPreamble(_ content: String) -> Bool {
         if content.hasPrefix("🎚️") || content.hasPrefix("🏗️")
             || content.hasPrefix("🎨") || content.hasPrefix("📊") { return true }
+        // 风险台账采纳落实受理行（引入落实回合）
+        if content.hasPrefix("⚡ 风险台账") { return true }
         if content.hasPrefix("📝 开始") { return true }
-        // ✅ 只有「已确认」是推进语（引入下一回合）；「质量门通过」「机器初审通过」是本轮结论
-        if content.hasPrefix("✅") { return content.contains("已确认") }
+        // ✅ 推进语（引入下一回合）归下一回合顶部注记：「已确认」、amending 的
+        // 「要点表已按新功能诉求更新——进入」（无「已确认」措辞，同为推进宣告——
+        // 塞进 Agent 的回答，不再落独立事件条）；
+        // 「质量门通过」（并进入）「机器初审通过」（确认后进入）是本轮结论，仍归上一回合尾部
+        if content.hasPrefix("✅") {
+            return content.contains("已确认") || content.contains("——进入")
+        }
         return false
     }
 
@@ -2012,20 +2451,153 @@ struct MessageBubble: View {
         return merged
     }
 
-    /// 快速通道链式续段判定（index 可为 entries.count，即流式中的下一回合）：
-    /// 前方只跨越连续系统行即可回溯到另一 assistant，且跨越的系统行里有「快速通道」
-    /// 标记（⚡ 受理行 / 📦（快速通道：自动确认）行）。链上续段共享首回合的回答头——
-    /// 一条用户消息只出一条连续回答，不再「连答多次」各带 Agent 头。
-    /// 常规确认推进（无标记）与被用户消息隔断的回合不判链，保留独立回答头。
+    /// 系统代发链式续段判定（index 可为 entries.count，即流式中的下一回合）：
+    /// 前方只跨越连续系统行即可回溯到另一 assistant，且跨越的系统行里有链标记——
+    /// 「快速通道」（⚡ 受理行 / 📦（快速通道：自动确认）行）、「🔄 已回到」
+    /// （回退重做受理行：LLM 回退块 / UI 回退按钮触发后 executeBacktrack 发出）
+    /// 或自动收束（2026-09-16 纳入：质量门/轮次耗尽的「澄清自动收束」受理行、
+    /// 增补收束的「要点表已按新功能诉求更新」推进行）。
+    /// 链上续段共享首回合的回答头——一条用户消息只出一条连续回答，回退后自动
+    /// 重做的续段同样并入，不因中间跨了阶段再出新 Agent 头。
+    /// 常规确认推进（隔用户确认消息）与被用户消息隔断的回合不判链，保留独立回答头。
     static func isFastForwardChainedBefore(_ index: Int, in entries: [DiscussionEntry]) -> Bool {
         var chained = false
         var i = index - 1
         while i >= 0, entries[i].role == .system, entries[i].memory == nil {
-            if entries[i].content.contains("快速通道") { chained = true }
+            if isChainMarked(entries[i].content) { chained = true }
             i -= 1
         }
         return chained && i >= 0 && entries[i].role == .assistant
     }
+
+    /// 链标记判据：链上受理/推进系统行必须携带的语义词。
+    /// 自动收束链（质量门/耗尽/增补）与快速通道、回退重做同权——
+    /// 都是「AI 代答续段」，观感统一为一条回答 + 值班单过渡。
+    fileprivate static func isChainMarked(_ content: String) -> Bool {
+        content.contains("快速通道")
+            || content.hasPrefix("🔄 已回到")
+            || content.contains("澄清自动收束")
+            || content.contains("要点表已按新功能诉求更新")
+    }
+
+    // MARK: 系统代答链交接条（方案 C「值班单」）
+
+    /// 消息流顶距（唯一事实源，displayItems 与流式气泡共用）。
+    /// 链式续段是上一条回答的延续——簇内 16（与「提示→消息」同档），
+    /// 不吃新回合的 52 轮距（否则「一条回答」中间裂出一道大空白）；
+    /// 常规 assistant 吃 52 轮距；系统提示行簇内 12–16 不摊轮距。
+    nonisolated static func topInset(
+        for role: DiscussionEntry.Role,
+        isFirst: Bool,
+        previousWasSystem: Bool,
+        isContinuation: Bool
+    ) -> CGFloat {
+        guard !isFirst else { return 0 }
+        if role == .assistant {
+            return isContinuation ? DS.Spacing.s16 : DS.Spacing.s52
+        }
+        return previousWasSystem ? DS.Spacing.s12 : DS.Spacing.s16
+    }
+
+    /// 回溯本段所处代答链，产出交接条数据（段序号 / 本段耗时步数 / 明细时间轴）。
+    /// index 可为 entries.count（流式续段尚未落盘）——此时段序号按已落盘段数 +1 顺延。
+    /// nil = 非链续段：链首段、单段直答、被用户消息或记忆行隔断。
+    static func dutyHandover(for index: Int, in entries: [DiscussionEntry]) -> DutyHandover? {
+        // 与「续段不出独立回答头」严格同判据：有交接条的必是续段，反之亦然。
+        guard isFastForwardChainedBefore(index, in: entries) else { return nil }
+        // 反向跨连续系统行回溯到链首 assistant
+        var i = index - 1
+        while i >= 0, entries[i].role == .system, entries[i].memory == nil { i -= 1 }
+        guard i >= 0, entries[i].role == .assistant else { return nil }
+        var headIndex = i
+        // 链可能是多段（快速通道沿途逐段推进）：中途的 assistant 本身也是续段时
+        // 继续向前回溯——否则段序号会从半途重数（段 3 被算成段 2）。
+        while isFastForwardChainedBefore(headIndex, in: entries) {
+            var j = headIndex - 1
+            while j >= 0, entries[j].role == .system, entries[j].memory == nil { j -= 1 }
+            guard j >= 0, entries[j].role == .assistant else { break }
+            headIndex = j
+        }
+        let settled = index < entries.count
+        let lastIndex = settled ? index : entries.count - 1
+        guard lastIndex >= headIndex else { return nil }
+
+        // 明细时间轴：链内各段完成 + 各系统行（记忆行不入轴，与渲染层同口径）
+        var segmentIndex = 0
+        var nodes: [DutyHandover.Node] = []
+        for j in headIndex...lastIndex {
+            let entry = entries[j]
+            guard entry.memory == nil else { continue }
+            if entry.role == .assistant {
+                segmentIndex += 1
+                if let time = hms(entry.createdAt) {
+                    nodes.append(DutyHandover.Node(
+                        time: time, text: "第 \(segmentIndex) 段回答完成"
+                    ))
+                }
+            } else if entry.role == .system {
+                if let time = hms(entry.createdAt) {
+                    nodes.append(DutyHandover.Node(
+                        time: time, text: self.chainNodeText(entry.content)
+                    ))
+                }
+            }
+        }
+        // 流式续段的目标段尚未落盘 → 序号顺延；链首段（第 1 段）不出交接条。
+        let target = settled ? segmentIndex : segmentIndex + 1
+        guard target >= 2 else { return nil }
+
+        let think = settled ? entries[index].think : nil
+        return DutyHandover(
+            segmentIndex: target,
+            durationSeconds: think?.dur,
+            stepCount: think.map { $0.steps.count },
+            stageLabel: self.chainStageLabel(
+                headIndex: headIndex, lastIndex: lastIndex, entries: entries
+            ),
+            nodes: nodes
+        )
+    }
+
+    /// 链内系统行 → 明细文案：剥事件 emoji（⚡ 不入 eventEmojis，手工剥，同采纳受理行先例），
+    /// 超长截断（明细行不做长文展开）。
+    fileprivate static func chainNodeText(_ content: String) -> String {
+        var text = content
+        if text.hasPrefix("⚡") {
+            text = String(text.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        text = stripEventEmoji(text)
+        return text.count > 60 ? String(text.prefix(60)) + "…" : text
+    }
+
+    /// 链内阶段徽标（如「③ 原型」）：强模式（①②③④ + 阶段名）命中，取链内最近一次。
+    /// 「🔄 已回到 ③ 原型（PRD 标记过期：局部）」同时含 ③ 与 PRD，靠「③ 在前」取胜。
+    fileprivate static func chainStageLabel(
+        headIndex: Int, lastIndex: Int, entries: [DiscussionEntry]
+    ) -> String? {
+        let pattern = "[①②③④]\\s*(澄清|结构|原型|PRD)"
+        guard lastIndex >= headIndex else { return nil }
+        for j in stride(from: lastIndex, through: headIndex, by: -1) {
+            let content = entries[j].content
+            if let range = content.range(of: pattern, options: .regularExpression) {
+                return String(content[range])
+            }
+        }
+        return nil
+    }
+
+    /// ISO8601 → 本地 HH:mm:ss（交接明细时间轴；解析失败返回 nil，该行不入轴）。
+    private static func hms(_ iso: String) -> String? {
+        guard !iso.isEmpty, let date = isoParser.date(from: iso) else { return nil }
+        return hmsFormatter.string(from: date)
+    }
+
+    private static let hmsFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     /// 流式回合头部将吸收的尾部系统行索引（与 streamingHeaderNotes 的合并判据一致）。
     /// displayItems 据此跳过独立胶囊渲染——否则同一行「独立卡 + 流式头部注记」双渲染
@@ -2062,25 +2634,26 @@ struct MessageBubble: View {
     }
 
     /// 截断卡「重新发送」的原始消息查找（internal 供测试）：
-    /// 向上找指定条目之前最近一条**真实**用户输入（文本 + 附图文件名）。
+    /// 向上找指定条目之前最近一条**真实**用户输入（文本 + 附图文件名 + 引用文件路径）。
     /// 跳过历史遗留的「重新生成×」合成指令——旧版截断卡点击会在会话里堆积这类
     /// 伪用户消息，截断-重试循环后最近一条往往是它，不跳过就会把指令误当原始消息重发。
     static func originalUserMessage(
         before id: String, in entries: [DiscussionEntry]
-    ) -> (content: String, images: [String])? {
+    ) -> (content: String, images: [String], files: [String])? {
         guard let idx = entries.firstIndex(where: { $0.id == id }) else { return nil }
         for prior in entries[..<idx].reversed() {
             guard prior.role == .user else { continue }
             let text = prior.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.hasPrefix("重新生成") { continue }
-            return (text, prior.images ?? [])
+            return (text, prior.images ?? [], prior.files ?? [])
         }
         return nil
     }
 
     /// 产物块已出全宽结果卡的文件相对路径 → 落盘文件卡据此跳过，防同文件双卡。
-    /// 原型卡常驻（不受摘要条影响）；PRD 卡仅在无交付摘要条的旧会话回退路径出
-    /// （digestVisible = false 时），摘要条承载期 PRD 由落盘文件卡出卡。
+    /// 仅旧会话回退路径消费（leftovers 携带 fileChanges 且无交付回执卡时）：
+    /// 原型卡常驻（不受回执影响）；PRD 卡仅在无回执的旧会话回退路径出
+    /// （digestVisible = false 时），回执承载期 PRD 由回执主行出卡。
     fileprivate static func blockCardPaths(
         blocks: [ArtifactParser.ArtifactBlock],
         project: String,
@@ -2088,11 +2661,19 @@ struct MessageBubble: View {
         digestVisible: Bool
     ) -> Set<String> {
         var paths: Set<String> = []
-        for (name, path) in [("prototype", ArtifactPath.prototype), ("prd", ArtifactPath.prd)] {
-            guard blocks.contains(where: { $0.name == name }),
-                  artifactFileURL(name, project: project, version: version) != nil else { continue }
-            if name == "prd" && digestVisible { continue }
-            paths.insert(path)
+        // 原型类块逐槽位出卡（多端多份各自可点，防同文件双卡）
+        for block in blocks where ArtifactPath.isPrototypeBlock(block.name) {
+            guard let slot = ArtifactPath.prototypeSlot(forBlockName: block.name),
+                  artifactFileURL(block.name, project: project, version: version) != nil else {
+                continue
+            }
+            paths.insert(slot.relPath)
+        }
+        // prd 卡仅在无交付摘要条的旧会话回退路径出（digestVisible = false 时）
+        if blocks.contains(where: { $0.name == "prd" }),
+           artifactFileURL("prd", project: project, version: version) != nil,
+           !digestVisible {
+            paths.insert(ArtifactPath.prd)
         }
         return paths
     }
@@ -2110,6 +2691,7 @@ struct MessageBubble: View {
         var leftovers: [TurnNote] = []
         var stageLabel: String?
         var stageAction: String?
+        var stageAutoNote: String?
         var reviewDone = false
 
         for note in notes {
@@ -2151,6 +2733,11 @@ struct MessageBubble: View {
                     case "stage":
                         stageLabel = stamp.label ?? "产物"
                         stageAction = stamp.nextAction
+                        // 快速通道链的 📦 行（自动确认，无机器门无确认坞）：
+                        // 脚注走自动确认句，禁走「确认坞」指路（方案 A 回执三态之一）
+                        if note.text.contains("快速通道") {
+                            stageAutoNote = fastForwardAutoNote(from: note.text)
+                        }
                     case "score":
                         // 评分卡：三格维度条 + 选档结论（理由收进 hover，零机器腔长句）
                         let tier = stamp.label ?? "standard"
@@ -2196,14 +2783,15 @@ struct MessageBubble: View {
         }
 
         // 下一节点：阶段产物已落盘 → 数据行记录（标题派生「已交付 X」）/
-        // 机器初审中（等待态，摘要条 footer 展示）。推进入口在确认坞 / 自由作答。
+        // 机器初审中（等待态，回执脚注展示）。推进入口在确认坞 / 自由作答。
         if stageLabel != nil || stageAction != nil {
-            if reviewDone {
+            if reviewDone || stageAutoNote != nil {
                 rows.append(MilestoneRow(
                     id: "next", icon: .arrowRight, tint: .brandAccent,
                     name: "\(stageLabel ?? "产物")待确认",
                     tail: stageAction,
-                    isNext: true
+                    isNext: true,
+                    autoNote: stageAutoNote
                 ))
             } else {
                 rows.append(MilestoneRow(
@@ -2217,6 +2805,45 @@ struct MessageBubble: View {
             leftovers.removeAll { $0.text.hasPrefix("开始撰写") }
         }
         return (rows, absorbedCards, leftovers)
+    }
+
+    /// 快速通道 📦 行文本 → 自动确认脚注句（方案 A 回执三态之一）。
+    /// 「📦 结构产物已生成——机器初审中……（快速通道：自动确认，继续生成 ③ 原型）」
+    /// → 「快速通道 · 自动确认，继续生成 ③ 原型」；含标记但无括注 → 通用句兜底；
+    /// 无快速通道标记 → nil（非快速通道行不适用）。
+    static func fastForwardAutoNote(from text: String) -> String? {
+        guard text.contains("快速通道") else { return nil }
+        if let start = text.range(of: "（快速通道："),
+           let end = text.range(of: "）", options: .backwards),
+           start.upperBound <= end.lowerBound {
+            return "快速通道 · " + text[start.upperBound..<end.lowerBound]
+        }
+        return "快速通道 · 自动确认，产物已落盘，继续推进后续阶段"
+    }
+
+    /// 方案 A 回执脚注推导（纯函数，可单测）：
+    /// - autoNote 非空（快速通道）→ 自动确认句（链上无确认坞，禁指路确认坞）；
+    /// - isNext（机器初审通过 / 跳过）→ 尾注带「确认后」前缀（①②③ 有确认坞）→
+    ///   确认坞指路句——推进动作只活在确认坞，回执只指路不替按；
+    ///   尾注无「确认后」前缀（④ PRD 封板流程，无确认坞）→ 就绪句直接接尾注；
+    /// - 机器初审中（未出结论）→ 等待态句（原居中注脚文案统一收进脚注行）。
+    /// rows 无下一节点行（仅雷达 / 决策的修订轮）→ nil，脚注不渲染。
+    static func receiptFooter(for rows: [MilestoneRow]) -> (text: String, waiting: Bool)? {
+        guard let next = rows.first(where: { $0.id == "next" }) else { return nil }
+        if let auto = next.autoNote {
+            return (auto, false)
+        }
+        if next.isNext {
+            if let tail = next.tail {
+                if tail.hasPrefix("确认后 ") {
+                    let action = String(tail.dropFirst("确认后 ".count))
+                    return ("本轮产物就绪。预览满意后，在下方确认坞选择「确认并进入」，\(action)。", false)
+                }
+                return ("本轮产物就绪。\(tail)。", false)
+            }
+            return ("本轮产物就绪。", false)
+        }
+        return ("机器初审中——结论稍后并入本回执", true)
     }
 
     /// 存量超限警示行解析（无载荷旧会话）：
@@ -2252,7 +2879,7 @@ struct MessageBubble: View {
     /// 本应用系统行使用的事件 emoji（含变体选择符，按 Character 整体匹配）。
     /// 💬 = 安静留痕提示（已收起确认等），渲染层剥离 emoji 后走居中纯文本。
     fileprivate static let eventEmojis: Set<String> = [
-        "✅", "⚠️", "🏗️", "🎨", "📝", "🎚️", "📦", "📊", "🔍", "🔒", "🔄", "💀", "🗃️", "🔀", "📌", "ℹ️", "⏹", "⏳", "💬"
+        "✅", "⚠️", "🏗️", "🎨", "📝", "🎚️", "📦", "📊", "🔍", "🔒", "🔄", "💀", "🗃️", "🔀", "📌", "ℹ️", "⏹", "⏳", "💬", "🧠"
     ]
 
     /// 脱前导事件 emoji 与随后的一个空格（注记/事件条统一走 DSIcon，不用 emoji 本体）。
@@ -2325,6 +2952,7 @@ extension MessageBubble: Equatable {
             && lhs.headerNotes == rhs.headerNotes
             && lhs.footerNotes == rhs.footerNotes
             && lhs.chainContinuation == rhs.chainContinuation
+            && lhs.handover == rhs.handover
             && lhs.project == rhs.project
             && lhs.version == rhs.version
             && lhs.resendEnabled == rhs.resendEnabled
@@ -2373,7 +3001,7 @@ private func artifactCardTitle(_ relativePath: String) -> String {
     case ArtifactPath.prototype: blockName = "prototype"
     case ArtifactPath.prd: blockName = "prd"
     case ArtifactPath.competitiveAnalysis: blockName = "analysis"
-    default: blockName = nil
+    default: blockName = ArtifactPath.prototypeBlockName(forRelativePath: relativePath)
     }
     if let blockName { return artifactDisplayName(blockName) }
     let filename = relativePath.split(separator: "/").last.map(String.init) ?? relativePath
@@ -2389,11 +3017,12 @@ private func artifactDisplayName(_ name: String) -> String {
     case "core-flows": "核心流程图"
     case "module-page-map": "模块-页面映射表"
     case "business-flows": "业务流程图"
-    case "prototype": "交互原型"
     case "prd": "产品需求文档"
     case "analysis": "竞品分析报告"
     case "radar": "漏项雷达"
     case "decision": "决策记录"
+    case let n where ArtifactPath.isPrototypeBlock(n):
+        ArtifactPath.prototypeSlot(forBlockName: n)?.display ?? "交互原型"
     default: "产物"
     }
 }
@@ -2407,9 +3036,10 @@ private func artifactFileURL(_ name: String, project: String, version: String) -
     case "core-flows": relativePath = ArtifactPath.coreFlows
     case "module-page-map": relativePath = ArtifactPath.modulePageMap
     case "business-flows": relativePath = ArtifactPath.businessFlows
-    case "prototype": relativePath = ArtifactPath.prototype
     case "prd": relativePath = ArtifactPath.prd
     case "analysis": relativePath = ArtifactPath.competitiveAnalysis
+    case let n where ArtifactPath.isPrototypeBlock(n):
+        relativePath = ArtifactPath.prototypeSlot(forBlockName: n)?.relPath
     default: relativePath = nil  // radar/decision 落 jsonl，右栏 Tab 承载
     }
     guard let relativePath, !project.isEmpty, !version.isEmpty else { return nil }
@@ -2420,18 +3050,22 @@ private func artifactFileURL(_ name: String, project: String, version: String) -
 
 /// 产物块渲染区：结构图表（architecture/core-flows/business-flows = mermaid 图源，
 /// module-page-map = 管道表格 markdown）内联直接渲染；文件类产物（原型 / PRD / 竞品
-/// 分析等）已落盘可交互 → 全宽生成文件卡，未落盘 / jsonl 类 → 中性提示胶囊降级。
+/// 分析等）已落盘可交互 → 全宽生成文件卡；jsonl 类（雷达 / 决策）与未落盘产物
+/// 不出占位卡——2026-09-15 用户钦定：「XX 已生成」灰胶囊一律不要（雷达 / 决策的
+/// 入账事实由交付回执卡承载，右栏台账亦可查）。**勿恢复胶囊兜底**
+/// （切会话中途完成的回合无回执载荷，旧胶囊正是在这些会话里冒出来）。
 private struct ArtifactBlocksSection: View {
     let blocks: [ArtifactParser.ArtifactBlock]
     var project: String = ""
     var version: String = ""
-    /// 雷达 / 决策入账已由交付摘要条承载（方案 B）、PRD 由落盘文件卡承载 → 不再重复
-    /// 渲染提示胶囊；旧会话（无里程碑载荷）与流式中保持 false，回退胶囊提示。
-    var hideSinkChips: Bool = false
-    /// 点击文件产物卡片 → 打开预览；nil = 非交互提示态（流式中）
+    /// 交付回执卡承载期（方案 A）文件类产物块全静默：原型卡 / PRD / analysis 等
+    /// 文件卡的主行事实由回执卡主行承载（防同文件双卡）；内联图表（mermaid /
+    /// 管道表格）是回答正文的一部分，不受影响。雷达 / 决策块本就无卡无胶囊，恒静默。
+    var hideFileCards: Bool = false
+    /// 点击文件产物卡片 → 打开预览；nil = 非交互态（流式中）
     var onOpen: ((FileNode) -> Void)? = nil
 
-    /// 内容为空（异常流）→ 退回胶囊兜底。
+    /// 内容为空（异常流）→ 按无内容处理（不出图，也不出占位）。
     private func isInlineChart(_ block: ArtifactParser.ArtifactBlock) -> Bool {
         let isChartName: Bool = switch block.name {
         case "architecture", "core-flows", "business-flows", "module-page-map": true
@@ -2446,26 +3080,16 @@ private struct ArtifactBlocksSection: View {
             ForEach(blocks.filter(isInlineChart), id: \.name) { block in
                 inlineArtifactFigure(block)
             }
-            // 原型结果卡：阶段主交付物，全宽块卡（与图表卡 / 生成文件卡 / 交付摘要条
-            // 同族容器），不进胶囊流——FlowLayout 按理想尺寸摆放会把卡压成窄条
-            ForEach(blocks.filter { $0.name == "prototype" }, id: \.name) { block in
+            // 原型结果卡：阶段主交付物（含 prototype-<slug> 分端槽位，多端多卡），
+            // 全宽块卡；交付回执卡承载期静默——主行事实由回执卡承载（防双卡）
+            ForEach(blocks.filter { ArtifactPath.isPrototypeBlock($0.name) && !hideFileCards }, id: \.name) { block in
                 prototypeBlock(block)
             }
             // 文件类产物卡（prd / analysis 等已落盘可交互）：与原型卡同族的生成文件卡，
-            // 全宽；prd 在交付摘要条承载期（hideSinkChips）不出卡——落盘文件卡已覆盖
+            // 全宽；交付回执卡承载期（hideFileCards）不出卡——回执主行已承载。
+            // 其余块（雷达 / 决策 / 流式未落盘）无卡即无渲染，不设灰胶囊占位。
             ForEach(blocks.filter(showsFileCard), id: \.name) { block in
                 fileCard(block)
-            }
-            let pillBlocks = blocks.filter {
-                !isInlineChart($0) && $0.name != "prototype" && $0.name != "backtrack"
-                    && $0.name != "fast-forward" && !showsFileCard($0)
-            }
-            if !pillBlocks.isEmpty {
-                FlowLayout(spacing: DS.Spacing.s6) {
-                    ForEach(pillBlocks, id: \.name) { block in
-                        pill(block)
-                    }
-                }
             }
         }
     }
@@ -2482,7 +3106,7 @@ private struct ArtifactBlocksSection: View {
                         .font(DS.Font.bodyMDStrong)
                         .foregroundStyle(Color.ink900)
                 }
-                MarkdownText(block.content, bodySize: 15)
+                MarkdownText(block.content, bodySize: 15, readingMeasure: DS.Typography.chatMeasure)
             }
         } else {
             MermaidFigureCard(
@@ -2494,7 +3118,7 @@ private struct ArtifactBlocksSection: View {
     }
 
     /// 原型块：已落盘且可交互 → 全宽生成文件卡（Claude artifacts 式）；
-    /// 流式中 / 未落盘 → 中性提示胶囊回退。
+    /// 流式中（生成进度卡承载）/ 未落盘 → 不出占位。
     @ViewBuilder
     private func prototypeBlock(_ block: ArtifactParser.ArtifactBlock) -> some View {
         if let onOpen, let url = artifactFileURL(block.name, project: project, version: version) {
@@ -2511,18 +3135,16 @@ private struct ArtifactBlocksSection: View {
                     children: nil
                 ))
             }
-        } else {
-            neutralPill(block.name)
         }
     }
 
     /// 文件类产物块出卡判据：已落盘且可交互（流式 onOpen = nil 不出卡）；
     /// 结构图表块（architecture / core-flows / business-flows / module-page-map）已内联
     /// 渲染，不再出文件卡——否则同一产物「内联图表 + 文件卡」双渲染（落盘后必现）；
-    /// prd 在交付摘要条承载期（hideSinkChips）不出卡——落盘文件卡已覆盖。
+    /// 交付回执卡承载期（hideFileCards）一律不出卡——回执主行已承载全部文件事实。
     private func showsFileCard(_ block: ArtifactParser.ArtifactBlock) -> Bool {
-        guard onOpen != nil, !isInlineChart(block), block.name != "prototype",
-              !(block.name == "prd" && hideSinkChips),
+        guard onOpen != nil, !hideFileCards, !isInlineChart(block),
+              !ArtifactPath.isPrototypeBlock(block.name),
               artifactFileURL(block.name, project: project, version: version) != nil
         else { return false }
         return true
@@ -2547,34 +3169,8 @@ private struct ArtifactBlocksSection: View {
         }
     }
 
-    /// 中性提示胶囊回退区：jsonl 类（radar / decision）、流式未落盘、旧会话回退；
-    /// 交付摘要条承载期（hideSinkChips）的雷达 / 决策 / PRD 静默不渲染。
-    @ViewBuilder
-    private func pill(_ block: ArtifactParser.ArtifactBlock) -> some View {
-        if hideSinkChips
-            && (block.name == "radar" || block.name == "decision" || block.name == "prd") {
-            // 摘要条 / 落盘文件卡已承载，不再重复提示
-        } else {
-            neutralPill(block.name)
-        }
-    }
-
-    /// 中性提示胶囊（产物已生成但不可交互：流式未落盘 / jsonl 类回退）。
-    private func neutralPill(_ name: String) -> some View {
-        HStack(spacing: DS.Spacing.s6) {
-            DSIcon(.fileUpload, size: 11)
-            Text(artifactDisplayName(name) + "已生成")
-                .font(DS.Font.bodySM)
-        }
-        // brand 收敛：产物提示是系统事件 → 中性胶囊（与 TurnNoteRow 中性档一致）
-        .foregroundStyle(Color.ink700)
-        .padding(.horizontal, DS.Spacing.s10)
-        .padding(.vertical, DS.Spacing.s4)
-        .background(
-            RoundedRectangle(cornerRadius: DS.Radius.md)
-                .fill(Color.surfaceSecondary)
-        )
-    }
+    /// 中性提示胶囊回退区已整体移除（2026-09-15 钦定）：雷达 / 决策无卡可出即静默，
+    /// 产物落盘后由生成文件卡承载；「XX 已生成」灰胶囊不得再引入。
 }
 
 // MARK: - 生成文件卡（Claude artifacts 式：图标块 + 名称 + 类型/大小元信息 + 预览入口）
@@ -2593,11 +3189,11 @@ private struct GeneratedFileCard: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: DS.Spacing.s12) {
-                DSIcon(icon, size: 16)
+                DSIcon(icon, size: 18)
                     .foregroundStyle(Color.brandAccent)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 42, height: 42)
                     .background(
-                        RoundedRectangle(cornerRadius: DS.Radius.md)
+                        RoundedRectangle(cornerRadius: DS.Radius.xl)
                             .fill(Color.brand100)
                     )
                 VStack(alignment: .leading, spacing: DS.Spacing.s2) {
@@ -2617,18 +3213,15 @@ private struct GeneratedFileCard: View {
                 }
                 .foregroundStyle(hovered ? Color.brandAccent : Color.ink500)
             }
-            .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s10)
+            // 2026-09 呼吸感改版：42 图标砖 + 22/18 内衬 + 无描边明度浮起（hover 加深一档）
+            .padding(.horizontal, 22)
+            .padding(.vertical, 18)
             .background(
-                RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .fill(hovered ? Color.overlayL1 : Color.surfaceSecondary)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .strokeBorder(hovered ? Color.brand300 : Color.borderL1, lineWidth: 1)
+                RoundedRectangle(cornerRadius: DS.Radius.r18)
+                    .fill(hovered ? Color.overlayL2 : Color.overlayL1)
             )
             .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
+            .contentShape(RoundedRectangle(cornerRadius: DS.Radius.r18))
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
@@ -2680,6 +3273,156 @@ private struct FileChangeCards: View {
     }
 }
 
+// MARK: - 变更提案卡（变更分诊：LLM 提案，用户三选裁决；处置状态查 AppModel.changeLedger）
+
+/// 提案卡三动作：纳入当前版本（走回退 + 重生成）/ 放入候选池 / 继续讨论。
+/// 已处置后按钮收起、出处置徽章——台账（changes.jsonl）是状态事实源，卡片只渲染。
+private struct ChangeProposalCard: View {
+    @EnvironmentObject private var model: AppModel
+    let proposal: ChangeProposalRecord
+
+    private var item: ChangeItem? {
+        model.changeLedger.first { $0.id == proposal.id }
+    }
+    private var resolution: ChangeResolution? { item?.resolution }
+
+    /// 建议文案（target 已在登记时过白名单；nil = 模型仅登记未建议回退）。
+    private var suggestionText: String? {
+        switch proposal.target.flatMap(AppModel.backtrackStage) {
+        case .clarify: "回① 澄清（增补模式，先判断可行性）"
+        case .structure: "回② 结构（原型与 PRD 连带失效）"
+        case .prototype: "回③ 原型重做（PRD 失效）"
+        default: nil
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Spacing.s10) {
+            // 头行：标识 + 分类 + 建议
+            HStack(spacing: DS.Spacing.s8) {
+                DSIcon(.arrowSwap, size: 13)
+                    .foregroundStyle(Color.brand600)
+                Text("变更提案")
+                    .font(DS.Font.bodyXSStrong)
+                    .foregroundStyle(Color.ink500)
+                if let category = proposal.category, !category.isEmpty {
+                    DSTag(title: category, variant: .neutral)
+                }
+                Spacer(minLength: 0)
+                if let suggestionText, resolution == nil {
+                    Text("建议 \(suggestionText)")
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink500)
+                        .lineLimit(1)
+                }
+            }
+
+            // 想法一句话（卡片主角）
+            Text(proposal.idea)
+                .font(DS.Font.bodyMDStrong)
+                .foregroundStyle(Color.ink900)
+                .dsBodyType(size: 14)
+                .textSelection(.enabled)
+
+            // 影响清单（防轻描淡写：看得见论据的确认才不是橡皮图章）
+            impactSection
+
+            // 处置区
+            if resolution == nil {
+                DSDivider()
+                HStack(spacing: DS.Spacing.s8) {
+                    Button {
+                        model.adoptChangeProposal(proposal)
+                    } label: {
+                        Text("纳入当前版本")
+                    }
+                    .buttonStyle(.ds(.primary, size: .sm))
+                    .disabled(model.currentVersionReleased || model.sessionStore.isStreaming)
+
+                    Button {
+                        model.poolChangeProposal(proposal)
+                    } label: {
+                        Text("放入候选池")
+                    }
+                    .buttonStyle(.ds(.secondary, size: .sm))
+
+                    Button {
+                        model.dismissChangeProposal(proposal)
+                    } label: {
+                        Text("继续讨论")
+                    }
+                    .buttonStyle(.ds(.ghost, size: .sm))
+                }
+            } else {
+                resolvedBadge
+            }
+        }
+        .padding(DS.Spacing.s12)
+        .frame(maxWidth: 620, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.md)
+                .fill(Color.surfaceSecondary)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.md)
+                .strokeBorder(Color.borderL1, lineWidth: 1)
+        )
+    }
+
+    /// 影响清单：产物级引用逐条列出；缺失时明示（不假装没有论据）。
+    @ViewBuilder
+    private var impactSection: some View {
+        if let impacts = proposal.impacts, !impacts.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Spacing.s4) {
+                Text("影响")
+                    .font(DS.Font.bodyXSStrong)
+                    .foregroundStyle(Color.ink300)
+                ForEach(impacts, id: \.self) { impact in
+                    HStack(alignment: .top, spacing: DS.Spacing.s6) {
+                        DSIcon(.dot, size: 5)
+                            .foregroundStyle(Color.ink300)
+                            .padding(.top, 6)
+                        Text(impact)
+                            .font(DS.Font.bodySM)
+                            .foregroundStyle(Color.ink700)
+                            .dsBodyType(size: 13)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        } else {
+            Text("未提供影响清单——建议仅供参考。")
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.ink300)
+        }
+    }
+
+    /// 已处置徽章（台账状态投影；note 补充处置语境）。
+    private var resolvedBadge: some View {
+        HStack(spacing: DS.Spacing.s6) {
+            switch resolution {
+            case .adopted:
+                DSIcon(.circleCheck, size: 12).foregroundStyle(Color.statusSuccess)
+                Text("已采纳").font(DS.Font.bodyXSStrong).foregroundStyle(Color.statusSuccess)
+            case .pooled:
+                DSIcon(.bookmark, size: 12).foregroundStyle(Color.brand600)
+                Text("已放入候选池").font(DS.Font.bodyXSStrong).foregroundStyle(Color.brand600)
+            case .deferred:
+                DSIcon(.clock, size: 12).foregroundStyle(Color.ink500)
+                Text("已顺延").font(DS.Font.bodyXSStrong).foregroundStyle(Color.ink500)
+            default:
+                DSIcon(.circleMinus, size: 12).foregroundStyle(Color.ink500)
+                Text("未采纳").font(DS.Font.bodyXSStrong).foregroundStyle(Color.ink500)
+            }
+            if let note = item?.resolutionNote, !note.isEmpty {
+                Text("· \(note)")
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink300)
+            }
+        }
+    }
+}
+
 // MARK: - 产物生成进度卡（流式中）
 
 /// 流式中未闭合 prototype 块的替身：图标 + 产物名 + 实时已生成行数，
@@ -2690,11 +3433,11 @@ private struct ArtifactProgressCard: View {
 
     private var icon: DSIcon.Name {
         switch name {
-        case "prototype": .browser
         case "prd": .document
         case "analysis": .barList
         case "radar": .glasses
         case "decision": .note
+        case let n where ArtifactPath.isPrototypeBlock(n): .browser
         default: .doc
         }
     }
@@ -2707,11 +3450,11 @@ private struct ArtifactProgressCard: View {
 
     var body: some View {
         HStack(spacing: DS.Spacing.s12) {
-            DSIcon(icon, size: 16)
+            DSIcon(icon, size: 18)
                 .foregroundStyle(Color.brandAccent)
-                .frame(width: 32, height: 32)
+                .frame(width: 42, height: 42)
                 .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.md)
+                    RoundedRectangle(cornerRadius: DS.Radius.xl)
                         .fill(Color.brand100)
                 )
             VStack(alignment: .leading, spacing: DS.Spacing.s2) {
@@ -2726,15 +3469,12 @@ private struct ArtifactProgressCard: View {
             Spacer(minLength: DS.Spacing.s8)
             DSPulseDot()
         }
-        .padding(.horizontal, DS.Spacing.s12)
-        .padding(.vertical, DS.Spacing.s10)
+        // 2026-09 呼吸感改版：与 GeneratedFileCard 同族——42 砖 + 22/18 内衬 + 无描边浮起
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
         .background(
-            RoundedRectangle(cornerRadius: DS.Radius.lg)
-                .fill(Color.surfaceSecondary)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.lg)
-                .strokeBorder(Color.borderL1, lineWidth: 1)
+            RoundedRectangle(cornerRadius: DS.Radius.r18)
+                .fill(Color.overlayL1)
         )
     }
 }
@@ -2806,8 +3546,11 @@ private struct StreamingContentBody: View {
     var project: String = ""
     var version: String = ""
 
-    /// 收进进度卡的块名（流式中收起源码，只显进度）。
-    private static let progressCardBlocks: Set<String> = ["prototype", "prd"]
+    /// 收进进度卡的块名判定（流式中收起源码，只显进度）：prd + 全部原型类槽位
+    /// （prototype / prototype-<slug> 分端块同样收起，防 HTML 源码刷屏）。
+    private static func isProgressCardBlock(_ name: String) -> Bool {
+        name == "prd" || ArtifactPath.isPrototypeBlock(name)
+    }
 
     /// （展示文本, 已完成块, 进行中的产物块）
     private func content() -> (
@@ -2815,14 +3558,21 @@ private struct StreamingContentBody: View {
         blocks: [ArtifactParser.ArtifactBlock],
         incomplete: (name: String, partial: String)?
     ) {
-        let blocks = ArtifactParser.parseArtifactBlocks(in: text)
-        let incomplete = ArtifactParser.parseIncompleteArtifact(in: text)
-            .flatMap { Self.progressCardBlocks.contains($0.name) ? $0 : nil }
+        // 流式文本同样清洗占位模仿残留（模型照抄的系统标注行不进气泡）
+        let rawText = ArtifactParser.scrubImitatedPlaceholders(in: text)
+        let blocks = ArtifactParser.parseArtifactBlocks(in: rawText)
+        let incomplete = ArtifactParser.parseIncompleteArtifact(in: rawText)
+            .flatMap { Self.isProgressCardBlock($0.name) ? $0 : nil }
         var display = blocks.isEmpty
-            ? text
-            : ArtifactParser.stripArtifactBlocks(in: text, placeholderFor: { _ in "" })
+            ? rawText
+            : ArtifactParser.stripArtifactBlocks(in: rawText, placeholderFor: { _ in "" })
         if incomplete != nil, let marker = display.range(of: "```artifact:", options: .backwards) {
-            display = String(display[..<marker.lowerBound])
+            // 开栏可能是更长反引号（````artifact:），前缀反引号一并裁掉
+            var cutStart = marker.lowerBound
+            while cutStart > display.startIndex, display[display.index(before: cutStart)] == "`" {
+                cutStart = display.index(before: cutStart)
+            }
+            display = String(display[..<cutStart])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return (display, blocks, incomplete)
@@ -2835,7 +3585,11 @@ private struct StreamingContentBody: View {
                 // Markdown 实时渲染（未闭合普通围栏容错到文末）；
                 // liveMermaid = false：流式中的 mermaid 围栏降级为代码块，
                 // 避免逐 tick 的 WKWebView 整页重载（流结束转正式条目后恢复图表）
-                MarkdownText(content.display, liveMermaid: false)
+                MarkdownText(
+                    content.display, liveMermaid: false,
+                    readingMeasure: DS.Typography.chatMeasure,
+                    semanticSections: true
+                )
             }
             ArtifactBlocksSection(
                 blocks: content.blocks,
@@ -2895,6 +3649,97 @@ struct PendingImageChip: View {
             .offset(x: 6, y: -6)
         }
         .onHover { hovering = $0 }
+    }
+}
+
+/// 引用文件 chip（产物台账右键「添加到对话」）：`<>` 图标 + 文件名。
+/// 输入坞内可移除——hover 时左侧图标槽位交叉淡化为关闭钮（同槽位不产生布局跳变）；
+/// 用户气泡内为静态展示（深底反色）。完整相对路径走 help 悬停提示。
+struct ReferencedFileChip: View {
+
+    enum Tone {
+        case composer   // 输入坞：浅底描边胶囊
+        case bubble     // 用户气泡：深底白系胶囊
+    }
+
+    let relativePath: String
+    var tone: Tone = .composer
+    var onRemove: (() -> Void)?
+
+    @State private var hovering = false
+
+    private var fileName: String {
+        (relativePath as NSString).lastPathComponent
+    }
+
+    private var showRemove: Bool { hovering && onRemove != nil }
+
+    var body: some View {
+        HStack(spacing: DS.Spacing.s6) {
+            // 左槽位：`<>` ↔ 关闭钮 交叉淡化（16×16 固定，hover 不推挤文件名）
+            ZStack {
+                DSIcon(.code, size: 10)
+                    .foregroundStyle(iconColor)
+                    .opacity(showRemove ? 0 : 1)
+                if let onRemove {
+                    Button(action: onRemove) {
+                        DSIcon(.close, size: 8)
+                            .foregroundStyle(iconColor)
+                            .frame(width: 15, height: 15)
+                            .background(
+                                Circle().fill(
+                                    tone == .composer
+                                        ? Color.overlayL2
+                                        : Color.white.opacity(0.22)
+                                )
+                            )
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .opacity(showRemove ? 1 : 0)
+                    .allowsHitTesting(showRemove)
+                    .help("移除该文件引用")
+                }
+            }
+            .frame(width: 16, height: 16)
+
+            Text(fileName)
+                .font(DS.Font.bodySM)
+                .foregroundStyle(titleColor)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, DS.Spacing.s8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.md)
+                .fill(tone == .composer ? Color.surfaceSecondary : Color.white.opacity(0.12))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.md)
+                .strokeBorder(
+                    tone == .composer
+                        ? (hovering ? Color.borderL3 : Color.borderL2)
+                        : Color.white.opacity(0.18),
+                    lineWidth: 1
+                )
+        )
+        .contentShape(RoundedRectangle(cornerRadius: DS.Radius.md))
+        // 文件名超长时 chip 不撑破输入坞：上限 220pt，超出中间省略
+        .frame(maxWidth: 220, alignment: .leading)
+        .onHover { inside in
+            withAnimation(DS.Motion.springFast) { hovering = inside }
+        }
+        .help(relativePath)
+        .animation(DS.Motion.springFast, value: hovering)
+    }
+
+    private var iconColor: Color {
+        tone == .composer ? Color.ink500 : Color.white.opacity(0.75)
+    }
+
+    private var titleColor: Color {
+        tone == .composer ? Color.ink800 : Color.white
     }
 }
 
@@ -3208,8 +4053,10 @@ private struct ComposerBarChip<Label: View>: View {
 }
 
 /// 发送钮（32×32 · radius 10 品牌紫方块 + 白 send 图标；禁用 = overlayL3 中性底）。
+/// P3：发起会话流式期间复用为插话钮（同形制，help 文案区分语义）。
 private struct ComposerSendButton: View {
     let enabled: Bool
+    var help: String = "发送（⏎ · ⇧⏎ 换行）"
     let action: () -> Void
 
     @State private var hovered = false
@@ -3235,7 +4082,7 @@ private struct ComposerSendButton: View {
         .disabled(!enabled)
         .onHover { hovered = $0 }
         .animation(DS.Motion.springFast, value: hovered)
-        .help("发送（⏎ · ⇧⏎ 换行）")
+        .help(help)
     }
 }
 

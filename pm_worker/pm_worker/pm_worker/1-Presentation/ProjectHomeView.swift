@@ -28,13 +28,19 @@ struct ProjectHomeView: View {
     @State private var loadFailed = false
     /// 已封板版本集合（version.json status == .released，磁盘为准）。
     @State private var releasedVersions: Set<String> = []
+    /// 各版本变更池未处置条目数（毕业仪式：封板前必须逐条处置，不许默认沉淀）。
+    @State private var pooledCounts: [String: Int] = [:]
+    /// 毕业仪式拦截弹窗：池内有未处置条目时点封板 → 指引先去处置。
+    @State private var poolBlockVersion: String?
+    /// 封板第一段确认弹窗的一行复盘摘要（点击封板时从磁盘 fold，nil = 无复盘内容）。
+    @State private var retroLine: String?
     /// 封板两段式确认：第一段（说明后果）/ 第二段（最终确认）。
     @State private var pendingWarnVersion: String?
     @State private var pendingConfirmVersion: String?
     @State private var showCompare = false
 
     var body: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s32) {
                 // 封板黄条置顶：项目存在已封板版本时提示（最新封板版本号）
                 if let latestReleased = releasedVersions.max() {
@@ -123,6 +129,7 @@ struct ProjectHomeView: View {
                 "封板后版本目录转为只读（不可再修改产物），风险全部结算"
                     + "（open 💀 → closed_unfired），并留存 release-notes 与 Git 快照。"
                     + "如需继续修改，请新建版本。"
+                    + (retroLine.map { "\n\n\($0)" } ?? "")
             )
         }
         .alert(
@@ -141,6 +148,21 @@ struct ProjectHomeView: View {
             }
         } message: {
             Text("目录即将冻结为只读，此操作不可在应用内撤销。确认封板？")
+        }
+        .alert(
+            "无法封板 \(poolBlockVersion ?? "")",
+            isPresented: Binding(
+                get: { poolBlockVersion != nil },
+                set: { if !$0 { poolBlockVersion = nil } }
+            )
+        ) {
+            Button("知道了", role: .cancel) { poolBlockVersion = nil }
+        } message: {
+            Text(
+                "变更池还有 \(pooledCounts[poolBlockVersion ?? ""] ?? 0) 条未处置——"
+                    + "封板前需在「决策日志 · 变更池」逐条裁决（纳入后续版本 / 放弃 / 顺延），"
+                    + "不许默认沉淀。"
+            )
         }
         .sheet(isPresented: $showCompare) {
             VersionCompareView(
@@ -297,7 +319,16 @@ struct ProjectHomeView: View {
             .buttonStyle(.ds(.ghost, size: .sm))
             if !isUnversioned && !isReleased {
                 Button {
-                    pendingWarnVersion = version
+                    // 毕业仪式闸：池内有未处置条目 → 拦截指引先去处置（不许默认沉淀）
+                    if (pooledCounts[version] ?? 0) > 0 {
+                        poolBlockVersion = version
+                    } else {
+                        // 对账前置：一行复盘（变更处置 / 回退 / 闸口 outcome）随第一段确认展示
+                        retroLine = ReleaseRetro.load(
+                            project: projectName, version: version
+                        ).oneLiner
+                        pendingWarnVersion = version
+                    }
                 } label: {
                     Label {
                         Text("封板")
@@ -330,6 +361,14 @@ struct ProjectHomeView: View {
                 return doc?.status == .released ? version : nil
             }
         )
+        // 毕业仪式前置：各版本变更池未处置条目数（封板闸依据）
+        pooledCounts = Dictionary(uniqueKeysWithValues: versions.map { version in
+            (
+                version,
+                ChangeLedger.load(project: projectName, version: version)
+                    .filter(\.isPooled).count
+            )
+        })
     }
 
     private func saveProject() {

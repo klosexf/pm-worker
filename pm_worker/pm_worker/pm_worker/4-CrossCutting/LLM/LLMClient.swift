@@ -54,6 +54,9 @@ nonisolated enum LLMDelta: Equatable {
     case reasoning(String)
     /// 流末 finish_reason == "length"：输出撞上 max_tokens 被截断（产物围栏可能未闭合）。
     case truncated
+    /// 瞬时故障（429/5xx）自动重试中：响应头阶段已判失败、正文未流出。
+    /// 消费方据此在 UI 显示重试状态（重试本身在 LLMClient 内部完成，无需干预）。
+    case retrying(code: Int, attempt: Int)
 }
 
 /// 流式末 chunk 携带的 usage（OpenAI 兼容；M5 Task 5.4 成本统计）。
@@ -91,19 +94,61 @@ nonisolated enum LLMClient {
 
     enum LLMError: LocalizedError {
         case missingAPIKey
+        /// Keychain item 存在但读取被拒（构建重签后运行中进程常见）——
+        /// 勿与 missingAPIKey 混同：重启 App 即恢复，重填 Key 无效。
+        case keychainAccessDenied(OSStatus)
         case missingBaseURL
         case http(Int, String)
         case emptyStream
+        /// 思考型模型把单轮输出预算全部烧在 reasoning 上、正文零输出（reasoning
+        /// 分片有、content 分片无）。与字面空流（服务端抖动、零数据）区分：
+        /// 同请求重发大概率重演（思考长度随任务稳定），重试必须换条件——
+        /// 降思考强度 + 加倍输出预算；文案也要给出可执行出路而非笼统「未返回」。
+        case emptyAfterThinking
+        case streamTimeout
 
         var errorDescription: String? {
             switch self {
             case .missingAPIKey: "未配置 API Key——请到设置（⌘,）填写"
+            case .keychainAccessDenied(let status):
+                "API Key 在钥匙串中完好但访问被拒（构建重签后常见）——退出并重启 App 即恢复，无需重填（OSStatus \(status)）"
             case .missingBaseURL: "模型端点（baseURL）未配置"
-            case .http(let code, let body): "HTTP \(code)：\(body.prefix(300))"
+            case .http(let code, let body):
+                // 人话化三要素：发生了什么 / 现在怎样 / 用户能做什么。
+                // 原始报文（provider JSON、Request ID）绝不直出 UI——429/5xx 在
+                // 传输层已自动重试过，走到这里说明重试耗尽，用户需要的是出路而非报文。
+                switch code {
+                case 401, 403:
+                    "API Key 无效或无权限——请到设置（⌘,）检查模型配置"
+                case 402:
+                    "账户余额不足——请到服务商控制台充值后重新发送这条消息"
+                case 429:
+                    "模型服务繁忙，已自动重试仍未成功——请稍等片刻后重新发送这条消息"
+                case 500...599:
+                    "模型服务暂时不可用，已自动重试仍未成功——请稍后重新发送这条消息"
+                default:
+                    // 非瞬时错误（400 等）多半是配置/模型名问题，透传服务端 message 帮助定位
+                    "请求失败（HTTP \(code)）：\(LLMClient.serverMessage(fromBody: body))——请检查模型配置或稍后重试"
+                }
             case .emptyStream: "模型未返回任何内容"
+            case .emptyAfterThinking:
+                "思考型模型把输出预算全部烧在思考上、未产生正文——已用「降低思考强度 + 加大输出上限」重试仍未成功，请重发这条消息或调低思考强度后再试"
+            case .streamTimeout: "流式响应超时：服务端长时间未返回内容，已断开（请重试或换模型）"
             }
         }
     }
+
+    /// 流式专用会话：resource 超时是**总时长硬上限**——request 级 timeoutInterval
+    /// 只是空闲计时，服务端持续发 keep-alive 心跳行却不给正文时会不断重置，
+    /// 流会永久挂起、isStreaming 卡死（实测 40 分钟不结束，后续所有发送被
+    /// 「生成中」守卫静默吞掉 = 用户视角「发不出去」）。resource 上限无论心跳
+    /// 与否到点必断，错误照常走 ⚠️ 收尾路径。internal 供测试断言配置。
+    nonisolated static let streamingSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 120   // 空闲超时：半开连接 120s 必断
+        config.timeoutIntervalForResource = 600  // 总时长硬上限：单次流 ≤10 分钟
+        return URLSession(configuration: config)
+    }()
 
     /// OpenAI 兼容请求体（提升到 enum 作用域：测试直测编码行为）。
     nonisolated struct RequestBody: Codable {
@@ -168,6 +213,79 @@ nonisolated enum LLMClient {
         }
     }
 
+    // MARK: - 瞬时故障自动重试（429 限流/过载、5xx 服务端错误）
+
+    /// 自动重试次数上限（与 openStreamWithRetry 的退避表 1s→2s 一一对应）。
+    static let maxStreamRetries = 2
+
+    /// 是否瞬时故障：服务端过载/限流（429）与 5xx，通常几秒内自愈——
+    /// 值得客户端退避重试吸收掉，而非把原始错误甩给用户。
+    static func isTransientStatus(_ code: Int) -> Bool {
+        code == 429 || (500...599).contains(code)
+    }
+
+    /// 空流重试（思考烧满预算形态）的输出预算：保底 32768、加倍、封顶 65536。
+    /// 思考与正文共用输出池，思考占满即正文为零——预算是重试期唯一无损杠杆
+    ///（保底覆盖 8192 抽取路径；封顶实测方舟 glm 与主流 OpenAI 兼容端点均接受）。
+    /// 纯函数，测试直测。
+    static func escalatedRetryBudget(_ maxTokens: Int) -> Int {
+        min(max(maxTokens * 2, 32768), 65536)
+    }
+
+    /// 重试等待期间的气泡状态文案（人话 + 进度）。纯函数，测试直测。
+    static func retryStatusText(code: Int, attempt: Int) -> String {
+        let reason = code == 429 ? "模型服务繁忙" : "模型服务暂时不可用"
+        return "\(reason)，自动重试中（\(attempt)/\(maxStreamRetries)）…"
+    }
+
+    /// 从错误报文提取服务端人话（OpenAI 兼容 {"error":{"message":…}} 结构）；
+    /// 解不出回退原报文前 160 字符。纯函数，测试直测。
+    static func serverMessage(fromBody body: String) -> String {
+        struct Envelope: Codable {
+            struct Err: Codable { var message: String? }
+            var error: Err?
+        }
+        if let data = body.data(using: .utf8),
+           let e = try? JSONDecoder().decode(Envelope.self, from: data),
+           let m = e.error?.message, !m.isEmpty {
+            return m
+        }
+        return String(body.prefix(160))
+    }
+
+    /// 打开流式连接：429/5xx 自动重试，指数退避 1s→2s（服务端 Retry-After 秒数优先，
+    /// 封顶 8s），最多重试 maxStreamRetries 次。仅在响应头阶段失败时重试——此刻正文
+    /// 尚未流出、状态未推进，同请求重发安全；一旦正文开始，重试会造成重复渲染，
+    /// 交由上层空流/截断路径兜底。退避等待可被取消：用户「停止」即刻退出，不发僵尸请求。
+    /// 每次发起重试前回调 onRetry(状态码, 第几次重试)，供消费方在 UI 显示重试状态。
+    private static func openStreamWithRetry(
+        _ request: URLRequest,
+        onRetry: (Int, Int) -> Void
+    ) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        let backoffs: [UInt64] = [1_000_000_000, 2_000_000_000]
+        var attempt = 0
+        while true {
+            let (bytes, response) = try await streamingSession.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  !(200..<300).contains(http.statusCode) else {
+                return (bytes, response)
+            }
+            var bodyText = ""
+            for try await line in bytes.lines { bodyText += line }
+            guard isTransientStatus(http.statusCode), attempt < backoffs.count else {
+                throw LLMError.http(http.statusCode, bodyText)
+            }
+            attempt += 1
+            onRetry(http.statusCode, attempt)
+            let wait = min(
+                http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+                    ?? Double(backoffs[attempt - 1]) / 1_000_000_000,
+                8
+            )
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        }
+    }
+
     /// 流式对话：逐 token 吐出增量（正文 delta / 思考 reasoning）。
     /// - Parameters:
     ///   - stage: 阶段（取该阶段配置与 API Key）
@@ -185,7 +303,16 @@ nonisolated enum LLMClient {
         guard let config = settings.stages[stage] else {
             throw LLMError.missingBaseURL
         }
-        guard let apiKey = KeychainStore.get(config.apiKeyKeychainKey), !apiKey.isEmpty else {
+        // Key 读取必须区分「未配置」与「访问被拒」：构建重签后运行中进程会被
+        // 拒读（item 完好），折叠成 missingAPIKey 会误导用户白填一遍 Key
+        //（2026-09-16 事故；设置页同教训见 KeychainStore.read 注释）。
+        let apiKey: String
+        switch KeychainStore.read(config.apiKeyKeychainKey) {
+        case .found(let key) where !key.isEmpty:
+            apiKey = key
+        case .accessFailed(let status):
+            throw LLMError.keychainAccessDenied(status)
+        default:
             throw LLMError.missingAPIKey
         }
         let baseURL = config.resolvedBaseURL
@@ -210,14 +337,12 @@ nonisolated enum LLMClient {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
-                    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-                        var bodyText = ""
-                        for try await line in bytes.lines { bodyText += line }
-                        throw LLMError.http(http.statusCode, bodyText)
+                    let (bytes, response) = try await openStreamWithRetry(request) { code, attempt in
+                        continuation.yield(.retrying(code: code, attempt: attempt))
                     }
 
                     var received = false
+                    var receivedReasoning = false  // 思考分片到达（正文为零时区分失败成因）
                     var truncated = false   // finish_reason == "length"（撞 max_tokens 截断）
                     var fullText = ""      // 累计正文+思考（usage 缺失时估算 completion 用）
                     var usage: StreamUsage?  // 末 chunk usage（M5 Task 5.4）
@@ -264,13 +389,17 @@ nonisolated enum LLMClient {
                                     continuation.yield(.text(text))
                                 }
                                 if let reasoning = delta.reasoningContent, !reasoning.isEmpty {
+                                    receivedReasoning = true
                                     fullText += reasoning
                                     continuation.yield(.reasoning(reasoning))
                                 }
                             }
                         }
                     }
-                    guard received else { throw LLMError.emptyStream }
+                    guard received else {
+                        // 正文为零时按成因分流：思考分片有 → 思考烧满预算；零分片 → 字面空流
+                        throw receivedReasoning ? LLMError.emptyAfterThinking : LLMError.emptyStream
+                    }
                     // 截断信号在用量记录前透出（消费方据此决定是否续写）
                     if truncated { continuation.yield(.truncated) }
                     // 成功路径记一笔用量（失败/空流不记；M5 Task 5.4）
@@ -281,6 +410,9 @@ nonisolated enum LLMClient {
                         )
                     )
                     continuation.finish()
+                } catch let error as URLError where error.code == .timedOut {
+                    // 空闲/总时长超时统一映射为明确的中文文案（⚠️ 收尾行可读）
+                    continuation.finish(throwing: LLMError.streamTimeout)
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -291,6 +423,10 @@ nonisolated enum LLMClient {
 
     /// 非流式便捷封装（分类路由 / JSON 抽取等小请求用）。
     /// 撞 max_tokens 截断时自动续写（MCP 无头生成原型 HTML 同样会截断），上限 2 次。
+    /// 空流自动重试上限 1 次：字面空流（服务端抖动）同请求重发；思考烧满预算
+    /// （reasoning 有、正文零，emptyAfterThinking）同请求重发大概率重演——
+    /// 改为加倍输出预算 + 强制 low 思考直击成因（澄清要点表等长 transcript
+    /// 抽取路径的咽喉救援，2026-09-16 「确认后 6 分钟空流」实证）。
     static func complete(
         stage: LLMStage,
         settings: LLMSettings,
@@ -300,17 +436,36 @@ nonisolated enum LLMClient {
         var result = ""
         var messages = messages
         var rounds = 0
+        var emptyRetries = 0
+        var budget = maxTokens
+        var effortOverride: String? = nil
         while true {
             var truncated = false
             let roundStart = result.count
-            for try await delta in try streamChat(
-                stage: stage, settings: settings, messages: messages, maxTokens: maxTokens
-            ) {
-                switch delta {
-                case .text(let text): result += text
-                case .truncated: truncated = true
-                case .reasoning: break
+            do {
+                for try await delta in try streamChat(
+                    stage: stage, settings: settings, messages: messages,
+                    maxTokens: budget, reasoningEffort: effortOverride
+                ) {
+                    switch delta {
+                    case .text(let text): result += text
+                    case .truncated: truncated = true
+                    case .reasoning: break
+                    case .retrying: break  // 无头路径无实时气泡，重试静默进行
+                    }
                 }
+            } catch LLMError.emptyAfterThinking
+                where result.count == roundStart && emptyRetries < 1 {
+                // 思考烧满预算：换条件重试（同请求重发大概率重演）
+                emptyRetries += 1
+                budget = escalatedRetryBudget(budget)
+                effortOverride = ThinkingEffort.low.apiValue
+                continue
+            } catch LLMError.emptyStream
+                where result.count == roundStart && emptyRetries < 1 {
+                // 字面空流（服务端抖动）：同请求重发
+                emptyRetries += 1
+                continue
             }
             guard truncated, rounds < 2 else { break }
             rounds += 1

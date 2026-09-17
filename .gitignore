@@ -27,11 +27,13 @@ pm-copilot-traework/
 pm_worker/pm_worker/ContentView.swift
 PM Agent · 简化版需求文档*.md
 PM 全流程 AI Agent*.md
+PM Copilot 产品全景文档（供外部AI评审）.md
 
 # 设计探索稿：根目录 HTML 一律视为本地方案对比 mockup，不上传（仅钦定 v4 原型入库）
 /*.html
 !/PM Copilot 交互原型 v4 · TraeWork.html
 !/PM Copilot 交互原型 v4 · TraeWork Dark.html
 /*-三方案/
+/自由讨论模式/
 /对话页呼吸感探索/
 /设计方案-版本选择入口/

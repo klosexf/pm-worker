@@ -324,7 +324,7 @@ struct DSTable<Rows: View>: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal) {
+        DSScroll(.horizontal) {
             Grid(
                 alignment: .topLeading,
                 horizontalSpacing: DS.Spacing.s8,

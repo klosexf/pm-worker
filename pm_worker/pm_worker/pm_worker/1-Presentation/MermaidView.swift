@@ -269,13 +269,21 @@ struct MermaidPreviewSheet: View {
     let title: String
     let fileURL: URL
     @State private var showSource = false
-    @State private var markdown: String = ""
+    @State private var markdown: String
     @State private var isEditing = false
     @State private var draft = ""
     @State private var savedText = ""
     @State private var saveError: String?
     @State private var editor = MarkdownEditorController()
     @Environment(\.dismiss) private var dismiss
+
+    /// init 即读盘（原来 onAppear 才读）：首帧直接渲染真实内容，消掉「空文件
+    /// 兜底帧闪现 + 弹窗动画中途整页重排」的卡顿观感；13KB 级读取在毫秒档。
+    init(title: String, fileURL: URL) {
+        self.title = title
+        self.fileURL = fileURL
+        _markdown = State(initialValue: (try? String(contentsOf: fileURL, encoding: .utf8)) ?? "")
+    }
 
     /// 草稿相对上次保存的差异
     private var isDirty: Bool { draft != savedText }
@@ -288,39 +296,15 @@ struct MermaidPreviewSheet: View {
 
             DSDivider()
 
-            if isEditing {
-                MarkdownEditToolbar(controller: editor)
-                DSDivider()
-                MarkdownSourceEditor(text: $draft, controller: editor)
-            } else if showSource {
-                // 源码：NSTextView 惰性排版承载（DSCode 单 Text 对万字符文档同步
-                // 排版会卡主线程数秒，见 MarkdownSourceReader 头注释）；卡壳沿用
-                // DSCode 视觉（overlayL1 底 + borderL1 发丝线），内部滚动
-                MarkdownSourceReader(text: markdown)
-                    .background(Color.overlayL1, in: RoundedRectangle(cornerRadius: DS.Radius.lg))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.lg)
-                            .strokeBorder(Color.borderL1, lineWidth: 1)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
-                    .padding(DS.Spacing.s16)
-            } else if markdown.isEmpty {
-                // 文件读取失败兜底（正常 .md 不会走到）
-                VStack {
-                    Spacer()
-                    Text("无法读取文件内容")
-                        .font(DS.Font.bodySM)
-                        .foregroundStyle(Color.ink500)
-                    Spacer()
-                }
-            } else {
-                // 全文 Markdown 渲染：标题/列表/表格/引用/代码块/行内富文本，
-                // ```mermaid 围栏块由 MarkdownText 内联成图卡（复用对话页渲染管线）
-                ScrollView {
-                    MarkdownText(markdown)
-                        .padding(DS.Spacing.s16)
-                }
-            }
+            // 内容区显式隔离动画事务（2026-09-15 崩溃修复）：DSTabs 的选中变化包在
+            // withAnimation(spring) 里，若分支交换跟随该事务做过渡动画，源码
+            // (NSTextView/NSScrollView)↔预览(MarkdownText) 的多帧过渡会在 AppKit
+            // 布局 pass 进行中重入触发 SwiftUI 约束失效（NSHostingView.requestUpdate
+            // → setNeedsUpdateConstraints），AppKit 直接抛 NSException 崩溃
+            // （-[NSWindow _postWindowNeedsUpdateConstraints]）。内容交换瞬时完成
+            // （标签胶囊滑动动画不受影响，它由 header 自己的事务驱动）。
+            content
+                .transaction { $0.animation = nil }
         }
         // 面板钳在 min–max 之间（ideal 保底尺寸，窗口大于 ideal 时浮卡可长到 max）
         .frame(
@@ -328,13 +312,50 @@ struct MermaidPreviewSheet: View {
             minHeight: 600, idealHeight: 840, maxHeight: 900
         )
         .dsDismissOnOutsideTap { dismiss() }  // 点击面板外关闭（与关闭钮同动作）
-        .onAppear {
-            markdown = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
-        }
         .onDisappear {
             // 兜底：编辑中直接关窗（非「退出编辑」路径）不丢稿
             if isEditing, isDirty {
                 try? draft.write(to: fileURL, atomically: true, encoding: .utf8)
+            }
+        }
+    }
+
+    /// 编辑 / 源码 / 预览三分支内容区（动画事务由 body 统一隔离，见 body 注释）。
+    @ViewBuilder
+    private var content: some View {
+        if isEditing {
+            MarkdownEditToolbar(controller: editor)
+            DSDivider()
+            MarkdownSourceEditor(text: $draft, controller: editor)
+        } else if showSource {
+            // 源码：NSTextView 惰性排版承载（DSCode 单 Text 对万字符文档同步
+            // 排版会卡主线程数秒，见 MarkdownSourceReader 头注释）；卡壳沿用
+            // DSCode 视觉（overlayL1 底 + borderL1 发丝线），内部滚动
+            MarkdownSourceReader(text: markdown)
+                .background(Color.overlayL1, in: RoundedRectangle(cornerRadius: DS.Radius.lg))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.Radius.lg)
+                        .strokeBorder(Color.borderL1, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
+                .padding(DS.Spacing.s16)
+        } else if markdown.isEmpty {
+            // 文件读取失败兜底（正常 .md 不会走到）
+            VStack {
+                Spacer()
+                Text("无法读取文件内容")
+                    .font(DS.Font.bodySM)
+                    .foregroundStyle(Color.ink500)
+                Spacer()
+            }
+        } else {
+            // 全文 Markdown 渲染：标题/列表/表格/引用/代码块/行内富文本，
+            // ```mermaid 围栏块由 MarkdownText 内联成图卡（复用对话页渲染管线）。
+            // longDocument 档：LazyVStack 惰性布局 + prose 合并分块封顶，
+            // 首屏即开即显（整篇文档一次性排版会卡主线程，见 MarkdownText 注释）
+            DSScroll {
+                MarkdownText(markdown, longDocument: true)
+                    .padding(DS.Spacing.s16)
             }
         }
     }
@@ -437,7 +458,7 @@ struct MarkdownEditToolbar: View {
     let controller: MarkdownEditorController
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        DSScroll(.horizontal) {
             HStack(spacing: DS.Spacing.s2) {
                 tool("撤销", "撤销（⌘Z）") { controller.undo() }
                 tool("重做", "重做（⇧⌘Z）") { controller.redo() }
@@ -759,6 +780,8 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         scroll.documentView = tv
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
+        // 系统粗滚动条统一降噪：覆盖式细条（随滚淡出），与 DSScroll 视觉一致
+        scroll.scrollerStyle = .overlay
         scroll.drawsBackground = false
 
         context.coordinator.text = $text
@@ -818,6 +841,8 @@ struct MarkdownSourceReader: NSViewRepresentable {
         scroll.documentView = tv
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
+        // 系统粗滚动条统一降噪：覆盖式细条（随滚淡出），与 DSScroll 视觉一致
+        scroll.scrollerStyle = .overlay
         scroll.drawsBackground = false
         return scroll
     }

@@ -7,9 +7,10 @@
 //  - 记忆段注入 + 假设态校准文本排段尾（预算压力下最先被裁的位置语义）
 //  - token 预算裁剪优先级（history → retrieval → skillBodies → memory；rules 永不裁）
 //  - 技能正文渐进式披露（命中才注入正文，未命中不注入）
-//  - 技能路由「意图优先、阶段兜底」（2026-09-14）：语义命中按 skillQuery 注入、
-//    零命中时注入阶段钦定锚点技能（PitfallsRouter.stageAnchorSkills），命中计数
-//    收口为「正文实际进上下文才算」
+//  - 技能路由「语义为准 + 判定兜底」（2026-09-14 意图优先 → 2026-09-15 混合路由）：
+//    语义命中按 skillQuery 注入；本地零命中时判定通道（skillJudge 闭包，测试用假实现）
+//    接住——判空即不注入；锚点兜底仅限「判定不可用 + 技能表无可用向量」的链路全断态，
+//    命中计数收口为「正文实际进上下文才算」
 //  - pitfalls 确定性路由进 system prompt 尾部自检清单
 //  - 空段省略 + ContextAssembly Codable 往返
 //  - SessionStore.trimmedHistory 成对丢最旧整轮
@@ -19,6 +20,19 @@
 import XCTest
 import GRDB
 @testable import pm_worker
+
+/// 判定通道探针（测试假实现）：记录调用与入参，返回预设结果——
+/// 判定通道是「本地零命中才调用」的可注入闭包，测试由此免网络断言调用时机与结果。
+private final class JudgeProbe {
+    var result: [String]?
+    var calls = 0
+    var lastQuery: String?
+    var lastCandidateIDs: [String] = []
+
+    init(result: [String]?) {
+        self.result = result
+    }
+}
 
 final class ContextBuilderTests: XCTestCase {
     var tempRoot: URL!
@@ -69,11 +83,13 @@ final class ContextBuilderTests: XCTestCase {
         bestFor: [String] = [],
         tags: [String] = [],
         pitfalls: [String] = [],
-        docPath: String = "/nonexistent/skill.md"
+        docPath: String = "/nonexistent/skill.md",
+        withVector: Bool = true
     ) throws {
-        // 与 IndexRebuilder 同口径：embedding 对 name + when_to_use + best_for + tags 编码
+        // 与 IndexRebuilder 同口径：embedding 对 name + when_to_use + best_for + tags 编码；
+        // withVector = false 复刻「零长度占位向量」索引失效态（旧重建路径遗留）
         let fourField = ([name, whenToUse] + bestFor + tags).joined(separator: "\n")
-        let vector = DeterministicHashEmbedder.vector(for: fourField)
+        let vector = withVector ? DeterministicHashEmbedder.vector(for: fourField) : []
         let encoder = JSONEncoder()
         try database.dbQueue.write { db in
             try db.execute(
@@ -313,15 +329,16 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertEqual(counts["高保真原型设计"], 0)
     }
 
-    func testStageAnchorFallsBackWhenSemanticMisses() async throws {
-        // 语义零命中（skillQuery 与技能四字段零重合）→ 阶段钦定锚点技能兜底注入
-        let anchorBody = "锚点技能正文：STAGE_ANCHOR_SENTINEL 设计令牌先行再谈配色"
+    func testSemanticMissInjectsNothingWhenSkillIndexReady() async throws {
+        // 语义零命中（skillQuery 与技能四字段零重合）+ 索引可用（技能行带向量）
+        // → 不注入任何技能正文（2026-09-15 定稿「语义为准」：离题提问 / 闲聊
+        // 不得被塞阶段技能；旧口径在此会注入阶段锚点）
         let anchorPath = tempRoot.appendingPathComponent("stage-anchor.md").path
         try """
         ---
         name: 高保真原型设计
         ---
-        \(anchorBody)
+        锚点技能正文：STAGE_ANCHOR_SENTINEL 设计令牌先行再谈配色
         """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
         try insertSkill(
             id: "高保真原型设计", name: "高保真原型设计",
@@ -335,7 +352,48 @@ final class ContextBuilderTests: XCTestCase {
             memoryContext: "", calibration: []
         ) { "骨架。" + $0 }
 
-        // 锚点正文兜底注入（主干方法论不因检索失效而缺席）
+        // 技能段整段省略（零注入），锚点也不兜底
+        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
+        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertTrue(assembly.skillIds.isEmpty)
+        XCTAssertTrue(assembly.injectedSkillBodies.isEmpty)
+        // 未注入不计命中数
+        let anchorHits = try await database.dbQueue.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT hit_count FROM skills WHERE id = ?",
+                arguments: ["高保真原型设计"]
+            ) ?? 0
+        }
+        XCTAssertEqual(anchorHits, 0)
+        // trace 可观测：索引可用（零命中 ≠ 通道失效）
+        let trace = try XCTUnwrap(assembly.retrieval)
+        XCTAssertEqual(trace.skillQuery, "零命中查询墨水瓶")
+        XCTAssertEqual(trace.skillIndexReady, true)
+    }
+
+    func testStageAnchorFallsBackOnlyWhenSkillIndexHasNoVectors() async throws {
+        // 索引失效态：技能行是零长度占位向量（旧同步重建路径遗留 / 未建索引）
+        // → 检索通道等于不存在，阶段钦定锚点兜底注入（主干方法论不缺席）
+        let anchorPath = tempRoot.appendingPathComponent("stage-anchor-no-vector.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        锚点技能正文：STAGE_ANCHOR_SENTINEL 设计令牌先行再谈配色
+        """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时",
+            docPath: anchorPath, withVector: false
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "零命中查询墨水瓶",
+            memoryContext: "", calibration: []
+        ) { "骨架。" + $0 }
+
         XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：高保真原型设计"))
         XCTAssertTrue(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
@@ -347,9 +405,209 @@ final class ContextBuilderTests: XCTestCase {
             ) ?? 0
         }
         XCTAssertEqual(anchorHits, 1)
-        // 意图 query 留痕（检查器 trace 可观测）
+        // trace 可观测：索引失效（无可用向量）
         let trace = try XCTUnwrap(assembly.retrieval)
-        XCTAssertEqual(trace.skillQuery, "零命中查询墨水瓶")
+        XCTAssertEqual(trace.skillIndexReady, false)
+    }
+
+    // MARK: - 4.6 判定兜底通道（混合路由，2026-09-15）
+
+    func testJudgeChannelPicksSkillsWhenLocalMisses() async throws {
+        // 本地零命中（口语化短句，词面兜不住）→ 判定通道接住：判出的技能正文注入
+        let path = tempRoot.appendingPathComponent("judge-skill.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        判定命中技能正文：JUDGE_SENTINEL 按钮层级与点击反馈
+        """.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时", docPath: path
+        )
+
+        let probe = JudgeProbe(result: ["高保真原型设计"])
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "这个按钮应该放在哪里",  // 与技能四字段零重合（本地检索零命中）
+            memoryContext: "", calibration: [],
+            skillJudge: { query, candidates in
+                probe.calls += 1
+                probe.lastQuery = query
+                probe.lastCandidateIDs = candidates.map(\.id)
+                return probe.result
+            }
+        ) { "骨架。" + $0 }
+
+        // 本地零命中才调用，判定查询 = 本轮消息（非 stageQuery），清单 = 启用技能
+        XCTAssertEqual(probe.calls, 1)
+        XCTAssertEqual(probe.lastQuery, "这个按钮应该放在哪里")
+        XCTAssertEqual(probe.lastCandidateIDs, ["高保真原型设计"])
+        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：高保真原型设计"))
+        XCTAssertTrue(assembly.systemPrompt.contains("JUDGE_SENTINEL"))
+        XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
+        // 判定结果进检查器报告
+        XCTAssertEqual(assembly.skillJudgeReport?.available, true)
+        XCTAssertEqual(assembly.skillJudgeReport?.picked, ["高保真原型设计"])
+        // 注入才算命中（与语义命中同口径）
+        let hits = try await database.dbQueue.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT hit_count FROM skills WHERE id = ?",
+                arguments: ["高保真原型设计"]
+            ) ?? 0
+        }
+        XCTAssertEqual(hits, 1)
+    }
+
+    func testJudgeEmptyResultInjectsNothing() async throws {
+        // 判定可用但判空（离题 / 闲聊 / 纯推进语）→ 不注入，且不再走锚点
+        // （判定可用 = 已经问过模型，索引可用与否都不再兜底塞技能）
+        let anchorPath = tempRoot.appendingPathComponent("judge-empty-anchor.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        锚点技能正文：STAGE_ANCHOR_SENTINEL
+        """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时",
+            docPath: anchorPath, withVector: false  // 索引失效也不得掩盖判定结论
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "我想问一下马斯克是谁？",
+            memoryContext: "", calibration: [],
+            skillJudge: { _, _ in [] }
+        ) { "骨架。" + $0 }
+
+        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
+        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertTrue(assembly.skillIds.isEmpty)
+        XCTAssertEqual(assembly.skillJudgeReport?.available, true)
+        XCTAssertEqual(assembly.skillJudgeReport?.picked, [])
+        let anchorHits = try await database.dbQueue.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT hit_count FROM skills WHERE id = ?",
+                arguments: ["高保真原型设计"]
+            ) ?? 0
+        }
+        XCTAssertEqual(anchorHits, 0)
+    }
+
+    func testJudgeSkippedWhenLocalHits() async throws {
+        // 本地语义命中 → 判定通道零调用（混合路由的「本地先筛、模糊才判」）
+        let xPath = tempRoot.appendingPathComponent("judge-skip-x.md").path
+        try """
+        ---
+        name: 技能X
+        ---
+        技能X正文：LOCAL_HIT_SENTINEL
+        """.write(to: URL(fileURLWithPath: xPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "技能X", name: "技能X", whenToUse: "用户访谈前列提纲时", docPath: xPath
+        )
+
+        let probe = JudgeProbe(result: ["技能X"])
+        let assembly = await makeBuilder().assemble(
+            stage: .clarify, project: "项目X",
+            stageQuery: "阶段查询文本",
+            skillQuery: "用户访谈前列提纲时",  // 与技能四字段重合 → 本地命中
+            memoryContext: "", calibration: [],
+            skillJudge: { query, candidates in
+                probe.calls += 1
+                return probe.result
+            }
+        ) { "骨架。" + $0 }
+
+        XCTAssertEqual(probe.calls, 0)
+        XCTAssertNil(assembly.skillJudgeReport)  // 未调用 → 无报告
+        XCTAssertTrue(assembly.systemPrompt.contains("LOCAL_HIT_SENTINEL"))
+        XCTAssertEqual(assembly.skillIds, ["技能X"])
+    }
+
+    func testJudgeUnavailableFallsBackToAnchorOnlyWhenIndexHasNoVectors() async throws {
+        // 判定通道不可用（nil = 网络 / 解析失败）+ 索引失效（零向量）→ 锚点兜底（链路全断态）
+        let anchorPath = tempRoot.appendingPathComponent("judge-nil-anchor.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        锚点技能正文：STAGE_ANCHOR_SENTINEL
+        """.write(to: URL(fileURLWithPath: anchorPath), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时",
+            docPath: anchorPath, withVector: false
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "零命中查询墨水瓶",
+            memoryContext: "", calibration: [],
+            skillJudge: { _, _ in nil }
+        ) { "骨架。" + $0 }
+
+        XCTAssertTrue(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
+        XCTAssertEqual(assembly.skillJudgeReport?.available, false)
+    }
+
+    func testJudgeUnavailableWithReadyIndexInjectsNothing() async throws {
+        // 判定通道不可用 + 索引可用 → 保守不注入（零命中 = 没有依据，不塞阶段技能）
+        let path = tempRoot.appendingPathComponent("judge-nil-ready.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        锚点技能正文：STAGE_ANCHOR_SENTINEL
+        """.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时", docPath: path
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "零命中查询墨水瓶",
+            memoryContext: "", calibration: [],
+            skillJudge: { _, _ in nil }
+        ) { "骨架。" + $0 }
+
+        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
+        XCTAssertTrue(assembly.skillIds.isEmpty)
+        XCTAssertEqual(assembly.skillJudgeReport?.available, false)
+    }
+
+    func testJudgeUnknownNamesIgnored() async throws {
+        // 判定幻觉名（不在技能清单里）被忽略——只有清单内的技能能注入
+        let path = tempRoot.appendingPathComponent("judge-hallucination.md").path
+        try """
+        ---
+        name: 高保真原型设计
+        ---
+        判定命中技能正文：JUDGE_SENTINEL
+        """.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
+        try insertSkill(
+            id: "高保真原型设计", name: "高保真原型设计",
+            whenToUse: "原型阶段把页面转成高保真彩色 UI 效果图时", docPath: path
+        )
+
+        let assembly = await makeBuilder().assemble(
+            stage: .prototype, project: "项目X",
+            stageQuery: "蓝染工坊检测站",
+            skillQuery: "这个按钮应该放在哪里",
+            memoryContext: "", calibration: [],
+            skillJudge: { _, _ in ["不存在的技能", "高保真原型设计"] }
+        ) { "骨架。" + $0 }
+
+        XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
+        XCTAssertEqual(assembly.skillJudgeReport?.picked, ["不存在的技能", "高保真原型设计"])
     }
 
     // MARK: - 5. pitfalls 确定性路由进自检清单（Task 4.8）
@@ -425,7 +683,7 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertEqual(decoded, assembly)
     }
 
-    // MARK: - 7. SessionStore.trimmedHistory：成对丢最旧整轮
+    // MARK: - 7. HistoryProjection.trimmedHistory：成对丢最旧整轮
 
     func testSessionStoreTrimmedHistoryRoundPairs() {
         let system = ChatMessage(role: .system, content: "系统提示词（组装后的阶段 prompt）")
@@ -445,10 +703,10 @@ final class ContextBuilderTests: XCTestCase {
             + round(2, repeatCount: 30) + round(3, repeatCount: 30)
 
         // 预算充足 → 原样保留
-        XCTAssertEqual(SessionStore.trimmedHistory(messages, budget: 10_000), messages)
+        XCTAssertEqual(HistoryProjection.trimmedHistory(messages, budget: 10_000), messages)
 
         // 预算只装得下最新轮 → 从最旧起成对丢（user+assistant 不拆对）
-        let trimmed = SessionStore.trimmedHistory(messages, budget: 200)
+        let trimmed = HistoryProjection.trimmedHistory(messages, budget: 200)
         XCTAssertEqual(trimmed.first, system)
         let rest = Array(trimmed.dropFirst())
         XCTAssertFalse(rest.isEmpty)
@@ -469,12 +727,12 @@ final class ContextBuilderTests: XCTestCase {
         )
 
         // 预算 ≤ 0 → 只剩 system（历史段整体让位）
-        XCTAssertEqual(SessionStore.trimmedHistory(messages, budget: 0), [system])
+        XCTAssertEqual(HistoryProjection.trimmedHistory(messages, budget: 0), [system])
         // 首条 system 不占历史预算：system 很长也不影响裁剪判定
         let longSystem = ChatMessage(
             role: .system, content: String(repeating: "很长的系统提示词。", count: 500)
         )
         let withLongSystem = [longSystem] + round(1, repeatCount: 5)
-        XCTAssertEqual(SessionStore.trimmedHistory(withLongSystem, budget: 50), withLongSystem)
+        XCTAssertEqual(HistoryProjection.trimmedHistory(withLongSystem, budget: 50), withLongSystem)
     }
 }

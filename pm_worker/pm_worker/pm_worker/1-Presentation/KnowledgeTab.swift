@@ -165,7 +165,7 @@ struct KnowledgeTab: View {
             .padding(DS.Spacing.s16)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {
-            ScrollView {
+            DSScroll {
                 LazyVStack(alignment: .leading, spacing: DS.Spacing.s10) {
                     // 主动推荐（阶段开始扫描卡片库；与检索结果独立展示）
                     if !model.recommendations.isEmpty || !model.rejectedCards.isEmpty {

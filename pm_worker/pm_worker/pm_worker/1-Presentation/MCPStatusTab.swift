@@ -62,7 +62,7 @@ struct MCPStatusTab: View {
     @State private var toast: DSNotifMessage?
 
     var body: some View {
-        ScrollView {
+        DSScroll {
             VStack(alignment: .leading, spacing: DS.Spacing.s24) {
                 serviceSection
                 configSection

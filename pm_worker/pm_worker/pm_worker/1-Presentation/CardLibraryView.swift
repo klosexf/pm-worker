@@ -85,6 +85,7 @@ struct CardLibraryView: View {
                 .listStyle(.sidebar)
                 .scrollContentBackground(.hidden)
                 .background(Color.surfaceSecondary)
+                .dsScrollbar()
             }
         }
         .background(Color.surfaceSecondary)
@@ -237,7 +238,7 @@ private struct CardDetailSheet: View {
             onClose: onClose,
             width: 560
         ) {
-            ScrollView {
+            DSScroll {
                 VStack(alignment: .leading, spacing: DS.Spacing.s16) {
                     HStack(spacing: DS.Spacing.s10) {
                         if row.supersededBy != nil {

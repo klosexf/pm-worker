@@ -4,7 +4,7 @@
 //
 //  右栏四 Tab 面板（design.md §6.4 v0.9.2）：产物 / 决策日志 / 漏项雷达 / 知识点。
 //  方案 A 分区台账容器：「产物」台账（01~07 编号目录内的 .md/.html/.mmd
-//  按类归档 + 筛选 chips + hover 预览/定位）与「工作空间文件」档案树
+//  按类归档 + 筛选 chips + 点击整行预览）与「工作空间文件」档案树
 //  （版本目录全量内容，含产物目录与产物文件，面包屑标注磁盘目录，
 //  文件夹可展开折叠）上下双区布局，中间可拖分隔条调整高度占比（比例持久化，
 //  双击复位）。
@@ -52,8 +52,6 @@ struct InspectorPanel: View {
             .padding(.horizontal, DS.Spacing.s12)
             .padding(.top, DS.Spacing.s10)
             .padding(.bottom, DS.Spacing.s8)
-
-            DSDivider()
 
             // 每个 Tab 内容统一撑满剩余高度（空态 DSEmptyState 居中不塌缩，
             // 底部工具条恒定贴底——消除切换 Tab 时面板高度跳动）。
@@ -186,6 +184,8 @@ nonisolated struct FileNode: Identifiable, Hashable {
 /// 预览 sheet（html → HTMLPreview，其余 → Mermaid）由本视图持有。
 struct ArtifactsPanelView: View {
 
+    @EnvironmentObject private var model: AppModel
+
     let project: String
     let version: String
 
@@ -201,7 +201,6 @@ struct ArtifactsPanelView: View {
     @State private var selectedID: String?
     @State private var previewTarget: FileNode?
     @State private var reloadToken = 0
-
     /// 台账区占可用高度的比例（拖动 1:1 跟踪，不参与动画，避免拖拽闪烁）。
     @State private var ratio: CGFloat = {
         let stored = UserDefaults.standard.object(
@@ -237,7 +236,11 @@ struct ArtifactsPanelView: View {
             for: NSNotification.Name("pm.worker.artifacts.changed")
             // 发帖侧可能是后台线程（MCP 无头写入等），归位主线程再改 @State
         ).receive(on: DispatchQueue.main)) { _ in reloadToken += 1 }
-        .task(id: reloadToken) { reload() }
+        // 重载 id 必须绑定 project/version：切换会话/项目时视图结构身份不变、
+        // @State 残留，只盯 reloadToken 会把上一个项目的台账原样显示给新项目
+        // （真实事故：右栏显示「默认」的产物，聊天却已切到别的项目）。名称经
+        // validateNodeName 禁「/」，用 / 分隔无碰撞。
+        .task(id: "\(project)/\(version)#\(reloadToken)") { reload() }
         .sheet(item: $previewTarget) { node in
             if node.url.pathExtension.lowercased() == "html" {
                 HTMLPreviewSheet(title: node.name, fileURL: node.url)
@@ -254,18 +257,23 @@ struct ArtifactsPanelView: View {
             let available = max(geo.size.height - Self.handleHeight, 0)
             let topHeight = available * clampedRatio
             VStack(spacing: 0) {
-                ScrollView {
+                DSScroll {
                     ArtifactsLedgerView(
                         entries: entries,
+                        selectedID: selectedID,
+                        onSelect: { selectedID = $0.id },
                         onOpen: { openPreview($0) },
-                        onReveal: { revealInFinder($0.url) }
+                        onAddToConversation: { entry in
+                            // 「添加到对话」：把引用排队给输入坞（ConversationView 消费）
+                            model.requestAddFileReference(relativePath: entry.relativePath)
+                        }
                     )
                 }
                 .frame(height: topHeight)
 
                 splitHandle(availableHeight: available)
 
-                ScrollView {
+                DSScroll {
                     workspaceSection
                 }
                 .frame(maxHeight: .infinity)
@@ -346,10 +354,6 @@ struct ArtifactsPanelView: View {
         previewTarget = FileNode(
             name: entry.name, url: entry.url, isDirectory: false, children: nil
         )
-    }
-
-    private func revealInFinder(_ url: URL) {
-        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     // MARK: 工作空间文件分区
