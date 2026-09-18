@@ -53,11 +53,50 @@ nonisolated struct TokenBreakdown: Codable, Equatable {
     }
 }
 
+// MARK: - 动态材料尾条协议（前缀缓存，2026-09-17）
+
+/// system prompt 与「动态材料」的组装/拆分协议（前缀缓存改造）：
+/// 冻结段（角色/任务/约束/输出协议/上游产物/规则层/自检清单）留在 system prompt——
+/// 同阶段跨轮次字节级一致，是 provider 前缀缓存（DeepSeek/GLM implicit caching，
+/// 只认字节级一致前缀）的可命中区；动态材料（记忆/技能正文/检索参考/引用文件正文）
+/// 每轮随语义命中与记忆收纳变化——曾嵌入 system prompt 中部，任何变化都使其后的
+/// 全部对话历史（唯一 append-only 的可缓存区）连坐失效，实测大请求缓存命中 0%。
+///
+/// 协议流转：assemble 产出「冻结段 + marker + 动态材料」复合 prompt，沿既有
+/// systemPrompt 参数链下传（send/sendSystemTurn 调用点零改动）；发送前
+/// SessionStore.split 拆开——冻结段进 system 消息，动态材料以独立 user 角色消息
+/// 追加在当前用户消息之后。user 角色是刻意的：部分 provider 会把 conversation
+/// 中部的 system 消息折叠回头部（前缀缓存再次失效），user 消息无归一化风险，
+/// 与「前情摘要」user 注入先例同构。
+/// 未拆分的消费路径拿到复合 prompt 组 system = 自动退化为旧行为（材料仍在
+/// system，功能不损失，仅缓存不命中）——安全兜底。
+nonisolated enum ContextTail {
+    /// 冻结段与动态材料的分割标记（独占一行；注入内容来自本地组装，不含该串）。
+    static let marker = "<<<PM_VOLATILE_TAIL>>>"
+
+    /// 复合 prompt：tail 为空原样返回（不产生标记，split 恒得空尾）。
+    static func compose(system: String, tail: String) -> String {
+        tail.isEmpty ? system : system + "\n" + marker + "\n" + tail
+    }
+
+    /// 拆分：无标记 → (prompt, "")。compose/split 字节级往返恒等
+    ///（compose 恰补一对换行，split 原样摘除）。
+    static func split(_ prompt: String) -> (system: String, tail: String) {
+        guard let range = prompt.range(of: marker) else { return (prompt, "") }
+        var system = String(prompt[..<range.lowerBound])
+        var tail = String(prompt[range.upperBound...])
+        if system.hasSuffix("\n") { system.removeLast() }
+        if tail.hasPrefix("\n") { tail.removeFirst() }
+        return (system, tail)
+    }
+}
+
 // MARK: - 组装结果与 trace
 
-/// 一次 Context Builder 组装的完整产物（systemPrompt 已含前四段；历史段由 SessionStore 按预算截断注入）。
+/// 一次 Context Builder 组装的完整产物（历史段由 SessionStore 按预算截断注入）。
 nonisolated struct ContextAssembly: Codable, Equatable {
-    /// 组装后的最终 system prompt（规则+记忆+技能正文+检索 拼装、已过预算裁剪）。
+    /// 冻结 system prompt（骨架 + 规则层 + 自检清单；已过预算裁剪）。
+    /// 动态材料不在此——见 injectionText / ContextTail 协议。
     var systemPrompt: String
     /// 组装时的阶段查询摘要（检索 query）。
     var query: String
@@ -67,6 +106,9 @@ nonisolated struct ContextAssembly: Codable, Equatable {
     var breakdown: TokenBreakdown
     /// 检索 trace（命中 + scope 标签 + 相似度；未命中技能列表在其中）。
     var retrieval: RetrievalTrace?
+    /// 动态材料全文（记忆 + 技能正文 + 检索参考；已过预算裁剪）——不嵌入
+    /// systemPrompt，由 SessionStore 以「动态材料尾条」（ContextTail 协议）追加。
+    var injectionText: String = ""
     /// 本次注入的技能正文（渐进式披露证明：未命中技能不在此）。
     var injectedSkillBodies: [String]
     /// 本次注入的记忶校准文本（假设态「经验」条目）。

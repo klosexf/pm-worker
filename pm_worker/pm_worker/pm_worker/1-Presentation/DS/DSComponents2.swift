@@ -17,7 +17,7 @@ import SwiftUI
 /// neutral = overlay-l2 底 + secondary 文字；
 /// brand/success/warning/danger = 对应 surface 底 + 状态色文字（无边框差异化）。
 struct DSTag: View {
-    enum Variant { case neutral, brand, success, warning, danger }
+    enum Variant { case neutral, brand, success, warning, danger, info, alert }
 
     let title: String
     var variant: Variant = .neutral
@@ -30,6 +30,8 @@ struct DSTag: View {
         case .success: Color.statusSuccess
         case .warning: Color.statusWarning
         case .danger: Color.statusError
+        case .info: Color.statusPrimary
+        case .alert: Color.statusAlert
         }
     }
 
@@ -40,6 +42,8 @@ struct DSTag: View {
         case .success: Color.statusSuccessSurface1
         case .warning: Color.statusWarningSurface1
         case .danger: Color.statusErrorSurface1
+        case .info: Color.statusPrimarySurface1
+        case .alert: Color.statusAlertSurface1
         }
     }
 

@@ -27,6 +27,8 @@ struct RiskLedgerTab: View {
     /// 自评审对账 trace（self-review.jsonl 投影——B3 事件驱动改版后 covered 等
     /// 全量声明的审计归宿；对话流只报新增，此处承载「每轮都在自检」的可见性）。
     @State private var reviews: [ArtifactParser.SelfReviewEntry] = []
+    /// 执行包产物预览（方案 C：mitigating 卡「预览」入口）。
+    @State private var previewTarget: PlanArtifactPreview?
 
     var body: some View {
         Group {
@@ -39,6 +41,9 @@ struct RiskLedgerTab: View {
             } else {
                 ledger
             }
+        }
+        .sheet(item: $previewTarget) { target in
+            MermaidPreviewSheet(title: "执行包 · \(target.rel)", fileURL: target.url)
         }
         .onAppear(perform: reload)
         .onChange(of: model.selection) { _, _ in reload() }
@@ -71,7 +76,8 @@ struct RiskLedgerTab: View {
                     ForEach(pending, id: \.id) { record in
                         RiskCard(
                             record: record,
-                            isGenerating: model.riskImplementationInFlightID == record.id,
+                            isGenerating: model.isRiskImplementing(record.id),
+                            isQueued: model.isAdoptQueued(record.id),
                             onAction: { action, record in perform(action, record) }
                         )
                     }
@@ -81,7 +87,7 @@ struct RiskLedgerTab: View {
                     ForEach(hanging, id: \.id) { record in
                         RiskCard(
                             record: record,
-                            isGenerating: model.riskImplementationInFlightID == record.id,
+                            isGenerating: model.isRiskImplementing(record.id),
                             onAction: { action, record in perform(action, record) }
                         )
                     }
@@ -185,7 +191,6 @@ struct RiskLedgerTab: View {
     // 动作反馈走对话系统行——与登记 / 命中 / 跨门同款惯例，对话流可见）
 
     private func perform(_ action: RiskRowAction, _ record: RiskRecord) {
-        NSLog("PMDBG perform entry action=\(action) id=\(record.id)") // PMDBG-TEMP
         guard let ctx = model.selection.inspectorProject else {
             // 无声出口清零（2026-09-16 零反馈事故）：上下文缺失也不许静默吞动作
             notify("⚠️ 风险台账上下文缺失，操作未执行——请切回对应项目会话后重试。")
@@ -204,21 +209,48 @@ struct RiskLedgerTab: View {
         }
         switch action {
         case .adopt:
-            // 采纳落实闭环（会话上下文一致且空闲时）：代发生成实施交付物，
-            // 流完成后才转「已挂方案」——状态流转由闭环收口，此处不落账
-            if model.canImplementRisk(ctx) {
-                Task { await model.implementRiskAdoption(record) }
+            // 并行落实口径（B 后放宽）：采纳落实的版本级写点全 append-only +
+            // 执行包按风险 id 分文件，与他会话的流并发安全。排队只剩两种场景：
+            // ① 发起会话自己生成中（每会话一条流是架构铁律）；
+            // ② 同版本已有采纳落实在途（落实闭环串行，新采纳排队等冲洗）。
+            let originSessionBusy = model.sessionStore.isSessionBusy(
+                model.sessionStore.sessionId
+            )
+            let adoptInFlight = model.isVersionAdoptImplementing(
+                project: ctx.project, version: ctx.version
+            )
+            // 排队 → 代发消息（条件满足后自动发出并落实；卡上显式逃生门）。
+            // 不再向会话流追加「⚡ 已排队」提示行（2026-09-18 移除）——排队态
+            // 反馈由台账卡自身的排队态行承载（脉冲点 + 「不等了，只记账」逃生门）。
+            if (originSessionBusy || adoptInFlight),
+               ctx.project == model.pipeline.project, ctx.version == model.pipeline.version {
+                model.queueAdopt(record)
+                reload()
                 return
             }
-            // 回退普通采纳（项目首页 / 封板 / 生成中）：仅记账 + 决策日志 + 反馈行。
+            // 采纳落实闭环（空闲时）：点击瞬间消息乐观上屏（先「发出」后「思考」），
+            // 落实流程异步补落盘 + AI 回答执行逻辑 + 执行包落产物
+            if model.canImplementRisk(ctx) {
+                let staged = model.sessionStore.stageOutgoingUser(
+                    AppModel.adoptMessageText(record)
+                )
+                Task {
+                    await model.implementRiskAdoption(
+                        record, stagedEntry: staged,
+                        project: ctx.project, version: ctx.version
+                    )
+                }
+                return
+            }
+            // 回退普通采纳（项目首页 / 封板 / 异上下文 / 该风险已在落实中）：
+            // 仅记账 + 决策日志 + 反馈行。
             // 降级必须显式告知（2026-09-16 零反馈事故：静默降级 = 预期落空）
             do {
                 _ = try store.adopt(id: record.id)
                 if sameContext {
-                    let busy = model.sessionStore.isStreaming || model.sessionStore.isPreparingReply
                     notify(
-                        busy
-                            ? "✅ 已采纳应对方案（生成中，按普通采纳记账，未走 AI 落实闭环）——"
+                        model.isRiskImplementing(record.id)
+                            ? "✅ 已采纳应对方案（该风险正在落实中，按普通采纳记账）——"
                                 + "「\(Self.summary(record.hypothesis))」风险挂起等验证，决策已记入日志"
                             : "✅ 已采纳应对方案——「\(Self.summary(record.hypothesis))」"
                                 + "风险挂起等验证，决策已记入日志"
@@ -230,7 +262,7 @@ struct RiskLedgerTab: View {
                 try store.accept(id: record.id)
                 if sameContext {
                     notify(
-                        "📌 已接受风险——「\(Self.summary(record.hypothesis))」风险自留，"
+                        "💬 已接受「\(Self.summary(record.hypothesis))」· 自留，"
                             + "封板时带入 PRD 已知风险"
                     )
                 }
@@ -255,8 +287,23 @@ struct RiskLedgerTab: View {
                     )
                 }
             } catch { fail(error) }
+        case .previewPlan:
+            guard let pa = record.planArtifact else { return }
+            previewTarget = PlanArtifactPreview(
+                rel: pa,
+                url: PMAgentStore.versionURL(project: ctx.project, version: ctx.version)
+                    .appendingPathComponent(pa)
+            )
+        case .injectPlan:
+            guard let pa = record.planArtifact else { return }
+            model.requestAddFileReference(relativePath: pa)
+            if sameContext {
+                notify("⤴ 执行包已注入输入坞——下一条消息将携带该产物，AI 据此真改文件（走主线确认门）")
+            }
+        case .cancelQueue:
+            model.cancelQueuedAdopt(record)
         }
-        reload()
+        if action != .previewPlan { reload() } // 预览不改台账，跳过重读
     }
 
     /// 动作反馈系统行（追加进当前打开的会话流）。写盘失败不许无声
@@ -310,11 +357,21 @@ struct RiskLedgerTab: View {
 
 // MARK: - 行动作枚举
 
+/// 执行包产物预览目标（Identifiable 供 sheet(item:) 使用）。
+nonisolated struct PlanArtifactPreview: Identifiable {
+    let rel: String
+    let url: URL
+    var id: String { rel }
+}
+
 enum RiskRowAction {
     case adopt     // 采纳方案（落实闭环或普通记账 → mitigating + 决策日志）
     case accept    // 接受风险（open → accepted 自留）
-    case resolve   // 已解除（mitigating → resolved + 决策日志）
-    case reopen    // 没解决（mitigating → open 重开）
+    case resolve   // 验证解除（mitigating → resolved + 解除决策）
+    case reopen    // 验证未过（mitigating → open，方案需升级）
+    case previewPlan  // 预览执行包产物（05-artifacts/risk-plans/<id>.md）
+    case injectPlan   // 执行包注入下一轮（产物引用通道 → AI 真改文件走主线确认门）
+    case cancelQueue  // 排队逃生门「不等了，只记账」：撤回排队消息原地记账
 }
 
 // MARK: - 对账轮行（B3 事件驱动：covered 全量声明的审计明细）
@@ -416,6 +473,7 @@ private struct ReviewTraceRow: View {
 private struct RiskCard: View {
     let record: RiskRecord
     let isGenerating: Bool
+    var isQueued = false
     let onAction: (RiskRowAction, RiskRecord) -> Void
 
     @State private var expanded: Bool
@@ -424,10 +482,12 @@ private struct RiskCard: View {
     init(
         record: RiskRecord,
         isGenerating: Bool,
+        isQueued: Bool = false,
         onAction: @escaping (RiskRowAction, RiskRecord) -> Void
     ) {
         self.record = record
         self.isGenerating = isGenerating
+        self.isQueued = isQueued
         self.onAction = onAction
         // 待处理默认展开方案卡（决策依据要一眼可见）；已挂 / 终态默认收起
         _expanded = State(initialValue: record.status == .open)
@@ -445,15 +505,18 @@ private struct RiskCard: View {
             RoundedRectangle(cornerRadius: DS.Radius.xxl)
                 .fill(Color.surfaceSecondary)
         )
-        // hover 微抬亮（零描边零阴影，明度差即层级——弹框钦定模式）
+        // hover 微抬亮（零描边零阴影，明度差即层级——弹框钦定模式）。
+        // 关键：纯装饰层必须 allowsHitTesting(false)——否则 hover 态下整张卡
+        // 变成命中层，盖住下方「采纳/接受」按钮（2026-09-17 双按钮无响应事故根因：
+        // 真实点击前必有 hover，合成点击无 hover 所以测试测不出来）。
         .overlay(
             RoundedRectangle(cornerRadius: DS.Radius.xxl)
                 .fill(hovering && isInteractive ? Color.overlayL2 : Color.clear)
+                .allowsHitTesting(false)
         )
         .contentShape(Rectangle())
-        .onHover { NSLog("PMDBG RiskCard hover=\($0) id=\(record.id)"); hovering = $0 } // PMDBG-TEMP
+        .onHover { hovering = $0 }
         .onTapGesture {
-            NSLog("PMDBG RiskCard tapGesture fired id=\(record.id)") // PMDBG-TEMP
             guard isInteractive, hasDetail else { return }
             withAnimation(DS.Motion.springFast) { expanded.toggle() }
         }
@@ -511,11 +574,30 @@ private struct RiskCard: View {
     @ViewBuilder
     private var detail: some View {
         switch record.status {
+        case .open where isQueued:
+            // 排队态（消息化模型）：代发消息待当前回答结束，显式逃生门可只记账
+            HStack(spacing: DS.Spacing.s8) {
+                PulsingDot()
+                Text("已排队——采纳消息待当前回答结束后自动发出")
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink500)
+                Button {
+                    onAction(.cancelQueue, record)
+                } label: {
+                    Text("不等了，只记账")
+                }
+                .buttonStyle(.ds(.ghost, size: .xs))
+                .help("撤回排队的采纳消息，原地普通记账（不生成执行包）")
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, DS.Spacing.s12)
+            .padding(.trailing, DS.Spacing.s12)
+            .padding(.bottom, DS.Spacing.s12)
         case .open where isGenerating:
             // 落实生成中：方案与动作暂收，脉冲点 + 进度文案（状态未落，可停止）
             HStack(spacing: DS.Spacing.s8) {
                 PulsingDot()
-                Text("正在生成实施交付物…（完成后转「已挂方案」）")
+                Text("AI 正在回答执行逻辑…（完成后转「已挂方案」）")
                     .font(DS.Font.bodyXS)
                     .foregroundStyle(Color.ink500)
                 Spacer(minLength: 0)
@@ -529,16 +611,14 @@ private struct RiskCard: View {
                 planCard(label: "建议方案", tint: Color.statusWarning)
                 HStack(spacing: DS.Spacing.s6) {
                     Button {
-                        NSLog("PMDBG adopt button FIRED id=\(record.id)") // PMDBG-TEMP
                         onAction(.adopt, record)
                     } label: {
                         Text("采纳方案")
                     }
                     .buttonStyle(DSButtonStyle(variant: .brand, size: .xs))
-                    .help("AI 先把方案落实成执行包，完成后转「已挂方案」并写入决策日志")
+                    .help("代发一条携带风险与方案的消息，AI 回答执行逻辑，完成后转「已挂方案」并写决策日志")
 
                     Button {
-                        NSLog("PMDBG accept button FIRED id=\(record.id)") // PMDBG-TEMP
                         onAction(.accept, record)
                     } label: {
                         Text("接受风险")
@@ -546,9 +626,6 @@ private struct RiskCard: View {
                     .buttonStyle(DSButtonStyle(variant: .secondary, size: .xs))
                     .help("风险自留——封板时写入 PRD 已知风险")
 
-                    Text("采纳 ≠ 解除 · 先挂上等验证")
-                        .font(DS.Font.bodyXS)
-                        .foregroundStyle(Color.ink300)
                     Spacer(minLength: 0)
                 }
             }
@@ -556,9 +633,33 @@ private struct RiskCard: View {
             .padding(.trailing, DS.Spacing.s12)
             .padding(.bottom, DS.Spacing.s12)
         case .mitigating:
-            // 已挂方案 + 证据留痕 + 验证动作：跨门核验或随手核
+            // 已挂方案 + 执行包产物 + 证据留痕 + 验证动作：跨门核验或随手核
             VStack(alignment: .leading, spacing: DS.Spacing.s8) {
                 planCard(label: "已挂方案", tint: Color.statusPrimary)
+                if let pa = record.planArtifact {
+                    HStack(spacing: DS.Spacing.s6) {
+                        DSIcon(.doc, size: 12).foregroundStyle(Color.statusPrimary)
+                        Text(pa)
+                            .font(DS.Font.monoSM)
+                            .foregroundStyle(Color.statusPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button {
+                            onAction(.previewPlan, record)
+                        } label: {
+                            Text("预览")
+                        }
+                        .buttonStyle(.ds(.ghost, size: .xs))
+                        Button {
+                            onAction(.injectPlan, record)
+                        } label: {
+                            Text("注入下一轮")
+                        }
+                        .buttonStyle(.ds(.secondary, size: .xs))
+                        .help("把执行包以产物引用注入下一条消息——AI 据此真改文件（走主线确认门）")
+                        Spacer(minLength: 0)
+                    }
+                }
                 if record.resolution?.contains("实施证据") == true {
                     Text("实施证据 · 见采纳回合的对话留痕")
                         .font(DS.Font.bodyXS)

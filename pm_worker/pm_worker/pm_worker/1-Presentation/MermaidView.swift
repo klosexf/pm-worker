@@ -23,6 +23,9 @@ struct MermaidView: View {
     var scrollable: Bool = false
     @Environment(\.colorScheme) private var colorScheme
     @State private var contentHeight: CGFloat = 180
+    /// 放大弹窗（内部滚动模式）的滚动进度——原生滚动条已隐藏，外挂 DS 细胶囊
+    @State private var vScroll = DSScrollSnapshot.hidden
+    @State private var hScroll = DSScrollSnapshot.hidden
 
     var body: some View {
         if scrollable {
@@ -32,8 +35,14 @@ struct MermaidView: View {
                 dark: colorScheme == .dark,
                 zoom: zoom,
                 scrollable: true,
-                onHeight: { contentHeight = $0 }
+                onHeight: { contentHeight = $0 },
+                onScroll: { vp, vf, hp, hf in
+                    vScroll = DSScrollSnapshot(progress: vp, fraction: vf)
+                    hScroll = DSScrollSnapshot(progress: hp, fraction: hf)
+                }
             )
+            .dsExternalScrollbar(axis: .vertical, snapshot: $vScroll)
+            .dsExternalScrollbar(axis: .horizontal, snapshot: $hScroll)
         } else {
             MermaidWebView(
                 source: source,
@@ -72,6 +81,8 @@ struct MermaidWebView: NSViewRepresentable {
     var scrollable: Bool = false
     /// mermaid 渲染完成后 JS 回报内容高度（px）。
     var onHeight: ((CGFloat) -> Void)? = nil
+    /// 内部滚动模式的滚动进度回报（驱动外挂 DS 细胶囊）。
+    var onScroll: ((CGFloat, CGFloat, CGFloat, CGFloat) -> Void)? = nil
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -79,6 +90,18 @@ struct MermaidWebView: NSViewRepresentable {
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         // 渲染完成 → 高度回报（对话页内联自适应布局依赖）
         config.userContentController.add(context.coordinator, name: "mermaidHeight")
+        if scrollable {
+            // 原生滚动条已由 CSS 隐藏（macOS 26 玻璃样式无法 CSS 定制），
+            // 文档滚动进度回报驱动外挂 DS 细胶囊
+            config.userContentController.add(context.coordinator, name: "pmScroll")
+            config.userContentController.addUserScript(
+                WKUserScript(
+                    source: webViewScrollReporterJS,
+                    injectionTime: .atDocumentEnd,
+                    forMainFrameOnly: true
+                )
+            )
+        }
         let webView = ScrollForwardingWebView(frame: .zero, configuration: config)
         // 内联模式（scrollable=false）：webview 高度贴合内容、HTML 无可滚区域，
         // 滚轮必须上抛给外层 ScrollView；滚动模式由 HTML 自己滚
@@ -86,6 +109,7 @@ struct MermaidWebView: NSViewRepresentable {
         webView.setValue(false, forKey: "drawsBackground")  // 透明背景随模式
         context.coordinator.webView = webView
         context.coordinator.onHeight = onHeight
+        context.coordinator.onScroll = onScroll
         context.coordinator.render(
             source: source, dark: dark, zoom: zoom, scrollable: scrollable
         )
@@ -94,6 +118,7 @@ struct MermaidWebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.onHeight = onHeight
+        context.coordinator.onScroll = onScroll
         context.coordinator.render(
             source: source, dark: dark, zoom: zoom, scrollable: scrollable
         )
@@ -108,6 +133,7 @@ struct MermaidWebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler {
         weak var webView: WKWebView?
         var onHeight: ((CGFloat) -> Void)?
+        var onScroll: ((CGFloat, CGFloat, CGFloat, CGFloat) -> Void)?
         private var renderedSource: String = ""
         private var renderedDark: Bool = false
         private var renderedZoom: CGFloat = 1
@@ -117,6 +143,16 @@ struct MermaidWebView: NSViewRepresentable {
             _ userContentController: WKUserContentController,
             didReceive message: WKScriptMessage
         ) {
+            if message.name == "pmScroll",
+               let body = message.body as? [String: NSNumber],
+               let vp = body["vProgress"], let vf = body["vFraction"],
+               let hp = body["hProgress"], let hf = body["hFraction"] {
+                onScroll?(
+                    CGFloat(vp.doubleValue), CGFloat(vf.doubleValue),
+                    CGFloat(hp.doubleValue), CGFloat(hf.doubleValue)
+                )
+                return
+            }
             guard message.name == "mermaidHeight",
                   let height = message.body as? NSNumber else { return }
             onHeight?(max(CGFloat(height.doubleValue), 40))
@@ -177,10 +213,43 @@ struct MermaidWebView: NSViewRepresentable {
                 .replacingOccurrences(of: "$", with: "\\$")
             let themeAttr = dark ? "dark" : "light"
             // scroll 模式（放大弹窗）：body 内部滚动——WKWebView 会消费滚轮事件且不
-            // 转发外层，SwiftUI 外层 ScrollView 永远滚不动，必须让 HTML 自己滚
+            // 转发外层，SwiftUI 外层 ScrollView 永远滚不动，必须让 HTML 自己滚。
+            // 原生滚动条隐藏（macOS 26 玻璃样式无法 CSS 定制，且 26.0 不支持
+            // scrollbar-color）——原生侧外挂 DS 细胶囊替代（pmScroll 进度回报）。
             let bodyClass = scrollable ? "scroll" : ""
+            // 拖拽平移（仅放大弹窗）：光标 grab + 禁文本选中——按住拖动 = 平移画布，
+            // 鼠标用户无需 Shift+滚轮也能把横向/纵向超出视口的区域拖进视野
             let bodyCSS = scrollable
-                ? "body.scroll { width: 100%; height: 100%; overflow: auto; padding: 16px; box-sizing: border-box; }"
+                ? "html { scrollbar-width: none; } body.scroll { width: 100%; height: 100%; overflow: auto; padding: 16px; box-sizing: border-box; cursor: grab; -webkit-user-select: none; user-select: none; } body.scroll.panning { cursor: grabbing; }"
+                : ""
+            // 平移手势：mousedown 记起点，mousemove 反向写 scrollLeft/Top。
+            // body 的 overflow 会传播到视口（html overflow visible），真正的滚动
+            // 容器是视口——scrollingElement 与 body 双写兜底；写入触发的 scroll
+            // 事件照常被 pmScroll 回报，外挂细胶囊随动。
+            let panJS = scrollable
+                ? """
+                  (function () {
+                    function scroller() { return document.scrollingElement || document.documentElement; }
+                    var active = false, sx = 0, sy = 0, sl = 0, st = 0;
+                    document.addEventListener('mousedown', function (e) {
+                      if (e.button !== 0) return;
+                      active = true; sx = e.clientX; sy = e.clientY;
+                      var d = scroller(); sl = d.scrollLeft; st = d.scrollTop;
+                      document.body.classList.add('panning');
+                    });
+                    window.addEventListener('mousemove', function (e) {
+                      if (!active) return;
+                      var d = scroller(), b = document.body;
+                      var x = sl - (e.clientX - sx), y = st - (e.clientY - sy);
+                      d.scrollLeft = x; d.scrollTop = y;
+                      b.scrollLeft = x; b.scrollTop = y;
+                    });
+                    window.addEventListener('mouseup', function () {
+                      active = false;
+                      document.body.classList.remove('panning');
+                    });
+                  })();
+                  """
                 : ""
             // margin 0：外边距由 SwiftUI 容器控制；渲染完成（含失败）回报内容高度
             let html = """
@@ -190,6 +259,11 @@ struct MermaidWebView: NSViewRepresentable {
             <meta charset="utf-8">
             <style>
               body { margin: 0; background: transparent; font-family: -apple-system, "PingFang SC", sans-serif; }
+              /* 滚动条降噪（2026-09-17）：webkit 伪元素 Safari 不支持，走标准
+                 scrollbar-width/scrollbar-color——thin + 透明轨道 = 只剩胶囊条，
+                 轨道底色透出页面本色，两侧无边。色值对齐 DSScroll 胶囊（ink500 0.9）。 */
+              html { scrollbar-width: thin; scrollbar-color: rgba(116,116,128,0.9) transparent; }
+              html[data-theme="dark"] { scrollbar-color: rgba(126,126,138,0.9) transparent; }
               /* 居中用 margin auto（flex center 对超宽子元素会产生不可滚动的左侧溢出） */
               .mermaid svg { display: block; margin: 0 auto; }
               \(bodyCSS)
@@ -218,6 +292,7 @@ struct MermaidWebView: NSViewRepresentable {
                   svg.style.maxWidth = 'none';
                 }
               }
+              \(panJS)
               mermaid.initialize({
                 startOnLoad: false,
                 theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
@@ -351,8 +426,9 @@ struct MermaidPreviewSheet: View {
         } else {
             // 全文 Markdown 渲染：标题/列表/表格/引用/代码块/行内富文本，
             // ```mermaid 围栏块由 MarkdownText 内联成图卡（复用对话页渲染管线）。
-            // longDocument 档：LazyVStack 惰性布局 + prose 合并分块封顶，
-            // 首屏即开即显（整篇文档一次性排版会卡主线程，见 MarkdownText 注释）
+            // longDocument 档：prose 合并分块封顶 + 整篇急切排版——滚动期零
+            // 排版尖刺、内容几何稳定（拖细胶囊也顺滑）；LazyVStack 已因滚动
+            // 卡顿退役，见 MarkdownText legacySegmentsView 注释。
             DSScroll {
                 MarkdownText(markdown, longDocument: true)
                     .padding(DS.Spacing.s16)

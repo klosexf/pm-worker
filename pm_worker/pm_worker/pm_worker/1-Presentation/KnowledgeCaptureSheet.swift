@@ -115,6 +115,7 @@ struct KnowledgeCaptureSheet: View {
                 .font(DS.Font.bodyBase)
                 .foregroundStyle(Color.ink900)
                 .scrollContentBackground(.hidden)
+                .scrollIndicators(.never)  // macOS 26 滚动条槽静止也绘制
                 .dsTextarea(focused: textFocused, minHeight: 120)
                 .focused($textFocused)
 

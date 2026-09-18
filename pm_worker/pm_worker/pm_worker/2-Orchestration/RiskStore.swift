@@ -87,9 +87,11 @@ final class RiskStore: ObservableObject {
     /// 同步回写一条决策日志（待验证态——方案落地验证通过后由 resolve 补一条解除决策）。
     /// - Parameter evidence: 实施证据指针（采纳落实闭环：AI 生成实施交付物的对话留痕，
     ///   形如「对话留痕 · 会话 s_xx · 回合 m_xx」；普通采纳传 nil）。
+    /// - Parameter planArtifact: 执行包产物相对路径（采纳落实闭环落盘的
+    ///   05-artifacts/risk-plans/&lt;id&gt;.md；普通采纳传 nil）。
     /// - Returns: 回写的决策记录（含 id，供台账行展示「→ 决策日志 d_xx」）。
     @discardableResult
-    func adopt(id: String, evidence: String? = nil) throws -> DecisionRecord {
+    func adopt(id: String, evidence: String? = nil, planArtifact: String? = nil) throws -> DecisionRecord {
         guard let index = risks.firstIndex(where: { $0.id == id }) else {
             throw RiskStore.notFound(id)
         }
@@ -102,11 +104,53 @@ final class RiskStore: ObservableObject {
         record.resolution = evidence == nil
             ? "决策日志 \(decision.id)"
             : "决策日志 \(decision.id) · 实施证据已留对话"
+        if let planArtifact {
+            record.resolution = (record.resolution ?? "") + " · 执行包 \(planArtifact)"
+        }
+        record.planArtifact = planArtifact
         record.closedAt = nil
         try PMAgentStore.appendLine(record, to: risksURL)
         try PMAgentStore.appendLine(DecisionLogEntry.decision(decision), to: decisionsURL)
         risks[index] = record
         return decision
+    }
+
+    // MARK: 执行包产物（采纳落实闭环 · 2026-09-17 方案 C）
+
+    /// 把采纳落实回合的执行逻辑落成真产物文件（05-artifacts/risk-plans/&lt;id&gt;.md）。
+    /// 执行不再只是聊天气泡——产物可预览、可经产物引用通道注入下一轮，
+    /// AI 据此真改文件（仍走主线确认门）。写失败返回 nil（调用方降级为仅对话留痕）。
+    static func writePlanArtifact(
+        project: String, version: String, record: RiskRecord, reply: String,
+        baseURL: URL? = nil
+    ) -> String? {
+        let rel = "05-artifacts/risk-plans/\(record.id).md"
+        let root = baseURL ?? PMAgentStore.versionURL(project: project, version: version)
+        let dir = root.appendingPathComponent("05-artifacts/risk-plans", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let md = """
+            # 执行包 · \(record.id)
+
+            - **风险**：\(record.hypothesis)
+            - **后果**：\(record.impact ?? "—")
+            - **方案**：\(record.plan ?? "—")
+            - **来源**：⚡ 风险台账 · 采纳落实闭环（\(record.originRef)）
+
+            ## 执行逻辑（AI 生成）
+
+            \(reply.isEmpty ? "（落实回合未捕获回复正文）" : reply)
+
+            ## 完成判据
+
+            执行项逐项落地并确认没出事 → 台账「✓ 已解除」；任一步失败 → 「✕ 没解决」重开，方案升级。
+            """
+            try md.write(to: dir.appendingPathComponent("\(record.id).md"), atomically: true, encoding: .utf8)
+            return rel
+        } catch {
+            NSLog("pm_worker 执行包落盘失败：\(error.localizedDescription)")
+            return nil
+        }
     }
 
     /// 接受风险：open → accepted（风险自留，封板时带入 PRD 已知风险）。

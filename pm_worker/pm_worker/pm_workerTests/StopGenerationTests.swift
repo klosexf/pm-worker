@@ -22,7 +22,7 @@ final class StopGenerationTests: XCTestCase {
         store.stopGeneration()
 
         XCTAssertFalse(store.isStreaming, "空闲态停止后不得进入流式态")
-        XCTAssertNil(store.streamingSessionID, "空闲态停止不得留下流归属残留")
+        XCTAssertTrue(store.streams.isEmpty, "空闲态停止不得留下流态残留")
     }
 
     // MARK: - ② 停止延迟 ≤300ms
@@ -47,7 +47,7 @@ final class StopGenerationTests: XCTestCase {
 
         XCTAssertLessThan(elapsed, 0.3, "停止必须 ≤300ms 内生效（2s 假生成被立即取消）")
         XCTAssertFalse(store.isStreaming, "停止后流式态必须已翻转（按钮即时回「发送」的依据）")
-        XCTAssertNil(store.streamingSessionID, "停止后流归属必须清空（流式气泡即时收起的依据）")
+        XCTAssertTrue(store.streams.isEmpty, "停止后本会话流态键必须移除（流式气泡即时收起的依据）")
     }
 
     // MARK: - ③ 停止收尾的回合构造
@@ -125,8 +125,8 @@ final class StopGenerationTests: XCTestCase {
         let store = SessionStore()
         store.enqueueSteering("补一句：目标用户是独立开发者")
 
-        XCTAssertTrue(store.steeringQueue.isEmpty, "空闲态插话必须 no-op（不入队）")
-        XCTAssertTrue(store.followUpQueue.isEmpty)
+        XCTAssertTrue(store.steeringQueues.isEmpty, "空闲态插话必须 no-op（不入队）")
+        XCTAssertTrue(store.followUpQueues.isEmpty)
     }
 
     @MainActor
@@ -144,8 +144,8 @@ final class StopGenerationTests: XCTestCase {
         store.stopGeneration()
         await generation.value
 
-        XCTAssertTrue(store.steeringQueue.isEmpty)
-        XCTAssertTrue(store.followUpQueue.isEmpty)
+        XCTAssertTrue(store.steeringQueues.isEmpty)
+        XCTAssertTrue(store.followUpQueues.isEmpty)
         XCTAssertFalse(store.isStreaming)
     }
 }

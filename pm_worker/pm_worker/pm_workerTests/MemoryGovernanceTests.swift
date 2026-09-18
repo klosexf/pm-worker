@@ -206,20 +206,21 @@ final class MemoryGovernanceTests: XCTestCase {
             memoryContext: memoryText, calibration: []
         ) { $0 }
 
+        // 动态材料不进 systemPrompt（ContextTail 尾条协议）——断言落在 injectionText
         XCTAssertTrue(
-            assembly.systemPrompt.contains("只做 macOS 桌面端"),
+            assembly.injectionText.contains("只做 macOS 桌面端"),
             "约束为保护层，预算压力下不得裁剪"
         )
         XCTAssertTrue(
-            assembly.systemPrompt.contains("不做小程序"),
+            assembly.injectionText.contains("不做小程序"),
             "否决项为保护层，预算压力下不得裁剪"
         )
         XCTAssertTrue(
-            assembly.systemPrompt.contains("数据全部留在本地"),
+            assembly.injectionText.contains("数据全部留在本地"),
             "全局来源前缀的约束行同为保护层（标记子串匹配）"
         )
         XCTAssertFalse(
-            assembly.systemPrompt.contains("目标用户是独立开发者"),
+            assembly.injectionText.contains("目标用户是独立开发者"),
             "结论无保护，超预算应被裁掉"
         )
     }
@@ -343,6 +344,7 @@ final class MemoryGovernanceTests: XCTestCase {
 
     func testMemoryExtractionPromptHasMustExtractList() {
         let prompt = AgentPrompts.memoryExtraction(transcript: "对话")
+        XCTAssertTrue(prompt.hasPrefix("## 对话记录\n对话"), "transcript 置顶（确认链三连抽共享缓存前缀）")
         XCTAssertTrue(prompt.contains("必抽清单"))
         XCTAssertTrue(prompt.contains("平台"), "平台/端边界必须出现在必抽清单")
         XCTAssertTrue(prompt.contains("原话"), "约束与否决项必须保留用户原话")

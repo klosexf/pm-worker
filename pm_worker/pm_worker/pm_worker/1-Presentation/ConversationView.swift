@@ -61,6 +61,9 @@ struct ConversationView: View {
     /// 解锁判定用「距底增量 vs 内容增量」纯几何判据（ScrollFollowJudge），
     /// 不依赖 scrollPhase（滚轮离散事件在几何回调前 phase 可能已回 idle，会漏判）。
     @State private var stickToBottom = true
+    /// 回到底部浮钮：距底 > 50pt 显示，≤ 50pt（含已吸底 / 内容不足一屏）隐藏。
+    @State private var showJumpToBottom = false
+    @State private var jumpToBottomHovered = false
 
     /// 用户长消息的展开集合（key = entry.id）。
     /// 上提到父级而非行内 @State：LazyVStack 滚出视口即销毁行视图，
@@ -92,14 +95,8 @@ struct ConversationView: View {
                     .padding(.top, DS.Spacing.s8)
             }
             messageList
-            if !model.recommendations.isEmpty, !store.isStreaming {
-                RecommendationStrip(
-                    recommendations: model.recommendations,
-                    onAdopt: { model.adoptRecommendation($0) },
-                    onReject: { model.rejectRecommendation($0) }
-                )
-                DSDivider()
-            }
+            // 聚光灯推荐已收口到左栏知识库整页（2026-09-17 钦定），
+            // 聊天流只留过程反馈——原内嵌 RecommendationStrip 移除
             // 统一停靠卡（作答段 → 确认段，同卡分步切换）：待答问题先作答，
             // 答毕 / 显式关闭后同卡切换为阶段确认（闸口）。两段弹出纪律均不变——
             // 作答段：新问题自动弹出一次，显式关闭后由触发 chip 兜底重开；
@@ -123,8 +120,9 @@ struct ConversationView: View {
             // ④ 回退坞：显性入口——不必知道「魔法话术」也能重做上游，
             // 与 LLM 回退块同一执行路径（回退 + 自动重生成，诉求可在弹出的生成里继续说）
             // 只在 PRD 生成会话渲染（闸口归属会话口径，同 ConfirmDock）
-            if pipeline.stage == .prd, !store.isStreaming, !model.currentVersionReleased,
-               model.isGateOwnerSession {
+            // 本会话口径（阶段 3）：回溯重发本会话消息，他会话的流不隐藏本坞
+            if pipeline.stage == .prd, !store.isSessionBusy(store.sessionId),
+               !model.currentVersionReleased, model.isGateOwnerSession {
                 BacktrackDock(model: model)
                 DSDivider()
             }
@@ -161,7 +159,8 @@ struct ConversationView: View {
             }
         }
         // 流结束才判定新问题（流式写一半的末尾选项行不触发）
-        .onChange(of: store.isStreaming) { _, streaming in
+        // 本会话口径（阶段 3）：他会话的流结束不再触发本会话抽屉同步
+        .onChange(of: store.streams[store.sessionId]?.isStreaming ?? false) { _, streaming in
             guard !streaming else { return }
             syncClarifyDrawerAutoOpen()
         }
@@ -289,19 +288,22 @@ struct ConversationView: View {
 
     // MARK: - 统一停靠卡（作答段开合 / 提交 / 触发 chip）
 
-    /// 确认段闸口（非 nil 即挂载确认段）：闸口就绪 + 非流式 + 非待回复 + 未静默。
-    /// （待回复期挂上会在「正在思考」上方叠确认卡、开流后又藏——闪现；一律等流结束再挂）
+    /// 确认段闸口（非 nil 即挂载确认段）：闸口就绪 + 本版本空闲 + 未静默。
+    /// （本版本 busy 口径，阶段 3：确认坞属于当前版本闸口——他会话他版本的流
+    /// 不再抑制本版本确认坞；本版本自身的流/占位（含待回复窗口）仍拦截，
+    /// 防「正在思考」上方叠卡、开流后隐藏的闪现）
     private var confirmDockTarget: AppModel.ConfirmTarget? {
-        guard let target = model.confirmTarget, !store.isStreaming,
-              !store.isPreparingReply,
+        guard let target = model.confirmTarget,
+              !store.isVersionBusy(project: pipeline.project, version: pipeline.version),
               !model.isConfirmGateDeferred(target) else { return nil }
         return target
     }
 
     /// 分支确认待决（意图误触发防护）：归属本会话才可见（挂起态绑定发起会话），
-    /// 非流式 / 非待回复（同确认段防闪现口径——流中挂上会与「正在思考」叠卡）。
+    /// 本会话空闲（本会话口径，阶段 3：分支确认卡与本会话「正在思考」卡同位，
+    /// 他会话的流不抑制本会话的裁决卡）。
     private var branchPending: AppModel.PendingBranchConfirmation? {
-        guard !store.isStreaming, !store.isPreparingReply else { return nil }
+        guard !store.isSessionBusy(store.sessionId) else { return nil }
         guard let pending = model.pendingBranchConfirmation,
               pending.sessionId == store.sessionId else { return nil }
         return pending
@@ -309,17 +311,19 @@ struct ConversationView: View {
 
     /// 统一停靠卡可见性：作答段 / 分支确认段 / 确认段任一成立（卡内按优先级切段）；
     /// 确认链进行中（要点表抽取 / 下游生成）整卡抑制——防推进空窗内确认卡闪现。
+    /// 抑制按会话键控（M2）：只有本会话的确认链在跑才抑制，他会话/他版本不拦。
     private var stageDockVisible: Bool {
-        !model.stageConfirmRunning
+        !model.stageConfirmRunningSessions.contains(store.sessionId)
             && ((pendingQuestion != nil && showClarifyDrawer)
                 || branchPending != nil
                 || confirmDockTarget != nil)
     }
 
     /// 待答问题出现 → 自动弹出一次；显式关闭后同问题不再自动弹出
-    /// （兜底入口 = 输入区上方触发 chip）。流式中不判定（写一半的选项行）。
+    /// （兜底入口 = 输入区上方触发 chip）。本会话流式中不判定（写一半的选项行）；
+    /// 他会话的流不拦截（本会话口径，阶段 3）。
     private func syncClarifyDrawerAutoOpen() {
-        guard let pending = pendingQuestion, !store.isStreaming else { return }
+        guard let pending = pendingQuestion, !store.isSessionBusy(store.sessionId) else { return }
         guard pending.entryId != clarifyAutoOpenedId else { return }
         clarifyAutoOpenedId = pending.entryId
         guard pending.entryId != clarifyDismissedId else { return }
@@ -344,6 +348,12 @@ struct ConversationView: View {
         if let pending = pendingQuestion, pending.wizard == nil, pending.isGateConfirm,
            AppModel.isGateConfirmSelection(text, options: pending.options?.options ?? []) {
             Task { await model.confirmStageByAnswer(text) }
+            return
+        }
+        // PRD 前置确认卡（prd_preflight）：选完不走常规发言，答案留痕后直接
+        // 以答案为指令串链快速通道出 PRD（选完直出，无二次确认）。
+        if pendingQuestion?.wizard?.purpose == "prd_preflight" {
+            Task { await model.submitPreflightCard(text) }
             return
         }
         Task { await model.sendMessage(text) }
@@ -436,13 +446,16 @@ struct ConversationView: View {
 
     private var messageList: some View {
         ScrollViewReader { proxy in
-            DSScroll {
+            // edgeClearance：右栏展开时本栏右缘贴 HSplitView 分割条，滚动条内收让位——
+            // 调右栏宽度的拖拽不被滚动条热区截胡（截胡 = 光标/手势变滚动条拖动）。
+            DSScroll(edgeClearance: dsScrollDividerEdgeClearance) {
                 // LazyVStack：长对话只实例化视口附近的消息（虚拟化）——
                 // 旧 VStack 全量持有全部气泡视图，是长会话内存与滚动开销的主因。
                 // 间距 0：轮距 52 改由逐项 topInset 承载（2026-09 呼吸感改版 B+C；
                 // 提示行簇内 12–16，不吃整段轮距）。
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if store.entries.isEmpty && !store.isStreaming {
+                    // 空态展示本会话口径（阶段 3）：他会话的流不隐藏本会话空态
+                    if store.entries.isEmpty && !store.isSessionBusy(store.sessionId) {
                         emptyState
                     }
                     ForEach(displayItems) { item in
@@ -464,7 +477,9 @@ struct ConversationView: View {
                                 }
                             },
                             onResend: { name in resendOriginal(name, for: item.entry) },
-                            resendEnabled: !store.isStreaming && !model.currentVersionReleased,
+                            // 重发本会话消息：本会话口径（阶段 3），他会话的流不禁用
+                            resendEnabled: !store.isSessionBusy(store.sessionId)
+                                && !model.currentVersionReleased,
                             isExpanded: expandedUserMessages.contains(item.entry.id),
                             onToggleExpanded: {
                                 withAnimation(DS.Motion.spring) {
@@ -483,23 +498,21 @@ struct ConversationView: View {
                         .dsSlideIn()
                         .id(item.entry.id)
                     }
-                    // 流式气泡只在归属会话内渲染：流是全局单份的，生成途中切到
-                    // 其他会话不得显示同一份生成内容（回复完成自动落回发起会话）。
+                    // 流式气泡只在归属会话内渲染：流态按会话键隔离（streams[sessionId]），
+                    // 他会话的并发流不会显示到本会话（回复完成自动落回发起会话）。
                     // 待回复期（消息已上屏、提示词组装中）同位渲染同一气泡——
                     // 此时思考占位卡即「正在思考」，开流转正后无切换感。
-                    if (store.isStreaming && store.streamingSessionID == store.sessionId)
-                        || (store.isPreparingReply && store.preparingSessionID == store.sessionId) {
-                        streamingBubble
+                    if store.isSessionBusy(store.sessionId) {
+                        streamingBubble(proxy: proxy, stickToBottom: stickToBottom)
                             .padding(.top, streamingTopInset)
                             .dsSlideIn()
                             .id("streaming")
                     }
                     // P3 插话排队气泡：未注入生效的插话（user 气泡半透明 + 「已排队」）。
                     // 注入生效 / 续发落盘后队列清空，由正式气泡替代。
-                    if (store.streamingSessionID == store.sessionId && store.isStreaming)
-                        || (store.preparingSessionID == store.sessionId && store.isPreparingReply),
-                       !store.steeringQueue.isEmpty || !store.followUpQueue.isEmpty {
-                        ForEach(store.steeringQueue + store.followUpQueue) { entry in
+                    if store.isSessionBusy(store.sessionId),
+                       !store.currentSteeringQueue.isEmpty || !store.currentFollowUpQueue.isEmpty {
+                        ForEach(store.currentSteeringQueue + store.currentFollowUpQueue) { entry in
                             steeringBubble(entry)
                                 .padding(.top, DS.Spacing.s12)
                                 .dsSlideIn()
@@ -517,30 +530,25 @@ struct ConversationView: View {
                 guard stickToBottom else { return }
                 scrollToBottom(proxy, animated: true)
             }
-            .onChange(of: store.streamingText) { _, _ in
-                guard stickToBottom else { return }
-                proxy.scrollTo("streaming", anchor: .bottom)
-            }
-            .onChange(of: store.isStreaming) { old, new in
+            // 流式期逐文本追底已下沉到 StreamingBubbleView（订阅流盒驱动）：
+            // 父视图不再随 delta 重估，此处 onChange 会失聪。
+            .onChange(of: store.streams[store.sessionId]?.isStreaming ?? false) { old, new in
                 // 新回合开始（发送 / 采纳推荐 / 确认推进）→ 恢复吸底跟随，并立刻
-                // 追到流式气泡（「正在思考…」卡）：思考阶段只有 streamingThink 在变
+                // 追到流式气泡（「正在思考…」卡）：思考阶段只有本会话流态 think 在变
                 // （卡片高度固定），若不在此追底，首个正文 token 前视口纹丝不动，
                 // 用户无从得知已在回答（采纳推荐 / 确认推进回合没有新用户气泡，
-                // entries.count 追底也不会触发）。
+                // entries.count 追底也不会触发）。本会话口径：他会话开流不触发。
                 guard new, !old else { return }
                 stickToBottom = true
-                // 流式气泡只在本会话渲染（见 messageList 同款条件），他会话回合不追
-                guard store.streamingSessionID == store.sessionId else { return }
                 // 异步一帧等条件分支（streamingBubble）完成挂载再滚，LazyVStack 才找得到 id
                 DispatchQueue.main.async { scrollToBottom(proxy, animated: true) }
             }
-            .onChange(of: store.isPreparingReply) { old, new in
+            .onChange(of: store.streams[store.sessionId]?.isPreparing ?? false) { old, new in
                 // 待回复态开始（发送 / followUp 续发）：思考占位卡与流式气泡同位，
                 // 挂载即追底——followUp 续发无新 entries、isStreaming 尚未翻转，
                 // 不在此追底则占位卡出现在视口外（发送轮有 entries.count 追底兜底）。
                 guard new, !old else { return }
                 stickToBottom = true
-                guard store.preparingSessionID == store.sessionId else { return }
                 DispatchQueue.main.async { scrollToBottom(proxy, animated: true) }
             }
             // 点击侧栏切换会话 / 首次进入对话页 → 自动定位到最后一条问答。
@@ -577,9 +585,31 @@ struct ConversationView: View {
                 ) {
                     stickToBottom = false
                 }
+                // 回到底部浮钮显隐（同一几何回调顺带判距，不另挂监听）：
+                // 距底 > 50pt 显示，≤ 50pt（含已吸底 / 内容不足一屏）隐藏。
+                // onScrollGeometryChange 按帧合流回调，动作为 O(1) 判距 + 翻转才写态，
+                // 无需额外节流器即无抖动；窗口尺寸变化同样触发，天然适配不同屏宽。
+                let shouldShowJump = newBottom > Self.jumpToBottomThreshold
+                if shouldShowJump != showJumpToBottom {
+                    withAnimation(DS.Motion.springFast) { showJumpToBottom = shouldShowJump }
+                }
+            }
+            // 回到底部浮钮：浮在滚动容器右下角（不随内容滚动），点击恢复吸底
+            // 并平滑滚回底部。显隐 = 透明度 + 缩放 + 位移过渡（springFast）。
+            .overlay(alignment: .bottomTrailing) {
+                jumpToBottomButton(proxy: proxy)
+                    .opacity(showJumpToBottom ? 1 : 0)
+                    .scaleEffect(showJumpToBottom ? 1 : 0.7)
+                    .offset(y: showJumpToBottom ? 0 : 8)
+                    .allowsHitTesting(showJumpToBottom)
+                    .padding(.trailing, DS.Spacing.s20)
+                    .padding(.bottom, DS.Spacing.s12)
             }
         }
     }
+
+    /// 回到底部浮钮的隐藏阈值：距底 ≤ 50pt 视为「已在底部附近」，与需求口径一致。
+    nonisolated private static let jumpToBottomThreshold: CGFloat = 50
 
     /// 视口底缘到内容底缘的距离（含 insets；≤ 0 = 已在底部 / 内容不足一屏）。
     nonisolated private static func bottomDistance(of geo: ScrollGeometry) -> CGFloat {
@@ -591,8 +621,8 @@ struct ConversationView: View {
 
     /// 滚到消息流底部：流式气泡（含待回复占位，同锚 id）在渲染时锚它，否则锚最后一条可见消息。
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        let streamingHere = store.isStreaming && store.streamingSessionID == store.sessionId
-        let preparingHere = store.isPreparingReply && store.preparingSessionID == store.sessionId
+        let streamingHere = store.streams[store.sessionId]?.isStreaming == true
+        let preparingHere = store.streams[store.sessionId]?.isPreparing == true
         let target: String = if streamingHere || preparingHere {
             "streaming"
         } else {
@@ -603,6 +633,32 @@ struct ConversationView: View {
         } else {
             proxy.scrollTo(target, anchor: .bottom)
         }
+    }
+
+    /// 回到底部浮钮：圆形浮层 + 向下箭头（DSIcon(.down)），hover 底色提亮。
+    /// 点击 = 恢复吸底跟随 + 平滑滚回底部（复用 scrollToBottom 的锚点口径：
+    /// 流式期锚「streaming」，否则锚最后一条消息）。浮层投影按 DS 纪律走
+    /// .floating 极轻环境影；surfaceBase 底 + 发丝线描边，深浅色全自适应。
+    private func jumpToBottomButton(proxy: ScrollViewProxy) -> some View {
+        Button {
+            jumpToBottomHovered = false
+            stickToBottom = true
+            scrollToBottom(proxy, animated: true)
+        } label: {
+            DSIcon(.down, size: 14)
+                .foregroundStyle(Color.ink700)
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle().fill(jumpToBottomHovered ? Color.surfaceSecondary : Color.surfaceBase)
+                )
+                .overlay(Circle().strokeBorder(Color.borderL2, lineWidth: 1))
+                .dsShadow(.floating)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { jumpToBottomHovered = $0 }
+        .accessibilityLabel("回到底部")
+        .help("回到底部")
     }
 
     /// 空态（原型：居中图标 + 会话未开始 + 副文案）。
@@ -622,82 +678,112 @@ struct ConversationView: View {
         .padding(.vertical, DS.Spacing.s48)
     }
 
-    /// 流式中的回答内容（头部注记 + 思考 spinner + 增量正文），与最终消息同构。
-    /// handover / live：链式续段顶部的交接条（值班单）；非链为 nil。
+    /// 流式气泡：解析本会话流盒传给子视图（2026-09-18 吞吐修复）。成员增删
+    /// （开流/收流/占位起止）经 streamBoxes 发布、驱动本气泡挂载/卸载；流式
+    /// 增量只在盒上发布，由订阅盒的 StreamingBubbleView 承接——父视图不随
+    /// delta 重估（探针实证：整页重渲染 ~0.3s/次曾吃满 MainActor）。
     @ViewBuilder
-    private func streamingInner(
-        handover: DutyHandover?, live: DutyHandoverBar.Live?
-    ) -> some View {
-        let headerAssembly = MessageBubble.milestoneAssembly(from: streamingHeaderNotes)
-        VStack(alignment: .leading, spacing: DS.Spacing.s8) {
-            // 系统代答链交接条（值班单）：流式期即并入续段顶部（进行态计时 + 字数）
-            if let handover {
-                DutyHandoverBar(data: handover, live: live)
-            }
-            // 回合注记（阶段推进/切档）在流式开始时即并入气泡顶部；
-            // 携带里程碑载荷的行（评分卡）渲染为交付摘要条
-            ForEach(Array(headerAssembly.leftovers.enumerated()), id: \.offset) { _, note in
-                TurnNoteRow(note: note)
-            }
-            if !headerAssembly.rows.isEmpty {
-                DigestBar(
-                    rows: headerAssembly.rows,
-                    openSink: { tab in
-                        model.inspectorTab = tab
-                        if model.inspectorCollapsed {
-                            withAnimation(DS.Motion.spring) { model.inspectorCollapsed = false }
-                        }
-                    }
-                )
-            }
-            // 原型：思考中 spinner + 流光扫字（含本轮引用技能）；文本开始输出后仅展示增量。
-            // 瞬时故障自动重试中（429/5xx）：琥珀状态行替代思考卡——等待显性化，不像假死
-            if let retryNote = store.streamingRetry {
-                HStack(spacing: DS.Spacing.s8) {
-                    DSPulseDot(tint: .statusWarning)
-                    Text(retryNote)
-                        .font(DS.Font.bodySM)
-                        .foregroundStyle(Color.ink500)
-                }
-            } else if store.streamingThink.isEmpty && store.streamingText.isEmpty {
-                ThinkingCard(data: nil, reasoning: store.streamingThink, skills: store.streamingSkills, phase: store.streamingPhase)
-            } else if !store.streamingThink.isEmpty {
-                ThinkingCard(data: nil, reasoning: store.streamingThink, skills: store.streamingSkills, phase: store.streamingPhase)
-            }
-            if !store.streamingText.isEmpty {
-                // 与最终消息同构的产物渲染；进行中的产物块（原型 HTML 等长代码）
-                // 收进生成进度卡，不再原样刷屏
-                StreamingContentBody(
-                    text: store.streamingText,
-                    project: project,
-                    version: version
-                )
-            }
+    private func streamingBubble(proxy: ScrollViewProxy, stickToBottom: Bool) -> some View {
+        if let box = store.streamBoxes[store.sessionId] {
+            StreamingBubbleView(
+                box: box, store: store, model: model, pipeline: pipeline,
+                project: project, version: version,
+                scrollProxy: proxy, stickToBottom: stickToBottom
+            )
         }
     }
 
-    /// 流式中的 AgentShell（思考 spinner + 增量文本）。
-    /// 快速通道链上的续段回合（前方跨系统行有「快速通道」标记可回溯到 assistant）
-    /// 不出独立回答头——流式期间就保持「一条回答」观感，落盘后与历史续段同构。
-    private var streamingBubble: some View {
-        let chained = MessageBubble.isFastForwardChainedBefore(
-            store.entries.count, in: store.entries
-        )
-        // 交接条（值班单）与链判定同集：段序号按已落盘段数顺延，
-        // 实时计量取本轮流数据（起始时刻 + 已生成字数）
-        let handover = chained
-            ? MessageBubble.dutyHandover(for: store.entries.count, in: store.entries)
-            : nil
-        let live = handover == nil ? nil : DutyHandoverBar.Live(
-            startedAt: store.streamingStartedAt,
-            charCount: store.streamingText.count
-        )
-        return Group {
-            if chained {
-                streamingInner(handover: handover, live: live)
-            } else {
-                AgentMessageShell(stage: pipeline.stage, time: nil) {
-                    streamingInner(handover: nil, live: nil)
+    /// 流式气泡子视图：**唯一订阅 StreamBox 的视图**。delta 增量只重渲染这里，
+    /// 不再连坐整个对话页（883s 轮网络侧仅 45.5s 的修复主体）。文本滚动跟随
+    /// 也由盒驱动——父视图不再逐 delta 重估，原 onChange(currentStream.text)
+    /// 在父视图会失聪，故下沉到本视图监听盒内文本。
+    private struct StreamingBubbleView: View {
+        @ObservedObject var box: StreamBox
+        @ObservedObject var store: SessionStore
+        @ObservedObject var model: AppModel
+        @ObservedObject var pipeline: PipelineEngine
+        let project: String
+        let version: String
+        let scrollProxy: ScrollViewProxy
+        let stickToBottom: Bool
+
+        var body: some View {
+            inner
+                .onChange(of: box.value.text) { _, _ in
+                    guard stickToBottom else { return }
+                    scrollProxy.scrollTo("streaming", anchor: .bottom)
+                }
+        }
+
+        private var inner: some View {
+            let chained = MessageBubble.isFastForwardChainedBefore(
+                store.entries.count, in: store.entries
+            )
+            // 回合注记（阶段推进/切档）在流式开始时即并入气泡顶部；
+            // 携带里程碑载荷的行（评分卡）渲染为交付摘要条
+            let headerAssembly = MessageBubble.milestoneAssembly(
+                from: MessageBubble.mergeableNotes(before: store.entries.count, in: store.entries)
+            )
+            // 交接条（值班单）与链判定同集：段序号按已落盘段数顺延，
+            // 实时计量取流盒（起始时刻 + 已生成字数，随增量刷新）
+            let handover = chained
+                ? MessageBubble.dutyHandover(for: store.entries.count, in: store.entries)
+                : nil
+            let live = handover == nil ? nil : DutyHandoverBar.Live(
+                startedAt: box.value.startedAt,
+                charCount: box.value.text.count
+            )
+            let stream = box.value
+            let core = VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+                // 系统代答链交接条（值班单）：流式期即并入续段顶部（进行态计时 + 字数）
+                if let handover {
+                    DutyHandoverBar(data: handover, live: live)
+                }
+                ForEach(Array(headerAssembly.leftovers.enumerated()), id: \.offset) { _, note in
+                    TurnNoteRow(note: note)
+                }
+                if !headerAssembly.rows.isEmpty {
+                    DigestBar(
+                        rows: headerAssembly.rows,
+                        openSink: { tab in
+                            model.inspectorTab = tab
+                            if model.inspectorCollapsed {
+                                withAnimation(DS.Motion.spring) { model.inspectorCollapsed = false }
+                            }
+                        }
+                    )
+                }
+                // 原型：思考中 spinner + 流光扫字（含本轮引用技能）；文本开始输出后仅展示增量。
+                // 瞬时故障自动重试中（429/5xx）：琥珀状态行替代思考卡——等待显性化，不像假死
+                if let retryNote = stream.retry {
+                    HStack(spacing: DS.Spacing.s8) {
+                        DSPulseDot(tint: .statusWarning)
+                        Text(retryNote)
+                            .font(DS.Font.bodySM)
+                            .foregroundStyle(Color.ink500)
+                    }
+                } else if (stream.think.isEmpty && stream.text.isEmpty) || !stream.think.isEmpty {
+                    ThinkingCard(data: nil, reasoning: stream.think, skills: stream.skills, phases: stream.phaseTrail)
+                }
+                if !stream.text.isEmpty {
+                    // 与最终消息同构的产物渲染；展示正文与产物事实由发布点
+                    // StreamDisplayPayload.make 全量算好（进行中的产物块收进
+                    // 生成进度卡，不再原样刷屏——识别不依赖被裁剪的展示文本）
+                    StreamingContentBody(
+                        display: stream.text,
+                        blocks: stream.artifactBlocks,
+                        inProgressName: stream.inProgressName,
+                        inProgressLines: stream.inProgressLines,
+                        project: project,
+                        version: version
+                    )
+                }
+            }
+            return Group {
+                if chained {
+                    core
+                } else {
+                    AgentMessageShell(stage: pipeline.stage, time: nil) { core }
                 }
             }
         }
@@ -754,11 +840,12 @@ struct ConversationView: View {
         return entry.id == store.entries.last(where: { $0.role == .assistant })?.id
     }
 
-    /// ① 多题问题卡待答：最新 assistant 回复中的 artifact:question-card 块，限澄清阶段。
-    /// 该回复之后已存在任何用户消息（已作答 / 已岔开继续聊）→ 不再算待答
-    /// （旧口径仅按【问题卡作答】前缀判定；统一口径：岔开即视为该问题关闭）。
+    /// 多题问题卡待答：最新 assistant 回复中的 artifact:question-card 块（全阶段——
+    /// ① 澄清卡 / ②③ 发起的 prd_preflight 前置确认卡 / ④ prd_defaults 默认项卡，
+    /// 提交分流看 purpose）。该回复之后已存在任何用户消息（已作答 / 已岔开继续聊）
+    /// → 不再算待答（旧口径仅按【问题卡作答】前缀判定；统一口径：岔开即视为该问题关闭）。
     private var pendingQuestionCard: ArtifactParser.QuestionCardRequest? {
-        guard pipeline.stage == .clarify, !model.currentVersionReleased else { return nil }
+        guard !model.currentVersionReleased else { return nil }
         guard let lastAssistantIndex = store.entries.lastIndex(where: { $0.role == .assistant }),
               let request = ArtifactParser.parseQuestionCard(
                   blocks: ArtifactParser.parseArtifactBlocks(in: store.entries[lastAssistantIndex].content)
@@ -858,7 +945,7 @@ struct ConversationView: View {
         // 流式期间尾部已被流式气泡头部吸收的 preamble 行（✅ 推进行等）同样跳过——
         // 流式条目落盘前 mergedSystemIndices 还看不到它，不跳就是双渲染
         let streamingAbsorbed: Set<Int> =
-            store.isStreaming && store.streamingSessionID == store.sessionId
+            store.streams[store.sessionId]?.isStreaming == true
             ? MessageBubble.streamingAbsorbedIndices(in: entries)
             : []
         var items: [DisplayItem] = []
@@ -867,6 +954,9 @@ struct ConversationView: View {
         var previousWasSystem = false
         for (index, entry) in entries.enumerated() {
             if entry.role == .system && entry.memory != nil { continue }
+            // 静默事件行（⚡ 受理 / ⏳ 风险提醒 / ✅ 推进确认）：照常落盘（审计/链判定
+            // 数据源），语义已由当轮 AI 回答开场承接句承载——UI 不再渲染
+            if entry.role == .system && entry.isSilent { continue }
             if entry.role == .system && streamingAbsorbed.contains(index) { continue }
             if entry.role == .assistant {
                 // 交接条与「续段不出独立回答头」同判据，门控在 chained——
@@ -900,7 +990,8 @@ struct ConversationView: View {
         return items
     }
 
-    /// 流式回合的注记：entries 尾部连续可并入的系统行（回合开始即并入，无「独立胶囊→并入」闪烁）。
+    /// 流式回合的注记（引用点已下沉到 StreamingBubbleView.inner，此处保留
+    /// 判据入口：L2787 的头部吸收索引与其共用 mergeableNotes 口径）。
     private var streamingHeaderNotes: [TurnNote] {
         MessageBubble.mergeableNotes(before: store.entries.count, in: store.entries)
     }
@@ -926,6 +1017,9 @@ struct ConversationView: View {
                     .padding(.horizontal, DS.Spacing.s2)
                     .padding(.bottom, DS.Spacing.s8)
                 }
+                // macOS 26：showsIndicators:false 语义同 .hidden（滚动中仍画），
+                // 必须 .never 才强制永不绘制
+                .scrollIndicators(.never)
             }
 
             // 待发送引用文件条（产物台账右键「添加到对话」；正文发送时读盘注入）
@@ -968,7 +1062,8 @@ struct ConversationView: View {
                     Text("记下来")
                         .font(DS.Font.bodySMStrong)
                 }
-                .disabled(store.isStreaming)
+                // 本会话口径（阶段 3）：他会话的流不禁用本会话的记下来
+                .disabled(store.isSessionBusy(store.sessionId))
 
                 Spacer(minLength: DS.Spacing.s8)
 
@@ -982,7 +1077,7 @@ struct ConversationView: View {
 
                 // 流式回复中（本会话为发起者）→ 单钮互替：草稿有字 = 插话发送钮，
                 // 清空即翻回停止钮（插话仅支持文本，附件不参与判据）；其余状态 → 发送钮
-                if store.isStreaming, store.streamingSessionID == store.sessionId {
+                if store.streams[store.sessionId]?.isStreaming == true {
                     if canInterject {
                         ComposerSendButton(enabled: true, help: "插话：不打断生成，生成结束后自动送达") {
                             send()
@@ -1034,6 +1129,8 @@ struct ConversationView: View {
             .font(DS.Font.chatBase)
             .foregroundStyle(Color.ink900)
             .scrollContentBackground(.hidden)
+            // macOS 26：TextEditor 内部滚动条槽静止也绘制，强制永不显示
+            .scrollIndicators(.never)
             .frame(minHeight: 44)
             .fixedSize(horizontal: false, vertical: true)
             .overlay(alignment: .topLeading) {
@@ -1110,15 +1207,15 @@ struct ConversationView: View {
         // P3 Steering：发起会话生成进行中（含回复流未开的待回复期）→
         // 文本插话入队（不打断生成）。附件/引用文件不支持插话携带：
         // 保留在输入坞，正文为空时不动作。
-        if (store.isStreaming && store.streamingSessionID == store.sessionId)
-            || (store.isPreparingReply && store.preparingSessionID == store.sessionId) {
+        if store.isSessionBusy(store.sessionId) {
             guard !text.isEmpty else { return }
             draft = ""
             Task { await model.sendMessage(text) }
             return
         }
 
-        guard !store.isStreaming else { return }
+        // 旧全局 !isStreaming 闸已摘（阶段 3）：上方分支已兜住本会话 busy，
+        // 他会话的流不拦本会话发送（多流并行，origin 各自钉定）
         draft = ""
         pendingImages = []
         pendingFileRefs = []
@@ -1140,7 +1237,9 @@ struct ConversationView: View {
     /// 输入框（附图回填待发条），再走与手输完全一致的 send() 标准链路：
     /// 「用户消息发送 → 系统接收 → AI 处理 → 生成回答」，不直接复用/重生成 AI 回答内容。
     private func resendOriginal(_ artifactName: String, for entry: DiscussionEntry) {
-        guard !store.isStreaming, !model.currentVersionReleased else { return }
+        // 本会话口径（阶段 3）：重发回填本会话输入坞，他会话的流不拦截
+        guard !store.isSessionBusy(store.sessionId),
+              !model.currentVersionReleased else { return }
         guard let origin = originalUserMessage(before: entry) else {
             // 理论不达（每条 AI 回答前必有用户消息）：兜底走同链路的指令式重试
             draft = "重新生成\(artifactDisplayName(artifactName))"
@@ -1255,64 +1354,95 @@ struct StageAvatar: View {
     }
 }
 
-// MARK: - 主动推荐条（Task 4.5，E23）
+// MARK: - 知识引用条（系统层，2026-09-17 钦定）
 
-/// 主动推荐条（阶段开始扫描卡片库推荐 1-3 个方法论，
-/// 含理由、可采纳（实战注记 + 记忆校准）、可拒绝（同阶段不再重复）。
-struct RecommendationStrip: View {
-    let recommendations: [Recommender.Recommendation]
-    var onAdopt: (String) -> Void
-    var onReject: (String) -> Void
+/// assistant 气泡底部的「参考知识卡」引用行：本轮 Context Builder 注入的卡命中
+/// （确定性数据，注入即显示——AI 是否真正采用由第二批 prompt 协议标注）。
+/// 数据随 entry.think.knowledgeRefs 落 discussions.jsonl，历史回放照常渲染。
+/// chip 可点击：按 id 定位卡片 .md 解析后弹出知识库页同款详情弹层。
+struct KnowledgeCiteBar: View {
+    let refs: [String: String]
+    /// 当前项目 id（卡片定位：全局 cards/ → 项目 knowledge/）。
+    let project: String
+
+    /// 详情弹层目标行（nil = 未打开）；detail 按需读 .md 解析。
+    @State private var detailRow: CardLibraryRow?
+    @State private var detail: MethodologyCard?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DS.Spacing.s8) {
-            HStack(spacing: DS.Spacing.s6) {
-                DSIcon(.aiStars, size: 11)
-                    .foregroundStyle(Color.ink700)
-                Text("主动推荐 · \(recommendations.count) 个方法论（本阶段可能用得上）")
-                    .font(DS.Font.bodySMStrong)
-                    .monospacedDigit()
-                    .foregroundStyle(Color.ink500)
-            }
-
-            ForEach(recommendations) { rec in
-                HStack(alignment: .top, spacing: DS.Spacing.s8) {
-                    VStack(alignment: .leading, spacing: DS.Spacing.s3) {
-                        Text(rec.title)
-                            .font(DS.Font.bodyBaseStrong)
-                            .foregroundStyle(Color.ink900)
-                            .lineLimit(1)
-                        Text(rec.reason)
-                            .font(DS.Font.bodyXS)
-                            .foregroundStyle(Color.ink500)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: DS.Spacing.s8)
-                    Button {
-                        onAdopt(rec.id)
-                    } label: {
-                        Text("采纳")
-                    }
-                    .buttonStyle(.ds(.secondary, size: .xs))
-                    .help("采纳：卡片实战注记 +1（带项目出处与日期），并注入你的历史使用倾向")
-
-                    Button {
-                        onReject(rec.id)
-                    } label: {
-                        Text("不适用")
-                    }
-                    .buttonStyle(.ds(.ghost, size: .xs))
-                    .help("本阶段不再重复推荐该方法论")
+        HStack(spacing: DS.Spacing.s6) {
+            DSIcon(.books, size: 12)
+                .foregroundStyle(Color.ink500)
+            Text("参考知识卡")
+                .font(DS.Font.bodyXS)
+                .foregroundStyle(Color.ink500)
+            ForEach(sortedRefs, id: \.key) { id, title in
+                Button {
+                    openCard(id: id, fallbackTitle: title)
+                } label: {
+                    Text(title)
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.brandAccent)
+                        .padding(.horizontal, DS.Spacing.s8)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.brandPopup.opacity(0.5)))
                 }
-                .padding(DS.Spacing.s8)
-                .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.lg)
-                        .fill(Color.surfaceSecondary)
+                .buttonStyle(.plain)
+                .help("\(id)——点击查看卡片全文与案例")
+                .lineLimit(1)
+            }
+        }
+        .padding(.top, DS.Spacing.s2)
+        .sheet(isPresented: Binding(
+            get: { detailRow != nil },
+            set: { if !$0 { closeDetail() } }
+        )) {
+            if let row = detailRow {
+                CardDetailSheet(
+                    row: row,
+                    detail: detail,
+                    recommendation: nil,
+                    onClose: { closeDetail() }
                 )
             }
         }
-        .padding(.horizontal, DS.Spacing.s12)
-        .padding(.vertical, DS.Spacing.s8)
+    }
+
+    private var sortedRefs: [(key: String, value: String)] {
+        refs.sorted { $0.key < $1.key }
+    }
+
+    private func closeDetail() {
+        detailRow = nil
+        detail = nil
+    }
+
+    /// 点击 chip：定位卡片 .md（全局 → 项目）→ 解析成详情行弹层。
+    /// 文件缺失/解析失败以引用标题兜底开卡（confidence 0 = 未经全量解析），点击必有反馈。
+    private func openCard(id: String, fallbackTitle: String) {
+        var row = CardLibraryRow(
+            id: id, projectId: project, title: fallbackTitle, content: fallbackTitle,
+            annotationCount: 0, confidence: 0, supersededBy: nil, createdAt: ""
+        )
+        var card: MethodologyCard?
+        if let url = CardLibraryView.locateCardFile(id: id, projectId: project),
+           let text = try? String(contentsOf: url, encoding: .utf8) {
+            card = MethodologyCard.parse(markdown: text)
+            if let card {
+                row = CardLibraryRow(
+                    id: card.id,
+                    projectId: card.project ?? "",
+                    title: Recommender.title(of: card.content),
+                    content: card.content,
+                    annotationCount: card.annotations.count,
+                    confidence: card.confidence,
+                    supersededBy: card.supersededBy,
+                    createdAt: card.created
+                )
+            }
+        }
+        detail = card
+        detailRow = row
     }
 }
 
@@ -1667,6 +1797,10 @@ private struct DeliveryReceiptCard: View {
     var openSink: ((InspectorPanel.InspectorTab) -> Void)? = nil
     /// 主行点击 → 预览；nil = 非交互态（无预览入口，仍展示交付事实）。
     var onOpenFile: ((FileNode) -> Void)? = nil
+    /// PRD 未改动轮的文件锚（2026-09-18）：④ 阶段回合没有携带任何落盘文件
+    /// （AI 判定「PRD 已是最新，不重排」的迭代轮）时，回执仍给出在盘最新 PRD 的
+    /// 可点击入口，副行标「本轮未改动」——文件未写 ≠ 用户不需要可达的文档入口。
+    var unchangedFile: FileChangeSummary? = nil
 
     @State private var hoveredRowID: String?
     @State private var hoveredFile: String?
@@ -1698,6 +1832,9 @@ private struct DeliveryReceiptCard: View {
             if !mainFiles.isEmpty {
                 hairline
                 ForEach(mainFiles, id: \.path) { mainRow($0) }
+            } else if let unchanged = unchangedFile {
+                hairline
+                mainRow(unchanged, unchangedNote: "本轮未改动")
             }
             let sinkRows = sinks
             if !sinkRows.isEmpty {
@@ -1745,7 +1882,7 @@ private struct DeliveryReceiptCard: View {
 
     // MARK: 主行（本轮交付物，吸收产物块文件卡）
 
-    private func mainRow(_ change: FileChangeSummary) -> some View {
+    private func mainRow(_ change: FileChangeSummary, unchangedNote: String? = nil) -> some View {
         let url = PMAgentStore.versionURL(project: project, version: version)
             .appendingPathComponent(change.path)
         let title = artifactCardTitle(change.path)
@@ -1764,10 +1901,13 @@ private struct DeliveryReceiptCard: View {
                     Text(title)
                         .font(DS.Font.bodyMDStrong)
                         .foregroundStyle(Color.ink900)
-                    Text("\(fileTypeLabel(change.path)) · \(fileSizeText(url))")
-                        .font(DS.Font.bodyXS)
-                        .foregroundStyle(Color.ink500)
-                        .monospacedDigit()
+                    Text(
+                        "\(fileTypeLabel(change.path)) · \(fileSizeText(url))"
+                            + (unchangedNote.map { " · \($0)" } ?? "")
+                    )
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink500)
+                    .monospacedDigit()
                 }
                 Spacer(minLength: DS.Spacing.s8)
                 if onOpenFile != nil {
@@ -1789,7 +1929,11 @@ private struct DeliveryReceiptCard: View {
             guard onOpenFile != nil else { return }
             hoveredFile = hovering ? change.path : nil
         }
-        .help("点击预览（弹窗内置「在浏览器打开」兜底）")
+        .help(
+            unchangedNote == nil
+                ? "点击预览（弹窗内置「在浏览器打开」兜底）"
+                : "本轮没有重写文档，这是在盘最新版——点击预览"
+        )
     }
 
     // MARK: 沉淀行（随本轮落盘的横切产物，可点 → 右栏）
@@ -2077,8 +2221,14 @@ struct MessageBubble: View {
         content.hasPrefix("💬")
     }
 
+    /// 风险自留留痕（💬 已接受「…」；历史行 📌 已接受风险——「…」）：居中微行渲染，
+    /// 与安静留痕同基调——记账反馈不与正文抢层级，历史行同款保持视觉一致。
+    fileprivate static func isRiskAcceptedNotice(_ content: String) -> Bool {
+        content.hasPrefix("💬 已接受「") || content.hasPrefix("📌 已接受风险——「")
+    }
+
     /// 独立系统事件条分流：变更提案卡（载荷行）> 压缩注记（居中灰字）>
-    /// 安静留痕（💬）居中纯文本 > 语义胶囊。
+    /// 风险自留微行 > 安静留痕（💬）居中纯文本 > 语义胶囊。
     @ViewBuilder
     private var systemPill: some View {
         if let proposal = entry.changeProposal {
@@ -2091,6 +2241,8 @@ struct MessageBubble: View {
                 .foregroundStyle(Color.ink500)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity)
+        } else if Self.isRiskAcceptedNotice(entry.content) {
+            riskAcceptedNotice
         } else if Self.isQuietNotice(entry.content) {
             Text(Self.stripEventEmoji(entry.content))
                 .font(DS.Font.bodyXS)
@@ -2103,8 +2255,30 @@ struct MessageBubble: View {
         }
     }
 
-    /// 左对齐紧凑胶囊：语义图标着色 + 状态底色，只承载必须独立可见的事件
-    /// （警告 / 闸口拦截 / 风险命中等）。
+    /// 风险自留微行（2026-09-17 方案 A「居中安静留痕」）：bodyXS 居中灰字，
+    /// 「…」风险名片段提亮一档——从落盘原文切出着色，不改事实源；
+    /// 无引号片段的畸形行回退纯灰字。
+    private var riskAcceptedNotice: some View {
+        let text = Self.stripEventEmoji(entry.content)
+        return Group {
+            if let seg = Self.quotedNameSegments(in: text) {
+                Text(seg.before)
+                    + Text(seg.name).foregroundStyle(Color.ink700)
+                    + Text(seg.after)
+            } else {
+                Text(text)
+            }
+        }
+        .font(DS.Font.bodyXS)
+        .foregroundStyle(Color.ink500)
+        .multilineTextAlignment(.center)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// 左对齐细字行（2026-09-17「纸面流」降噪：胶囊底色 + 描边退场，系统行
+    /// 不与正文抢层级；状态色由语义图标承担，四类染状态色原则不变）。
+    /// 只承载必须独立可见的事件（警告 / 闸口拦截 / 风险命中等）。
     private var eventPill: some View {
         let style = Self.eventChipStyle(entry.content)
         return HStack(spacing: 0) {
@@ -2118,16 +2292,6 @@ struct MessageBubble: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
-            .padding(.horizontal, DS.Spacing.s10)
-            .padding(.vertical, DS.Spacing.s6)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .fill(style.bg)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.lg)
-                    .strokeBorder(Color.borderL1, lineWidth: 1)
-            )
             Spacer(minLength: 0)
         }
     }
@@ -2198,6 +2362,11 @@ struct MessageBubble: View {
             }
             if let think = entry.think {
                 ThinkingCard(data: think)
+                // 思考/正文 divider（DSH 式过程与产出分隔）：思考卡与正文之间一条 hairline
+                Rectangle()
+                    .fill(Color.borderL1)
+                    .frame(height: 1)
+                    .padding(.top, DS.Spacing.s4)
             }
             // Markdown 渲染：标题/粗斜体/列表/代码块/表格/引用分层排版
             // （散文收在 chatMeasure 阅读栏内，表格/代码/图表留列宽）
@@ -2230,15 +2399,25 @@ struct MessageBubble: View {
             // 下一步是脚注——取代旧交付摘要条 / 独立落盘文件卡 / 机器初审居中注脚
             // 三处散落渲染。机器初审等待态也统一收进脚注行（两版漂移文案归一）。
             if !assembly.rows.isEmpty {
+                // PRD 未改动轮文件锚：④ 阶段回执无任何落盘文件且在盘 PRD 存在
+                // → 主行渲染「PRD文档.md · 本轮未改动」，点击预览在盘最新版
+                let receiptFiles = assembly.absorbedCards.compactMap(\.fileChanges).flatMap { $0 }
+                let prdURL = PMAgentStore.versionURL(project: project, version: version)
+                    .appendingPathComponent(ArtifactPath.prd)
                 DeliveryReceiptCard(
                     stage: stage,
                     time: hhmm(entry.createdAt),
                     rows: assembly.rows,
-                    files: assembly.absorbedCards.compactMap(\.fileChanges).flatMap { $0 },
+                    files: receiptFiles,
                     project: project,
                     version: version,
                     openSink: onOpenSink,
-                    onOpenFile: { previewTarget = $0 }
+                    onOpenFile: { previewTarget = $0 },
+                    unchangedFile: MessageBubble.unchangedPRDPointer(
+                        stage: stage,
+                        deliveredFiles: receiptFiles,
+                        prdExists: FileManager.default.fileExists(atPath: prdURL.path)
+                    )
                 )
             }
 
@@ -2253,6 +2432,13 @@ struct MessageBubble: View {
                 } else {
                     TurnNoteRow(note: note)
                 }
+            }
+
+            // 知识引用条（系统层，2026-09-17 钦定）：本轮注入的卡命中——
+            // 让「卡片在反哺 AI 回答」可感知、可核对（AI 层采用标注为第二批）
+            // 挂在气泡最底：正文 → 产物卡 → 回执/注记 → 参考知识，引用是整回合的附注
+            if let refs = entry.think?.knowledgeRefs, !refs.isEmpty {
+                KnowledgeCiteBar(refs: refs, project: project)
             }
         }
     }
@@ -2386,6 +2572,7 @@ struct MessageBubble: View {
         var i = index - 1
         while i >= 0,
               entries[i].role == .system, entries[i].memory == nil,
+              !entries[i].isSilent,
               isTurnPreamble(entries[i].content) {
             if scorecardDups.contains(i) { i -= 1; continue }  // 存量重复评分卡：不进回合注记
             guard var note = turnNote(from: entries[i].content) else { break }
@@ -2410,6 +2597,7 @@ struct MessageBubble: View {
         var i = index + 1
         while i < entries.count,
               entries[i].role == .system, entries[i].memory == nil,
+              !entries[i].isSilent,
               !isTurnPreamble(entries[i].content) {
             guard var note = turnNote(from: entries[i].content) else { break }
             if let changes = entries[i].fileChanges, !changes.isEmpty {
@@ -2432,6 +2620,7 @@ struct MessageBubble: View {
             var i = index - 1
             while i >= 0,
                   entries[i].role == .system, entries[i].memory == nil,
+                  !entries[i].isSilent,
                   isTurnPreamble(entries[i].content),
                   turnNote(from: entries[i].content) != nil {
                 merged.insert(i)
@@ -2440,6 +2629,7 @@ struct MessageBubble: View {
             i = index + 1
             while i < entries.count,
                   entries[i].role == .system, entries[i].memory == nil,
+                  !entries[i].isSilent,
                   !isTurnPreamble(entries[i].content),
                   turnNote(from: entries[i].content) != nil {
                 merged.insert(i)
@@ -2607,6 +2797,7 @@ struct MessageBubble: View {
         var i = entries.count - 1
         while i >= 0,
               entries[i].role == .system, entries[i].memory == nil,
+              !entries[i].isSilent,
               isTurnPreamble(entries[i].content),
               turnNote(from: entries[i].content) != nil {
             absorbed.insert(i)
@@ -2846,6 +3037,18 @@ struct MessageBubble: View {
         return ("机器初审中——结论稍后并入本回执", true)
     }
 
+    /// PRD 未改动轮的文件锚（纯函数，可单测；2026-09-18 用户缺口反馈）：
+    /// ④ 阶段回合没有携带任何落盘文件（AI 判定「PRD 已是最新，不重排」的迭代轮，
+    /// 无 📦 注记 → 回执无主行）且在盘 PRD 存在 → 回执仍渲染一行可点击的
+    /// 「PRD文档.md · 本轮未改动」——文件未写 ≠ 用户不需要可达的文档入口。
+    /// 非④阶段 / 本轮有真实落盘 / 在盘 PRD 缺失 → nil（不渲染）。
+    static func unchangedPRDPointer(
+        stage: PipelineRun.Stage, deliveredFiles: [FileChangeSummary], prdExists: Bool
+    ) -> FileChangeSummary? {
+        guard stage == .prd, deliveredFiles.isEmpty, prdExists else { return nil }
+        return FileChangeSummary(path: ArtifactPath.prd, added: 0, removed: 0, isNew: false)
+    }
+
     /// 存量超限警示行解析（无载荷旧会话）：
     /// 「活跃 💀 已达 N 条（软上限 M 条）：建议…」——发射格式由 RiskStore.append 固定；
     /// 前缀不匹配或计数解析失败返回 nil，回退普通注记行渲染。
@@ -2889,6 +3092,21 @@ struct MessageBubble: View {
         while i < chars.count, eventEmojis.contains(String(chars[i])) { i += 1 }
         if i < chars.count, chars[i] == " " { i += 1 }
         return String(chars[i...])
+    }
+
+    /// 切出首个「…」片段及其前后文（用于风险自留微行的风险名提亮；
+    /// 无闭合引号返回 nil，调用方回退纯灰字）。
+    fileprivate static func quotedNameSegments(
+        in text: String
+    ) -> (before: String, name: String, after: String)? {
+        guard let start = text.firstIndex(of: "「") else { return nil }
+        let afterStart = text.index(after: start)
+        guard let end = text[afterStart...].firstIndex(of: "」") else { return nil }
+        return (
+            String(text[..<start]),
+            String(text[start...end]),
+            String(text[text.index(after: end)...])
+        )
     }
 
     /// 独立事件条的语义样式（图标 / 前景 / 底色，全 DS 动态令牌，深浅色自适应）。
@@ -3106,7 +3324,7 @@ private struct ArtifactBlocksSection: View {
                         .font(DS.Font.bodyMDStrong)
                         .foregroundStyle(Color.ink900)
                 }
-                MarkdownText(block.content, bodySize: 15, readingMeasure: DS.Typography.chatMeasure)
+                MarkdownText(block.content, bodySize: DS.Typography.chatBodySize, readingMeasure: DS.Typography.chatMeasure)
             }
         } else {
             MermaidFigureCard(
@@ -3337,7 +3555,10 @@ private struct ChangeProposalCard: View {
                         Text("纳入当前版本")
                     }
                     .buttonStyle(.ds(.primary, size: .sm))
-                    .disabled(model.currentVersionReleased || model.sessionStore.isStreaming)
+                    // 本版本口径（阶段 3）：纳入重写本版本状态机并重生成，
+                    // 与 AppModel.adoptChangeProposal 守卫同口径
+                    .disabled(model.currentVersionReleased
+                        || model.sessionStore.isVersionBusy(project: model.pipeline.project, version: model.pipeline.version))
 
                     Button {
                         model.poolChangeProposal(proposal)
@@ -3430,6 +3651,8 @@ private struct ChangeProposalCard: View {
 private struct ArtifactProgressCard: View {
     let name: String     // artifact 块名；空串 = 块名尚未流完
     let partial: String  // 已生成正文
+    /// 行数直传（流式结构化口径，全量行数）；nil = 从 partial 现算（历史轮全量文本）
+    var lineCount: Int? = nil
 
     private var icon: DSIcon.Name {
         switch name {
@@ -3443,6 +3666,7 @@ private struct ArtifactProgressCard: View {
     }
 
     private var progressText: String {
+        if let lineCount, lineCount > 0 { return "已生成 \(lineCount) 行" }
         guard !partial.isEmpty else { return "正在准备…" }
         let lines = partial.split(separator: "\n", omittingEmptySubsequences: false).count
         return "已生成 \(lines) 行"
@@ -3542,7 +3766,14 @@ private struct ArtifactTruncatedCard: View {
 /// prototype / prd 收进生成进度卡（长产物源码刷屏无阅读价值；PRD 按用户要求
 /// 仅展示进度状态与完成提示，不显示文档源码内容）；其余文字型产物保留原文流式。
 private struct StreamingContentBody: View {
-    let text: String
+    /// 展示正文（发布点已剥离完整块、裁除进行中块，只剩块间正文）
+    let display: String
+    /// 已闭合完整产物块（结构化下发，识别链不再依赖被裁剪的展示文本）
+    let blocks: [ArtifactParser.ArtifactBlock]
+    /// 进行中（未闭合）产物块名；空 = 无
+    let inProgressName: String
+    /// 进行中块已生成行数（全量口径）
+    let inProgressLines: Int
     var project: String = ""
     var version: String = ""
 
@@ -3552,53 +3783,29 @@ private struct StreamingContentBody: View {
         name == "prd" || ArtifactPath.isPrototypeBlock(name)
     }
 
-    /// （展示文本, 已完成块, 进行中的产物块）
-    private func content() -> (
-        display: String,
-        blocks: [ArtifactParser.ArtifactBlock],
-        incomplete: (name: String, partial: String)?
-    ) {
-        // 流式文本同样清洗占位模仿残留（模型照抄的系统标注行不进气泡）
-        let rawText = ArtifactParser.scrubImitatedPlaceholders(in: text)
-        let blocks = ArtifactParser.parseArtifactBlocks(in: rawText)
-        let incomplete = ArtifactParser.parseIncompleteArtifact(in: rawText)
-            .flatMap { Self.isProgressCardBlock($0.name) ? $0 : nil }
-        var display = blocks.isEmpty
-            ? rawText
-            : ArtifactParser.stripArtifactBlocks(in: rawText, placeholderFor: { _ in "" })
-        if incomplete != nil, let marker = display.range(of: "```artifact:", options: .backwards) {
-            // 开栏可能是更长反引号（````artifact:），前缀反引号一并裁掉
-            var cutStart = marker.lowerBound
-            while cutStart > display.startIndex, display[display.index(before: cutStart)] == "`" {
-                cutStart = display.index(before: cutStart)
-            }
-            display = String(display[..<cutStart])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return (display, blocks, incomplete)
-    }
-
     var body: some View {
-        let content = content()
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
-            if !content.display.isEmpty {
+            if !display.isEmpty {
                 // Markdown 实时渲染（未闭合普通围栏容错到文末）；
                 // liveMermaid = false：流式中的 mermaid 围栏降级为代码块，
                 // 避免逐 tick 的 WKWebView 整页重载（流结束转正式条目后恢复图表）
                 MarkdownText(
-                    content.display, liveMermaid: false,
+                    display, liveMermaid: false,
                     readingMeasure: DS.Typography.chatMeasure,
                     semanticSections: true
                 )
             }
             ArtifactBlocksSection(
-                blocks: content.blocks,
+                blocks: blocks,
                 project: project,
                 version: version,
                 onOpen: nil
             )
-            if let incomplete = content.incomplete {
-                ArtifactProgressCard(name: incomplete.name, partial: incomplete.partial)
+            if Self.isProgressCardBlock(inProgressName) {
+                ArtifactProgressCard(
+                    name: inProgressName, partial: "",
+                    lineCount: inProgressLines
+                )
             }
         }
     }

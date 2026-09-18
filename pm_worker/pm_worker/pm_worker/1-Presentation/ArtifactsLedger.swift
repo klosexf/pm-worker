@@ -252,6 +252,11 @@ struct ArtifactsLedgerView: View {
     let onOpen: (ArtifactEntry) -> Void
     /// 右键菜单「添加到对话」回调。
     var onAddToConversation: (ArtifactEntry) -> Void
+    /// 右键菜单「设为主原型」可见性判定（阶段 4 台账选主：非主槽位原型槽位文件
+    /// 且当前版本非 busy）；nil = 该项整体隐藏（宿主未接线时不显示）。
+    var canPromoteToMaster: ((ArtifactEntry) -> Bool)? = nil
+    /// 右键菜单「设为主原型」回调。
+    var onSelectAsMaster: ((ArtifactEntry) -> Void)? = nil
 
     @State private var filter: ArtifactKind?
 
@@ -335,7 +340,9 @@ struct ArtifactsLedgerView: View {
                         isSelected: entry.id == selectedID,
                         onSelect: { onSelect(entry) },
                         onPreview: { onOpen(entry) },
-                        onAddToConversation: { onAddToConversation(entry) }
+                        onAddToConversation: { onAddToConversation(entry) },
+                        canPromoteToMaster: canPromoteToMaster?(entry) ?? false,
+                        onPromoteToMaster: { onSelectAsMaster?(entry) }
                     )
                     DSDivider()
                 }
@@ -356,6 +363,9 @@ private struct LedgerRow: View {
     let onSelect: () -> Void
     let onPreview: () -> Void
     let onAddToConversation: () -> Void
+    /// 「设为主原型」菜单项可见性（父级按路径 + 版本 busy 判定）。
+    let canPromoteToMaster: Bool
+    let onPromoteToMaster: () -> Void
 
     @State private var hovered = false
     @State private var menuPresented = false
@@ -453,6 +463,14 @@ private struct LedgerRow: View {
             DSMenuItem(title: "添加到对话", icon: .chat, titleFont: DS.Font.bodySM) {
                 menuPresented = false
                 onAddToConversation()
+            }
+            if canPromoteToMaster {
+                // 阶段 4 台账选主：非主槽位的原型槽位文件（修订/方案/未知 slug）
+                // 可提升为主槽位；可见性含 busy 判定（防与流完成落盘竞态）。
+                DSMenuItem(title: "设为主原型", icon: .star, titleFont: DS.Font.bodySM) {
+                    menuPresented = false
+                    onPromoteToMaster()
+                }
             }
         }
         .presentationBackground(.clear)

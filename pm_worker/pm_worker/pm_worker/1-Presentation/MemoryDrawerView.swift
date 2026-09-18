@@ -27,15 +27,18 @@ struct MemoryDrawerView: View {
             headerBar
             DSDivider()
             ScrollViewReader { proxy in
-                List {
-                    effectiveSections
-                    invalidatedSection(proxy: proxy)
+                // DSScroll + LazyVStack（2026-09-17 由 List 迁移）：List 的原生
+                // 玻璃轨道滚动条 .scrollIndicators(.hidden) 压不住（List 无 init
+                // 参数兜底路径），换 DSScroll 统一细胶囊。
+                DSScroll {
+                    LazyVStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                        effectiveSections
+                        invalidatedSection(proxy: proxy)
+                    }
+                    .padding(.horizontal, DS.Spacing.s12)
+                    .padding(.top, DS.Spacing.s6)
+                    .padding(.bottom, DS.Spacing.s12)
                 }
-                .listStyle(.inset)
-                .scrollContentBackground(.hidden)
-                .background(Color.surfaceBase)
-                .padding(.horizontal, DS.Spacing.s8)
-                .dsScrollbar()
             }
         }
         // 原型 .ds-drawer：bg-base · neutral-l1 边 · r12 · max-w 360 ·
@@ -93,6 +96,9 @@ struct MemoryDrawerView: View {
                     title: scopeTitle(group.scope),
                     scope: group.scope
                 )
+                // List 段头自带上方间距，LazyVStack 需显式补回
+                .padding(.top, DS.Spacing.s10)
+                .padding(.bottom, DS.Spacing.s4)
             }
         }
     }
@@ -160,6 +166,9 @@ struct MemoryDrawerView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    // List 段头自带上方间距，LazyVStack 需显式补回
+                    .padding(.top, DS.Spacing.s10)
+                    .padding(.bottom, DS.Spacing.s2)
                 }
             } else {
                 Section {

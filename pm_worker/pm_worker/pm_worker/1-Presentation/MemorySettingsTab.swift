@@ -670,6 +670,7 @@ private struct MemoryEntryEditor: View {
                         TextEditor(text: $content)
                             .font(DS.Font.bodyMD)
                             .scrollContentBackground(.hidden)
+                            .scrollIndicators(.never)  // macOS 26 滚动条槽静止也绘制
                             .frame(height: 128)
                             .padding(DS.Spacing.s8)
                             .background(RoundedRectangle(cornerRadius: DS.Radius.md).fill(Color.surfaceSecondary))

@@ -324,12 +324,13 @@ enum DS {
         static let bodyBaseStrong = SwiftUI.Font.system(size: 15, weight: .medium)
         /// 对话注脚行（2026-09 呼吸感改版：摘要条降噪）。
         static let bodyFootnote = SwiftUI.Font.system(size: 12.5)
-        /// 对话阅读字号（2026-09-13 方案 B「清晰梯度」：17 → 15 收敛正文——
-        /// 17 与表格 15 并置是「忽大忽小」的根源之一；层级改由导语 / 章节 /
-        /// 表格的收敛阶梯承担，见 DS.Typography 对话令牌组与 MarkdownText 映射。
-        /// 对话流正文（AI 回答 Markdown / 用户气泡 / 输入框）专用）。
-        static let chatBase = SwiftUI.Font.system(size: 15, weight: .regular)
-        static let chatBaseStrong = SwiftUI.Font.system(size: 15, weight: .medium)
+        /// 对话阅读字号（2026-09-13 方案 B「清晰梯度」17 → 15；2026-09-17
+        /// 「纸面流」再降档 15 → 14——对齐市面主流对话 13–16px 档，用户反馈
+        /// 15 偏大。层级改由导语 / 章节 / 表格的收敛阶梯承担，见 DS.Typography
+        /// 对话令牌组与 MarkdownText 映射。对话流正文（AI 回答 Markdown /
+        /// 用户气泡 / 输入框）专用；数值单一事实源 = DS.Typography.chatBodySize）。
+        static let chatBase = SwiftUI.Font.system(size: DS.Typography.chatBodySize, weight: .regular)
+        static let chatBaseStrong = SwiftUI.Font.system(size: DS.Typography.chatBodySize, weight: .medium)
         static let bodyLG = SwiftUI.Font.system(size: 20, weight: .regular)
 
         // heading 系（600）
@@ -346,13 +347,16 @@ enum DS {
         static let displayLG = SwiftUI.Font.system(size: 34, weight: .semibold, design: .serif)
         /// 档案索引衬线小号（侧栏任务列表项目行 · 档案方案）：display 系最小档。
         static let display2XS = SwiftUI.Font.system(size: 15, weight: .semibold, design: .serif)
+        /// 档案索引衬线次小号（侧栏项目行 · 呼吸感改版 2026-09-17）：display 系 16 档。
+        static let displayXS = SwiftUI.Font.system(size: 16, weight: .semibold, design: .serif)
         /// 对话内 Markdown 章节标题（2026-09 呼吸感改版）：display 系中档。
         static let displaySM = SwiftUI.Font.system(size: 19, weight: .semibold, design: .serif)
 
         /// 等宽（--code-editor：JetBrains Mono 打包进 bundle · OFL 许可 ·
         /// pm_workerApp.init 显式注册；非拉丁字符自动级联系统字体（中文回落苹方））。
         static let mono = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 13)
-        /// 对话代码块字号（随 chatBase 15 同档：14 → 13，压缩与正文 15 的落差）。
+        /// 对话代码块字号（随 chatBase 同档：正文 15 时代为 13，「纸面流」正文
+        /// 14 后维持 13——代码比正文小半档的口径不变）。
         static let monoLG = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 13)
         static let monoSM = SwiftUI.Font.custom("JetBrainsMono-Regular", size: 12)
         /// 档案索引 mono 小标签（01 索引 / VER / SEALED · 档案方案）。
@@ -381,10 +385,12 @@ enum DS {
         static let tableRatio: CGFloat = 1.45
         /// 中文正文微字距（+0.2）：字与字之间轻微透气，去挤压感。
         static let bodyTracking: CGFloat = 0.2
-        /// 段落间距（Markdown block 间）：2026-09-15 方案 A「阅读栏 · 刻度阶梯」
-        /// 18 → 22——段距须显著大于行距，否则段落粘连成一整块文字墙。
+        /// 段落间距（Markdown block 间）：2026-09-15 方案 A 18 → 22；
+        /// 2026-09-17「纸面流」22 → 12——呼吸感改由「回合距 52」承担（段密回疏），
+        /// 12 仍 ≈ 1.65× 行距附加量（leading(14, 1.72) ≈ 7.3），守住
+        /// 「段距须显著大于行距」的文字墙防线。
         ///（排版节奏值，非布局网格——不在 DS.Spacing 阶梯内）
-        static let paragraphSpacing: CGFloat = 22
+        static let paragraphSpacing: CGFloat = 12
         /// Markdown 标题上方额外间距（叠加在 paragraphSpacing 之上 → 实得 34）：
         /// 标题「上远下近」倒挂节奏——远离上文、贴近所辖内容。
         static let headingTop: CGFloat = DS.Spacing.s12
@@ -400,9 +406,13 @@ enum DS {
         // 对话 Markdown 排版（2026-09-13 方案 B「清晰梯度」→ 2026-09-15 呼吸感改版
         // → 2026-09-15 方案 A「阅读栏 · 刻度阶梯」）：层级 = 字级刻度阶梯 + 样式差
         // 协同 + 阅读栏宽——26 / 21 衬线章节 / 17 / 15 条目标题 / 13 小节标签 /
-        // 15 正文 / 13.5 表格 / 12.5 行内代码 / 13 代码块。
+        // 14 正文 / 13.5 表格 / 12.5 行内代码 / 13 代码块。
         // 规则：相邻可见级差 ≥2pt 且必伴一样样式差（衬线在 h3 退场、刻度线随 h4、
         // 颜色 / 字重）。
+        /// 对话正文字号单一事实源（2026-09-17「纸面流」15 → 14，对齐市面主流
+        /// 13–16px 档）：chatBase / chatBaseStrong / MarkdownText 默认 bodySize /
+        /// 产物块结果卡统一引用，降档只改这一处。
+        static let chatBodySize: CGFloat = 14
         /// 对话正文行高比例（呼吸感改版 1.62 → 1.78；方案 A 1.78 → 1.72——
         /// 行宽收窄到阅读栏后行数增多，行距略收，整段高度不至于失控）。
         static let chatRatio: CGFloat = 1.72

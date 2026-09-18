@@ -14,7 +14,66 @@ import XCTest
 
 final class MilestoneTests: XCTestCase {
 
+    // MARK: 方案 C —— 执行包产物（采纳落实闭环，2026-09-17）
+
+    /// 执行包落盘：临时版本目录写入成功、相对路径正确、内容含风险与执行逻辑；
+    /// planArtifact 新字段 Codable 双向兼容（旧行无键解码 nil，新行带键回读）。
+    func testRiskPlanArtifactWriteAndCodableRoundTrip() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let record = RiskRecord(
+            version: "v1", stage: .prototype,
+            hypothesis: "图片-only 命不住核心场景", impact: "文档预览返工",
+            plan: "R2 加格式分布题", originRef: "自评审"
+        )
+        let rel = try XCTUnwrap(RiskStore.writePlanArtifact(
+            project: "测试", version: "v1", record: record,
+            reply: "① 访谈验证构成\n② 预览适配", baseURL: base
+        ))
+        XCTAssertEqual(rel, "05-artifacts/risk-plans/\(record.id).md")
+        let written = try String(
+            contentsOf: base.appendingPathComponent(rel), encoding: .utf8
+        )
+        XCTAssertTrue(written.contains("执行包 · \(record.id)"))
+        XCTAssertTrue(written.contains("② 预览适配"))
+
+        let oldJSON = #"{"id":"r_x","version":"v1","stage":"prototype","hypothesis":"h","status":"open","originRef":"o","createdAt":"2026-09-17T00:00:00Z"}"#
+        let old = try JSONDecoder().decode(RiskRecord.self, from: Data(oldJSON.utf8))
+        XCTAssertNil(old.planArtifact)
+
+        var updated = record
+        updated.status = .mitigating
+        updated.planArtifact = rel
+        let back = try JSONDecoder().decode(RiskRecord.self, from: JSONEncoder().encode(updated))
+        XCTAssertEqual(back.planArtifact, rel)
+        XCTAssertEqual(back.status, .mitigating)
+    }
+
+
     // MARK: - ① 编解码与旧格式兼容
+
+    /// PRD 未改动轮文件锚（2026-09-18 用户缺口：④ 阶段「PRD 已是最新，不重排」轮
+    /// 回执无主行、文档不可达）：仅④阶段 + 本轮零落盘 + 在盘 PRD 存在时给锚。
+    func testUnchangedPRDPointerGating() {
+        // ④ 阶段 + 无落盘文件 + 在盘 PRD → 出锚（指向在盘 PRD，未改动语义）
+        XCTAssertEqual(
+            MessageBubble.unchangedPRDPointer(stage: .prd, deliveredFiles: [], prdExists: true),
+            FileChangeSummary(path: ArtifactPath.prd, added: 0, removed: 0, isNew: false)
+        )
+        // 本轮真实重写（有 📦 落盘）→ 不出锚（主行已是真实文件行）
+        let delivered = [FileChangeSummary(path: ArtifactPath.prd, added: 12, removed: 3, isNew: false)]
+        XCTAssertNil(
+            MessageBubble.unchangedPRDPointer(stage: .prd, deliveredFiles: delivered, prdExists: true)
+        )
+        // 非④阶段回执不挂 PRD 锚
+        XCTAssertNil(
+            MessageBubble.unchangedPRDPointer(stage: .prototype, deliveredFiles: [], prdExists: true)
+        )
+        // 在盘 PRD 缺失（新版本未出稿）→ 不出锚
+        XCTAssertNil(
+            MessageBubble.unchangedPRDPointer(stage: .prd, deliveredFiles: [], prdExists: false)
+        )
+    }
 
     func testMilestonesCodableRoundtrip() throws {
         let entry = DiscussionEntry(

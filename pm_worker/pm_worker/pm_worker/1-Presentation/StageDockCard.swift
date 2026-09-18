@@ -10,7 +10,7 @@
 //  · 分支确认段：意图误触发防护待决（pendingBranchConfirmation 归属本会话）→
 //    BranchConfirmContent——分支执行是用户最新消息的直接回应，优先于常驻确认段
 //    （闸口状态不消失，分支裁决完自动回补）
-//  · 确认段：闸口就绪（confirmTarget 非空 · 非流式 · 未静默）→ ConfirmDockContent
+//  · 确认段：闸口就绪（confirmTarget 非空 · 本版本非 busy · 未静默）→ ConfirmDockContent
 //  卡壳统一且常驻（surfaceBase 底 · brand200 描边 · floating 浮起影 · xxl 圆角 · 滑入）：
 //  段切换时卡不重建，内容换段走 spring 过渡（透明度渐变，卡体高度随内容弹簧过渡）。
 //  开合契约（宿主 ConversationView 驱动）不变：待答问题自动弹出一次，
@@ -50,7 +50,7 @@ struct StageDockCard: View {
     let pending: PendingQuestion?
     /// 作答段开关（宿主维护：自动弹出 / 显式关闭 / 触发 chip 重开）。
     let showAnswerSection: Bool
-    /// 确认段闸口（nil = 未就绪 / 流式中 / 已静默，确认段不挂载）。
+    /// 确认段闸口（nil = 未就绪 / 本版本 busy / 已静默，确认段不挂载）。
     let confirmTarget: AppModel.ConfirmTarget?
     /// 分支确认待决（nil = 无待决，分支确认段不挂载；宿主已按归属会话过滤）。
     let branchPending: AppModel.PendingBranchConfirmation?
@@ -85,7 +85,9 @@ struct StageDockCard: View {
                         options: pending.options,
                         entryId: pending.entryId,
                         stageLabel: stageLabel,
-                        isStreaming: store.isStreaming,
+                        // 本会话口径（阶段 3）：问题卡属于当前会话的澄清流，
+                        // 他会话的流不禁用本会话作答
+                        sessionBusy: store.isSessionBusy(store.sessionId),
                         onClose: onCloseAnswer,
                         onSubmit: onSubmitAnswer
                     )

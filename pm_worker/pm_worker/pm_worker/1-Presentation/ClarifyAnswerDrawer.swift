@@ -30,7 +30,9 @@ struct ClarifyAnswerContent: View {
     let entryId: String
     /// 当前阶段短名（头部 mono 眉标「追问 · ③ 原型」：标注追问归属阶段；nil 不显示）。
     let stageLabel: String?
-    let isStreaming: Bool
+    /// 本会话 busy（阶段 3 口径，宿主传 isSessionBusy(本会话)）：问题卡属于当前
+    /// 会话的澄清流——本会话流式/占位中禁动作，他会话的流不影响。
+    let sessionBusy: Bool
     /// 显式关闭（X / 跳过此题）：宿主记下当前问题 id，同问题不再自动弹出。
     let onClose: () -> Void
     /// 提交（多题拼装消息 / 单题点选即发 / 自定义输入），宿主走 sendMessage 通道。
@@ -44,14 +46,14 @@ struct ClarifyAnswerContent: View {
                 if let wizard {
                     ClarifyQuestionCard(
                         request: wizard,
-                        isStreaming: isStreaming
+                        sessionBusy: sessionBusy
                     ) { assembled in
                         onSubmit(assembled)
                     }
                 } else if let options {
                     ClarifySingleForm(
                         options: options,
-                        isStreaming: isStreaming,
+                        sessionBusy: sessionBusy,
                         onSubmit: onSubmit,
                         onSkip: onClose
                     )
@@ -103,7 +105,8 @@ struct ClarifyAnswerContent: View {
 /// 点选项即发送（原流内 chips 同交互），自定义输入回车 / 点发送提交，跳过 = 关闭作答段不发送。
 struct ClarifySingleForm: View {
     let options: ArtifactParser.ClarifyOptions
-    let isStreaming: Bool
+    /// 本会话 busy（阶段 3 口径）：本会话流式/占位中禁动作，他会话的流不影响。
+    let sessionBusy: Bool
     let onSubmit: (String) -> Void
     let onSkip: () -> Void
 
@@ -188,7 +191,7 @@ struct ClarifySingleForm: View {
             .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
         }
         .buttonStyle(.plain)
-        .disabled(isStreaming)
+        .disabled(sessionBusy)  // 本会话 busy（阶段 3 口径）
         .onHover { hovering in
             withAnimation(DS.Motion.springFast) {
                 hoveredKey = hovering ? key : nil
@@ -236,7 +239,7 @@ struct ClarifySingleForm: View {
                 Text("发送")
             }
             .buttonStyle(.ds(.brand, size: .sm))
-            .disabled(isStreaming || customDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(sessionBusy || customDraft.trimmingCharacters(in: .whitespaces).isEmpty)  // 本会话 busy（阶段 3）
         }
     }
 
@@ -249,7 +252,7 @@ struct ClarifySingleForm: View {
                 Text("跳过此题")
             }
             .buttonStyle(.ds(.ghost, size: .sm))
-            .disabled(isStreaming)
+            .disabled(sessionBusy)  // 本会话 busy（阶段 3 口径）
         }
         .padding(.horizontal, DS.Spacing.s12)
         .padding(.vertical, DS.Spacing.s10)
@@ -257,7 +260,7 @@ struct ClarifySingleForm: View {
 
     private func sendCustom() {
         let trimmed = customDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isStreaming, !trimmed.isEmpty else { return }
+        guard !sessionBusy, !trimmed.isEmpty else { return }  // 本会话 busy（阶段 3 口径）
         onSubmit(trimmed)
     }
 }

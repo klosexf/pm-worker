@@ -9,6 +9,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 /// 行级 diff 统计（落盘文件卡数据源）：added = 新增行数、removed = 删除行数。
 /// 标准 LCS（滚动数组，空间 O(min(m,n))）；n·m 超 400 万 cell（超长 PRD 全量重写等）
@@ -204,6 +205,30 @@ nonisolated enum ArtifactParser {
 
     // MARK: - 结构产物落盘（write-then-verify）
 
+    /// 产物并发冲突（阶段 0 乐观锁基座）：调用方携带的期望 SHA 与磁盘现状不符，
+    /// 写入在触盘前已取消，磁盘文件保持未动。actualSHA = 磁盘现状内容的 SHA256；
+    /// nil = 文件已消失或不可读（期望有存量而磁盘没有，同样视为失配）。
+    /// 阶段 0 只建立检测管道（writeMeasured 的 expectedSHA 闸 + writePrototypeArtifact
+    /// 的 expectedSnapshot 透传），冲突场景构造与修订文件名生成属后续阶段。
+    struct ArtifactConflict: Error, LocalizedError {
+        let path: String
+        let actualSHA: String?
+
+        var errorDescription: String? {
+            switch actualSHA {
+            case .some(let sha):
+                "产物已被外部修改，为避免覆盖已取消写入：\(path)（磁盘 SHA256 \(sha)）"
+            case .none:
+                "产物文件已不存在或不可读，写入已取消：\(path)"
+            }
+        }
+    }
+
+    /// 文本 SHA256 十六进制摘要（产物冲突检测的指纹口径，CryptoKit）。
+    static func sha256Hex(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     struct StructureArtifacts: Equatable {
         var architecture: String   // 功能架构图.md 全文
         var coreFlows: String      // 核心流程图.md 全文
@@ -214,14 +239,27 @@ nonisolated enum ArtifactParser {
 
     /// 落盘并测量变更：读旧内容 → writeVerified → 行级 diff 摘要。
     /// 文件不存在 → isNew；存在但读取失败 → (0, 0)，宁可少显示不虚报。
+    /// expectedSHA 非 nil 时做乐观并发校验：对磁盘现状内容算 SHA256（文件缺失 /
+    /// 不可读视为失配——期望有存量而磁盘没有），失配抛 ArtifactConflict 且磁盘
+    /// 文件保持未动；nil 时不校验，行为与旧口径完全一致。
     private static func writeMeasured(
-        _ content: String, to url: URL, relativePath: String
+        _ content: String, to url: URL, relativePath: String,
+        expectedSHA: String? = nil
     ) throws -> FileChangeSummary {
         var isNew = true
         var old: String?
         if FileManager.default.fileExists(atPath: url.path) {
             isNew = false
             old = try? String(contentsOf: url, encoding: .utf8)
+        }
+        if let expectedSHA {
+            guard !isNew, let old else {
+                throw ArtifactConflict(path: relativePath, actualSHA: nil)
+            }
+            let actualSHA = sha256Hex(old)
+            guard actualSHA == expectedSHA else {
+                throw ArtifactConflict(path: relativePath, actualSHA: actualSHA)
+            }
         }
         try PMAgentStore.writeVerified(content, to: url)
         let diff: (added: Int, removed: Int)
@@ -241,7 +279,8 @@ nonisolated enum ArtifactParser {
     /// 返回 nil 表示产物不全（architecture / core-flows / module-page-map 缺一不可）。
     @discardableResult
     static func writeStructureArtifacts(
-        blocks: [ArtifactBlock], project: String, version: String
+        blocks: [ArtifactBlock], project: String, version: String,
+        proposalSessionId: String? = nil
     ) throws -> StructureArtifacts {
         let byName = Dictionary(uniqueKeysWithValues: blocks.map { ($0.name, $0.content) })
         guard let arch = byName["architecture"],
@@ -255,7 +294,10 @@ nonisolated enum ArtifactParser {
             )
         }
 
-        let dir = PMAgentStore.versionURL(project: project, version: version)
+        // 草稿预演（B1）：proposalSessionId 非 nil 时镜像落提案目录，不碰主线
+        let dir = PMAgentStore.artifactRoot(
+            project: project, version: version, proposalSessionId: proposalSessionId
+        )
 
         var changes: [FileChangeSummary] = []
         changes.append(try writeMeasured(
@@ -309,9 +351,18 @@ nonisolated enum ArtifactParser {
     /// 逐块落独立文件（按回复中出现顺序，同名块 first-wins，附行级变更摘要）；
     /// 零合法块（无原型块 / 内容不含 "<"）返回 nil。部分截断天然降级：
     /// parseArtifactBlocks 只收已闭合块，闭合的槽位照常落盘，未闭合的由调用方单独提示。
+    /// 阶段 0 透传管道（默认参数下行为完全不变）：
+    /// - slotOverrides：块名 → 改落的相对路径；块落盘前查表，命中则改落该路径
+    ///   （不查槽位合法性，调用方负责；改落路径同时回填 slots）。
+    /// - expectedSnapshot：相对路径 → 期望 SHA256；对本次实际目标路径（含 override
+    ///   改落后）查表，命中传 expectedSHA 给 writeMeasured 做乐观校验，失配抛
+    ///   ArtifactConflict。冲突场景构造与修订文件名生成属后续阶段。
     @discardableResult
     static func writePrototypeArtifact(
-        blocks: [ArtifactBlock], project: String, version: String
+        blocks: [ArtifactBlock], project: String, version: String,
+        expectedSnapshot: [String: String]? = nil,
+        slotOverrides: [String: String]? = nil,
+        proposalSessionId: String? = nil
     ) throws -> PrototypeArtifacts? {
         var seen = Set<String>()
         var ordered: [(name: String, html: String)] = []
@@ -325,10 +376,16 @@ nonisolated enum ArtifactParser {
         var changes: [FileChangeSummary] = []
         for (name, html) in ordered {
             guard let slot = ArtifactPath.prototypeSlot(forBlockName: name) else { continue }
-            let url = PMAgentStore.versionURL(project: project, version: version)
-                .appendingPathComponent(slot.relPath)
-            let change = try writeMeasured(html, to: url, relativePath: slot.relPath)
-            slots.append(.init(blockName: name, relPath: slot.relPath, display: slot.display))
+            let relPath = slotOverrides?[name] ?? slot.relPath
+            // 草稿预演（B1）：落提案目录镜像，跳过主线槽位冲突检测（草稿无并发写）
+            let url = PMAgentStore.artifactRoot(
+                project: project, version: version, proposalSessionId: proposalSessionId
+            ).appendingPathComponent(relPath)
+            let change = try writeMeasured(
+                html, to: url, relativePath: relPath,
+                expectedSHA: proposalSessionId == nil ? expectedSnapshot?[relPath] : nil
+            )
+            slots.append(.init(blockName: name, relPath: relPath, display: slot.display))
             changes.append(change)
         }
         return PrototypeArtifacts(slots: slots, changes: changes)
@@ -372,6 +429,7 @@ nonisolated enum ArtifactParser {
     /// 决策 WHY 草稿（artifact:decision 块，五要素，design.md 附录 B）。
     /// 2026-09-16 写入时富化：话题闭合时可选携带 topic / user_ask /
     /// turning_points 与备选所有权标注（owner）——全部可选，旧格式不受影响。
+    /// 2026-09-17 结论依据富化：basis 三槽（数据/逻辑/事实案例），话题闭合必填。
     struct DecisionDraft: Codable, Equatable {
         var decision: String
         var why: String
@@ -381,6 +439,9 @@ nonisolated enum ArtifactParser {
         var topic: String?
         var userAsk: String?
         var turningPoints: [TurningPoint]?
+        var basis: Basis?
+        /// 推翻的旧否决引用键（2026-09-18 supersedes 协议，可选）。
+        var supersedes: [String]?
 
         enum CodingKeys: String, CodingKey {
             case decision, why, rejected, confidence
@@ -388,6 +449,15 @@ nonisolated enum ArtifactParser {
             case topic
             case userAsk = "user_ask"
             case turningPoints = "turning_points"
+            case basis
+            case supersedes
+        }
+
+        /// basis 草稿（三槽全可选，AI 缺槽照填其余；全空由 DecisionBasis.isEmpty 兜）。
+        struct Basis: Codable, Equatable {
+            var data: String?
+            var logic: String?
+            var facts: String?
         }
 
         /// 补全默认值 → DecisionRecord（version 由调用侧填）。
@@ -401,7 +471,11 @@ nonisolated enum ArtifactParser {
                 toBeVerified: toBeVerified ?? false,
                 topic: topic,
                 userAsk: userAsk,
-                turningPoints: turningPoints
+                turningPoints: turningPoints,
+                basis: basis.map { DecisionBasis(
+                    data: $0.data, logic: $0.logic, facts: $0.facts
+                ) },
+                supersedes: supersedes
             )
         }
     }
@@ -483,6 +557,8 @@ nonisolated enum ArtifactParser {
 
     /// 澄清问题卡（artifact:question-card 块）：① 阶段 LLM 输出相互独立的事实型问题集，
     /// App 渲染为向导卡片批量收集，答案拼装为【问题卡作答】用户消息回传。
+    /// purpose 区分变体：缺省 = ① 澄清卡；prd_preflight = PRD 前置确认卡（提交改道快速通道）、
+    /// prd_defaults = PRD 默认项卡（提交走常规修订）。purpose 仅 App 分流用，不进向导 UI。
     struct QuestionCardRequest: Codable, Equatable {
         struct Question: Codable, Equatable {
             var id: String?          // 稳定标识（缺省由 App 归一化补 q1…qn）
@@ -512,6 +588,8 @@ nonisolated enum ArtifactParser {
             }
         }
         var questions: [Question]
+        /// 卡用途标记（缺省 nil = ① 澄清卡）：prd_preflight / prd_defaults，见类型注释。
+        var purpose: String?
     }
 
     /// 问题卡归一化：题数 clamp ≤5、每题选项 clamp ≤4、id 缺省补齐、空标题题丢弃；
@@ -529,7 +607,7 @@ nonisolated enum ArtifactParser {
                 questions[i].id = "q\(i + 1)"
             }
         }
-        return QuestionCardRequest(questions: questions)
+        return QuestionCardRequest(questions: questions, purpose: raw.purpose)
     }
 
     /// 从回复块中解析澄清问题卡（无块、JSON 不合法或无有效题 → nil）。
@@ -639,28 +717,113 @@ nonisolated enum ArtifactParser {
     }
 
     /// 决策条目 append 到 decisions.jsonl（write-then-verify 由 appendLine 保证）。
+    /// 锁约定：整批决策在 PMAgentStore.ioLock 持锁段内经 appendLineLocked 追加
+    /// （同批行在文件中连续，不与并发写入器交错；appendLineLocked 不重复加锁）。
     static func writeDecisions(
         _ decisions: [DecisionRecord], project: String, version: String
     ) throws {
         let url = PMAgentStore.jsonlURL(
             project: project, version: version, file: "decisions.jsonl"
         )
+        PMAgentStore.ioLock.lock()
+        defer { PMAgentStore.ioLock.unlock() }
         for decision in decisions {
-            try PMAgentStore.appendLine(decision, to: url)
+            try PMAgentStore.appendLineLocked(decision, to: url)
         }
+    }
+
+    // MARK: - PRD 图表引用槽拼接（2026-09-18 确定性拼接）
+
+    /// 拼接结果：text = 槽位替换后的全文；unresolved 供度量（行内已带警示，不静默）。
+    nonisolated struct MermaidStitch: Equatable {
+        var text: String
+        var resolvedCount: Int
+        var unresolvedSlots: [String]
+    }
+
+    /// 扫描文本中全部 ```mermaid 围栏块（返回围栏内源码，按出现顺序）。纯函数。
+    static func mermaidBlocks(in text: String) -> [String] {
+        var blocks: [String] = []
+        var collecting: [String]? = nil
+        for rawLine in text.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if collecting == nil {
+                if line.hasPrefix("```mermaid") { collecting = [] }
+            } else if line == "```" {
+                blocks.append(collecting!.joined(separator: "\n"))
+                collecting = nil
+            } else {
+                collecting!.append(rawLine)
+            }
+        }
+        return blocks
+    }
+
+    /// 图表引用槽拼接（纯函数，测试直测）：PRD 正文中独占一行的
+    /// `[[MERMAID:名称]]` / `[[MERMAID:名称#N]]` 替换为 sources[名称] 中的第 N 张
+    /// mermaid 图（N 缺省 1）。模型只写引用不抄源码——省转抄输出 tokens，且
+    /// 落盘图与已确认材料逐字一致（「成品复用」的确定性形态，opencode/OpenHands
+    /// 「不让模型搬运已知内容」思路的落盘侧实现）。未解析槽位降级为行内警示
+    ///（文档可见、不静默、不虚构内容）。
+    static func stitchMermaidSlots(
+        in body: String, sources: [String: String]
+    ) -> MermaidStitch {
+        var resolved = 0
+        var unresolved: [String] = []
+        var blocksCache: [String: [String]] = [:]
+        let outLines = body.components(separatedBy: "\n").map { rawLine -> String in
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("[[MERMAID:"), line.hasSuffix("]]") else { return rawLine }
+            let inner = line.dropFirst("[[MERMAID:".count).dropLast(2)
+            let parts = inner.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = parts.first.map(String.init) ?? ""
+            let indexPart = parts.count > 1 ? parts[1] : "1"[...]
+            guard !name.isEmpty, let index = Int(indexPart), index >= 1,
+                  let source = sources[name] else {
+                unresolved.append(line)
+                return "> ⚠️ 图表引用未解析：\(line)（已确认材料中无对应图）"
+            }
+            if blocksCache[name] == nil { blocksCache[name] = mermaidBlocks(in: source) }
+            let blocks = blocksCache[name]!
+            guard index <= blocks.count else {
+                unresolved.append(line)
+                return "> ⚠️ 图表引用未解析：\(line)（已确认材料中无对应图）"
+            }
+            resolved += 1
+            return "```mermaid\n\(blocks[index - 1])\n```"
+        }
+        return MermaidStitch(
+            text: outLines.joined(separator: "\n"),
+            resolvedCount: resolved,
+            unresolvedSlots: unresolved
+        )
     }
 
     /// PRD 正文落盘：04-prd/PRD文档.md（write-then-verify，附变更摘要）。
     @discardableResult
     static func writePRDArtifact(
-        blocks: [ArtifactBlock], tier: String, project: String, version: String
+        blocks: [ArtifactBlock], tier: String, project: String, version: String,
+        proposalSessionId: String? = nil
     ) throws -> (url: URL, changes: [FileChangeSummary])? {
         guard let body = blocks.first(where: { $0.name == "prd" })?.content,
               body.count > 200 else { return nil }
-        let url = PMAgentStore.versionURL(project: project, version: version)
-            .appendingPathComponent(ArtifactPath.prd)
+        // 图表引用槽拼接：正文中的 [[MERMAID:…]] 槽位替换为已确认结构产物中的
+        // 图表源码（读主版本目录即时解析；提案目录镜像同样用主线已确认材料）。
+        let root = PMAgentStore.versionURL(project: project, version: version)
+        func source(_ rel: String) -> String {
+            (try? String(contentsOf: root.appendingPathComponent(rel), encoding: .utf8)) ?? ""
+        }
+        let stitch = stitchMermaidSlots(in: body, sources: [
+            "功能架构图": source(ArtifactPath.architecture),
+            "核心流程图": source(ArtifactPath.coreFlows),
+            "业务流程图": source(ArtifactPath.businessFlows),
+        ])
+        // 草稿预演（B1）：落提案目录镜像，不碰主线
+        let url = PMAgentStore.artifactRoot(
+            project: project, version: version, proposalSessionId: proposalSessionId
+        ).appendingPathComponent(ArtifactPath.prd)
         let change = try writeMeasured(
-            body, to: url, relativePath: ArtifactPath.prd
+            stitch.text, to: url, relativePath: ArtifactPath.prd
         )
         return (url: url, changes: [change])
     }
@@ -672,6 +835,16 @@ nonisolated enum ArtifactParser {
         guard let (name, partial) = parseIncompleteArtifact(in: text),
               name == "prd", partial.count > 500 else { return nil }
         return partial
+    }
+
+    /// 非 PRD 阶段的 stray PRD 块检测（AppModel 落盘分派兜底提示用）：
+    /// 回复携带闭合可解析的 prd 块，或存在未闭合的 prd 围栏（截断）——两者在
+    /// 非 PRD 阶段的落盘分派里都没有消费者，会被静默丢弃（2026-09-17「AI 宣称
+    /// 出 PRD 却没落盘」零反馈事故）。.prd 阶段不调用：闭合块正常落盘，
+    /// 未闭合块走 prdTruncatedDraft 截断草稿兜底。
+    static func hasStrayPRDBlock(blocks: [ArtifactBlock], text: String) -> Bool {
+        if blocks.contains(where: { $0.name == "prd" }) { return true }
+        return parseIncompleteArtifact(in: text)?.name == "prd"
     }
 
     /// 竞品分析包落盘：05-analysis/竞品分析.md。

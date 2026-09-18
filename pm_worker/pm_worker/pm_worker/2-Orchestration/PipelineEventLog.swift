@@ -16,12 +16,15 @@ nonisolated struct PipelineEvent: Codable, Equatable, Identifiable {
         case clarifyRound       // 澄清一轮完成
         case stageAdvance       // 阶段推进（①→②）
         case stageConfirm       // 确认闸口通过（②/③）
+        case stageSkip          // 阶段按路径选择跳过（②/③ skipped.json，2026-09-17 路径选择）
         case stageInvalidate    // 回退（结构重生成 / 原型重做）
         case artifactGenerated  // 产物落盘（结构三项 / 原型 / PRD）
         case prdStaleMarked     // PRD 过期标记
         case prdStaleCleared    // PRD 过期清除
         case radarRecorded      // 自评审入账（修正数）
         case gateEvaluated      // 机器门评审（Tier1/Tier2 结果与打回）
+        case methodAdopt        // 方法论卡采纳（聚光灯/知识库处置，2026-09-17 反哺基建）
+        case methodSkip         // 方法论卡推荐被跳过（同阶段不重复推的留痕）
     }
 
     var id: String
@@ -50,6 +53,9 @@ nonisolated enum PipelineEventLog {
 
     /// 追加事件（文件缺失自动补建——兼容 events.jsonl 之前创建的旧工作区）。
     /// 静默失败：事件流是旁路，永不阻塞流水线。
+    /// 锁约定：存在性检查 + 补建 + 追加整体持 PMAgentStore.ioLock——createFile
+    /// 对已有文件是截断覆盖，缺失检查与首建若不原子，并发首写会竞态双建吞掉
+    /// 已追加的行；段内经 appendLineLocked 落行（不重复加锁）。
     static func append(
         kind: PipelineEvent.Kind,
         stage: String,
@@ -60,6 +66,8 @@ nonisolated enum PipelineEventLog {
         version: String
     ) {
         let url = url(project: project, version: version)
+        PMAgentStore.ioLock.lock()
+        defer { PMAgentStore.ioLock.unlock() }
         let fm = FileManager.default
         if !fm.fileExists(atPath: url.path) {
             try? fm.createDirectory(
@@ -76,7 +84,7 @@ nonisolated enum PipelineEventLog {
             outcome: outcome,
             createdAt: ISO8601.timestamp()
         )
-        try? PMAgentStore.appendLine(event, to: url)
+        try? PMAgentStore.appendLineLocked(event, to: url)
     }
 
     /// 全量读回（文件缺失 / 单行解析失败跳过，不抛错）。

@@ -21,6 +21,8 @@ nonisolated struct MethodologyCard: Codable, Equatable {
     var created: String
     /// 正文：方法论定义（官方定义谁都有）
     var content: String
+    /// 为什么有效：底层原理/因果逻辑（写时富化 2026-09-17；nil = 旧卡无此节）
+    var principle: String?
     /// 实战注记（append-only · 只增不覆盖——越用越厚）
     var annotations: [Annotation]
 
@@ -40,6 +42,7 @@ nonisolated struct MethodologyCard: Codable, Equatable {
         supersededBy: String? = nil,
         created: String = ISO8601.dayString(),
         content: String = "",
+        principle: String? = nil,
         annotations: [Annotation] = []
     ) {
         self.id = id
@@ -50,6 +53,7 @@ nonisolated struct MethodologyCard: Codable, Equatable {
         self.supersededBy = supersededBy
         self.created = created
         self.content = content
+        self.principle = principle
         self.annotations = annotations
     }
 

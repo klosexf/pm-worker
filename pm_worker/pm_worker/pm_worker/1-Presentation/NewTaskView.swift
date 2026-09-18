@@ -48,7 +48,8 @@ struct NewTaskView: View {
         // 品牌 Logo + 时间问候 → 大输入卡 → 建议 chips。视口有富余时上下
         // Spacer 均分余量居中；窗口过矮时收缩到 64 边距并进入滚动（不裁切）。
         GeometryReader { viewport in
-            DSScroll {
+            // 右栏展开时本栏右缘贴 HSplitView 分割条，滚动条内收让位（见 dsScrollDividerEdgeClearance）。
+            DSScroll(edgeClearance: dsScrollDividerEdgeClearance) {
                 VStack(spacing: 0) {
                     Spacer(minLength: DS.Spacing.s64)
                     launchContent
@@ -168,6 +169,8 @@ struct NewTaskView: View {
                     .font(DS.Font.bodyBase)
                     .foregroundStyle(Color.ink900)
                     .scrollContentBackground(.hidden)
+                    // macOS 26：TextEditor 内部滚动条槽静止也绘制，强制永不显示
+                    .scrollIndicators(.never)
                     .frame(height: editorHeight, alignment: .topLeading)
                     .padding(.horizontal, DS.Spacing.s16)
                     .padding(.top, DS.Spacing.s16)
@@ -177,12 +180,13 @@ struct NewTaskView: View {
                     .onKeyPress { press in
                         // ⏎ 直接发送（⇧⏎ 换行，IME 组字中回车仅确认组字）；
                         // 不可发送时回车保持系统换行行为——与对话页输入框同策略
+                        // （阶段 3 放开流中新建：发送 origin 钉定新会话，切走不打断流，
+                        // 他会话/本页历史流不再拦发送）
                         guard press.key == .return,
                               press.phase == .down,
                               !press.modifiers.contains(.shift),
                               !imeComposing,
-                              canSend,
-                              !model.sessionStore.isStreaming
+                              canSend
                         else { return .ignored }
                         sendMessage()
                         return .handled
@@ -307,7 +311,9 @@ struct NewTaskView: View {
                 )
         }
         .buttonStyle(.plain)
-        .disabled(!canSend || model.sessionStore.isStreaming)
+        // 阶段 3 放开流中新建：只保留 canSend 判据——流中新建不打断进行中的流
+        //（origin 钉定新会话），他会话的流不再禁用发送
+        .disabled(!canSend)
         .help("发送，开始任务")
     }
 

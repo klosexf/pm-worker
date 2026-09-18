@@ -23,6 +23,8 @@ nonisolated enum ArtifactPath {
     static let prototype = "03-prototypes/可点击原型.html"
     static let prd = "04-prd/PRD文档.md"
     static let prdTruncatedDraft = "04-prd/PRD截断草稿.md"
+    /// PRD 模板版本戳（落盘时记录生成所用模板版本；模板升级后据判定存量 PRD 失效）。
+    static let prdMeta = "04-prd/prd-meta.json"
     static let competitiveAnalysis = "05-analysis/竞品分析.md"
     static let releaseNotes = "07-reports/发布说明.md"
 
@@ -93,13 +95,14 @@ nonisolated enum ArtifactPath {
         }
     }
 
-    /// 扫描版本目录 03-prototypes/ 下所有可识别的槽位文件（磁盘是事实源），
-    /// 按 默认 → 移动端 → 桌面端 → 平板端 → 未知 slug（字母序）返回；
+    /// 扫描产物根下 03-prototypes/ 槽位文件（磁盘是事实源），按
+    /// 默认 → 移动端 → 桌面端 → 平板端 → 未知 slug（字母序）返回；
     /// 不认识的 .html 跳过（产物台账 / 版本对比走目录扫描，可见性不丢）。
+    /// root：产物根（B1 草稿预演传提案目录；nil = 主线版本目录）。
     static func prototypeSlotFiles(
-        project: String, version: String
+        project: String, version: String, root: URL? = nil
     ) -> [(blockName: String, relPath: String, display: String, url: URL)] {
-        let dir = PMAgentStore.versionURL(project: project, version: version)
+        let dir = (root ?? PMAgentStore.versionURL(project: project, version: version))
             .appendingPathComponent("03-prototypes", isDirectory: true)
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
             return []
@@ -137,6 +140,17 @@ nonisolated enum PMAgentStore {
     /// 测试与正式环境可注入不同根目录。
     nonisolated(unsafe) static var rootOverride: URL?
 
+    /// 进程级写锁：串行化全部落盘写路径（产物覆盖写 writeVerified / jsonl 追加
+    /// appendLine，以及外部写入器的「存在性检查+补建+追加」复合段），防跨线程
+    /// FileManager 竞态（并发追加丢行损行 / 缺失文件竞态双建截断已有内容）。
+    /// 锁约定（NSLock 非重入，务必遵守）：
+    /// - 公开方法 appendLine / writeVerified 自行加锁；
+    /// - 需要复合原子段的调用方（PipelineEventLog / ChangeLedger /
+    ///   ArtifactParser.writeDecisions）自行 lock，持锁段内只调不加锁的底层
+    ///   实现 appendLineLocked，禁止再调会自行加锁的公开方法（否则死锁）；
+    /// - 单次写入一律直接走公开方法，不要手写 lock/unlock。
+    nonisolated(unsafe) static let ioLock = NSLock()
+
     /// `~/PMAgent/`
     static var root: URL {
         rootOverride ?? FileManager.default.homeDirectoryForCurrentUser
@@ -161,6 +175,17 @@ nonisolated enum PMAgentStore {
 
     static func jsonlURL(project: String, version: String, file: String) -> URL {
         versionURL(project: project, version: version).appendingPathComponent(file)
+    }
+
+    /// 产物根目录（B1 草稿预演分流）：proposalSessionId 为 nil → 主线版本目录；
+    /// 非 nil → 草稿提案目录 05-artifacts/proposals/<sessionId>/（草稿预演产物
+    /// 按主线同构相对路径镜像落盘，合并时整目录对拷入主线）。
+    static func artifactRoot(
+        project: String, version: String, proposalSessionId: String?
+    ) -> URL {
+        let base = versionURL(project: project, version: version)
+        guard let sid = proposalSessionId, !sid.isEmpty else { return base }
+        return base.appendingPathComponent("05-artifacts/proposals/\(sid)", isDirectory: true)
     }
 
     // MARK: - Bootstrap
@@ -417,7 +442,10 @@ nonisolated enum PMAgentStore {
     }
 
     /// 产物写入（write-then-verify，design.md E5）：写后回读校验，不一致抛错。
+    /// 整体持 ioLock（写 + 回读校验 + 广播为一个原子段，防并发覆盖写交错）。
     static func writeVerified(_ text: String, to url: URL) throws {
+        ioLock.lock()
+        defer { ioLock.unlock() }
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
@@ -562,8 +590,17 @@ nonisolated enum PMAgentStore {
 
     // MARK: - JSONL
 
-    /// append-only：一行一条，永不覆盖。
+    /// append-only：一行一条，永不覆盖。持 ioLock（并发追加不丢行不损行）。
+    /// 复合原子段的调用方请自行 lock 后调 appendLineLocked（见 ioLock 锁约定）。
     static func appendLine<T: Encodable>(_ value: T, to url: URL) throws {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        try appendLineLocked(value, to: url)
+    }
+
+    /// append-only 底层实现（不加锁）。锁约定：调用方必须已持有 ioLock，
+    /// 否则并发下存在性检查与 seekToEnd+write 不原子（供持锁段内部调用）。
+    static func appendLineLocked<T: Encodable>(_ value: T, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(value)

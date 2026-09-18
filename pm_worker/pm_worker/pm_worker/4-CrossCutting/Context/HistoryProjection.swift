@@ -21,8 +21,12 @@ nonisolated enum HistoryProjection {
     /// - 系统行（胶囊/记忆行）不回灌模型；
     /// - assistant 产物块回灌时剥离（上下文里以说明代替大段源码，省 token）；
     /// - 历史附图不重发（多模态 token 昂贵）：文本标注代替，当轮图在 send() 里替换；
-    /// - 引用文件正文只在该轮注入（不随历史重发）：标注路径供模型理解前后文。
-    static func projectEntries(_ entries: [DiscussionEntry]) -> [ChatMessage] {
+    /// - 引用文件正文只在该轮注入（不随历史重发）：标注路径供模型理解前后文；
+    /// - replayReasoning（2026-09-18 思考回传）：assistant 轮携带落盘思考原文
+    ///   （think.full），门控与「只留最后一轮」的收敛由 SessionStore 编排。
+    static func projectEntries(
+        _ entries: [DiscussionEntry], replayReasoning: Bool = false
+    ) -> [ChatMessage] {
         entries.compactMap { entry -> ChatMessage? in
             guard entry.role != .system else { return nil }
             var content: String
@@ -48,7 +52,12 @@ nonisolated enum HistoryProjection {
                 content += "\n（本条引用了文件：\(files.joined(separator: "、"))；"
                     + "正文仅在该轮注入，未随历史回灌。）"
             }
-            return ChatMessage(role: roleOf(entry.role), content: content)
+            let reasoning = replayReasoning && entry.role == .assistant
+                ? entry.think?.full.flatMap { $0.isEmpty ? nil : $0 }
+                : nil
+            return ChatMessage(
+                role: roleOf(entry.role), content: content, reasoningContent: reasoning
+            )
         }
     }
 
@@ -120,18 +129,35 @@ nonisolated enum HistoryProjection {
         return "\(dropped.count)|\(first.content.prefix(64))|\(last.content.prefix(64))"
     }
 
+    /// 思考回传收敛（2026-09-18）：只保留最后一条携带思考的 assistant 消息，
+    /// 其余轮 reasoningContent 置空。历史预算按正文估算（TokenBreakdown），
+    /// 全量回传会无界膨胀；且更早轮的结论已外化进产物与前情摘要，连贯价值
+    /// 集中在最近一轮（修订轮直接续上前一版的推敲线）。纯函数，测试直测。
+    static func keepRecentReasoning(in messages: [ChatMessage]) -> [ChatMessage] {
+        guard let last = messages.lastIndex(where: { $0.reasoningContent != nil }) else {
+            return messages
+        }
+        var result = messages
+        for index in result.indices where index != last {
+            result[index].reasoningContent = nil
+        }
+        return result
+    }
+
     // MARK: - ③ 摘要垫头
 
     /// 摘要垫头：system 首条之后插一条 user 角色的前情摘要（明确标注为系统注入的压缩内容）。
+    /// bridging（2026-09-18 分块压缩）：暂缓期内新被丢的轮次以原文垫在摘要之后、
+    /// 保留段之前（时间序）——旧摘要与既有历史保持字节级不变，前缀缓存可命中。
     static func historyWithSummary(
-        kept: [ChatMessage], summary: String
+        kept: [ChatMessage], summary: String, bridging: [ChatMessage] = []
     ) -> [ChatMessage] {
         guard let first = kept.first, first.role == .system else { return kept }
         let summaryMessage = ChatMessage(
             role: .user,
             content: "【前情摘要】以下是较早对话轮次的压缩摘要（原文已从上下文移除）：\n\(summary)"
         )
-        return [first, summaryMessage] + kept.dropFirst()
+        return [first, summaryMessage] + bridging + kept.dropFirst()
     }
 
     /// 滚动压缩摘要 prompt：旧摘要要点吸收保留 + 新纳入轮次压缩成结构化要点。

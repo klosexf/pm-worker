@@ -22,6 +22,13 @@ nonisolated struct UsageRecord: Codable, Equatable {
     var cacheHitTokens: Int = 0
     /// 端点未返回 usage、用 TokenBreakdown.estimate 估算时 true。
     var estimated: Bool
+    /// 归因增强（2026-09-18 提速归因）：轮次关联 id——同一轮的多次请求
+    ///（空流重试/截断续写）共享；与 StreamProbe 时间线可按 id 对齐。旧记录 nil。
+    var roundId: String? = nil
+    /// 本次请求净耗时（秒，流开到流末；探针同源）。旧记录 nil。
+    var totalS: Double? = nil
+    /// 首 token 延迟（秒）。旧记录 nil。
+    var ttftS: Double? = nil
 }
 
 // 旧 JSONL 兼容：cacheHitTokens 缺省 0（decodeIfPresent）；
@@ -38,5 +45,8 @@ nonisolated extension UsageRecord {
         completionTokens = try container.decode(Int.self, forKey: .completionTokens)
         cacheHitTokens = try container.decodeIfPresent(Int.self, forKey: .cacheHitTokens) ?? 0
         estimated = try container.decode(Bool.self, forKey: .estimated)
+        roundId = try container.decodeIfPresent(String.self, forKey: .roundId)
+        totalS = try container.decodeIfPresent(Double.self, forKey: .totalS)
+        ttftS = try container.decodeIfPresent(Double.self, forKey: .ttftS)
     }
 }

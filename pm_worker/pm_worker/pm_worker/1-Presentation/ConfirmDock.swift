@@ -33,9 +33,38 @@ struct ConfirmDockContent: View {
     @State private var hoveredOption: Option?
 
     /// 处理方式选项（单选；rawValue = 数字徽章编号）。「稍后再说」走页脚次按钮，不占选项位。
-    private enum Option: Int, CaseIterable {
-        case proceed = 1       // 确认并进入
-        case editLater = 2     // 继续修改
+    /// 2026-09-17 路径选择：按闸口分档——① 三推进（进② / 直出原型 / 直出 PRD）、
+    /// ② 两推进（进③ / 跳③出 PRD）、③ 两推进（进④ / 到此为止）；
+    /// 跳过的阶段写跳过标记闭环，可随时补做（时间线补做入口）。
+    private enum Option: Int {
+        case proceed = 1          // 确认并进入下一阶段（常规完整流程）
+        case skipToPrototype = 2  // ①：跳过 ② 直出原型
+        case skipToPRD = 3        // ①②：跳过中间阶段直出 PRD
+        case stopHere = 4         // ③：到原型为止（本版不出 PRD）
+        case editLater = 99       // 继续修改
+
+        /// 选项对应的闸口路径（editLater 不推进，performSelection 特判）。
+        var route: AppModel.GateRoute {
+            switch self {
+            case .proceed: .next
+            case .skipToPrototype: .skipToPrototype
+            case .skipToPRD: .skipToPRD
+            case .stopHere: .stopHere
+            case .editLater: .next
+            }
+        }
+
+        /// 所选是否推进类（主按钮 disabled 判据：推进类才被版本流拦截）。
+        var advances: Bool { self != .editLater }
+
+        /// 本闸口可用选项（有序：常规在前，路径选择随后，继续修改垫底）。
+        static func options(for target: AppModel.ConfirmTarget) -> [Option] {
+            switch target {
+            case .clarify: [.proceed, .skipToPrototype, .skipToPRD, .editLater]
+            case .structure: [.proceed, .skipToPRD, .editLater]
+            case .prototype: [.proceed, .stopHere, .editLater]
+            }
+        }
     }
 
     init(model: AppModel, target: AppModel.ConfirmTarget) {
@@ -82,35 +111,53 @@ struct ConfirmDockContent: View {
     private var optionsArea: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
             // ① 的要点表在确认时才生成（此刻尚未落盘），不能说「已就绪」——
-            // ②③ 产物已在盘，保持「已就绪」表述
+            // ②③ 产物已在盘，保持「已就绪」表述。2026-09-17 路径选择：
+            // 问句从「怎么处理」改为「选哪条路径」——去哪、走到哪由用户定。
             Text(target == .clarify
-                 ? "澄清对话已收束，确认后将生成要点表并进入 ② 结构设计："
-                 : "\(target.title)已就绪，选择接下来的处理方式：")
+                 ? "澄清对话已收束，确认后将生成要点表归档，选择接下来的路径："
+                 : "\(target.title)已就绪，选择接下来的路径：")
                 .font(DS.Font.bodySM)
                 .foregroundStyle(Color.ink500)
                 .padding(.bottom, DS.Spacing.s2)
 
             VStack(spacing: DS.Spacing.s6) {
-                optionCard(
-                    .proceed,
-                    title: "确认并进入\(target.nextStage)",
-                    subtitle: proceedSubtitle
-                )
-                optionCard(
-                    .editLater,
-                    title: "继续修改",
-                    subtitle: "收起确认坞，回到对话补充信息"
-                )
+                ForEach(Option.options(for: target), id: \.rawValue) { option in
+                    optionCard(option, title: optionTitle(option), subtitle: optionSubtitle(option))
+                }
             }
         }
     }
 
-    /// 主选项副标题（按闸口分档，结果导向：确认后定稿什么、AI 接下来做什么）。
-    private var proceedSubtitle: String {
-        switch target {
-        case .clarify: "把聊定的结论整理成要点表存档，AI 随即开始设计产品结构"
-        case .structure: "结构定稿存档，AI 随即开始生成可交互网页原型"
-        case .prototype: "原型定稿存档，AI 随即开始撰写产品需求文档"
+    /// 选项标题（按闸口分档）。
+    private func optionTitle(_ option: Option) -> String {
+        switch (target, option) {
+        case (_, .proceed): "确认并进入\(target.nextStage)"
+        case (.clarify, .skipToPrototype): "跳过结构，直接出原型"
+        case (_, .skipToPRD): target == .clarify ? "跳过结构原型，直接出 PRD" : "跳过原型，直接出 PRD"
+        case (_, .stopHere): "到此为止，本版不出 PRD"
+        default: "继续修改"
+        }
+    }
+
+    /// 选项副标题（结果导向：确认后定稿什么、AI 接下来做什么、跳过的可补做）。
+    private func optionSubtitle(_ option: Option) -> String {
+        switch (target, option) {
+        case (.clarify, .proceed):
+            "把聊定的结论整理成要点表存档，AI 随即开始设计产品结构"
+        case (.structure, .proceed):
+            "结构定稿存档，AI 随即开始生成可交互网页原型"
+        case (.prototype, .proceed):
+            "原型定稿存档，AI 随即开始撰写产品需求文档"
+        case (.clarify, .skipToPrototype):
+            "要点表存档后跳过 ②，AI 直接基于要点表生成原型；结构可事后补做"
+        case (.clarify, .skipToPRD):
+            "要点表存档后跳过 ②③，AI 直接撰写 PRD（小需求优化适用）；结构与原型可事后补做"
+        case (.structure, .skipToPRD):
+            "结构定稿存档后跳过 ③，AI 直接撰写 PRD；原型可事后补做"
+        case (_, .stopHere):
+            "原型定稿存档即收尾，可直接封板；后续想出 PRD 对话说「出 PRD」续接"
+        default:
+            "收起确认坞，回到对话补充信息"
         }
     }
 
@@ -215,11 +262,20 @@ struct ConfirmDockContent: View {
                 Label {
                     Text(primaryTitle)
                 } icon: {
-                    DSIcon(selection == .proceed ? .check : .arrowRight, size: 12)
+                    DSIcon(
+                        selection == .proceed || selection == .stopHere
+                            ? .check : .arrowRight,
+                        size: 12
+                    )
                 }
             }
-            .buttonStyle(.ds(selection == .proceed ? .brand : .secondary, size: .sm))
-            .disabled(selection == .proceed && store.isStreaming)
+            .buttonStyle(
+                .ds(selection.advances && selection != .stopHere ? .brand : .secondary, size: .sm)
+            )
+            // 本版本口径（阶段 3）：推进类选项落当前版本闸口链，只被本版本自身的
+            // 流/占位拦截；他会话他版本的并发流不禁用本版本确认坞
+            .disabled(selection.advances
+                && store.isVersionBusy(project: model.pipeline.project, version: model.pipeline.version))
         }
     }
 
@@ -227,18 +283,22 @@ struct ConfirmDockContent: View {
     private var primaryTitle: String {
         switch selection {
         case .proceed: "确认并进入"
+        case .skipToPrototype: "直接出原型"
+        case .skipToPRD: "直接出 PRD"
+        case .stopHere: "到此为止"
         case .editLater: "继续修改"
         }
     }
 
-    /// 执行所选选项：确认 → 提交生效（触发下一阶段生成）；继续修改 → 静默本阶段。
+    /// 执行所选选项：推进类（含路径选择）→ 按所选 route 提交生效；继续修改 → 静默本阶段。
     private func performSelection() {
-        guard selection == .proceed else {
+        guard selection != .editLater else {
             model.deferConfirmGate(target)
             return
         }
+        let route = selection.route
         Task {
-            await model.confirmCurrentStage()
+            await model.confirmCurrentStage(route: route)
         }
     }
 }

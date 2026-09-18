@@ -128,9 +128,15 @@ struct DecisionLogPage: View {
                             .monospacedDigit()
                             .foregroundStyle(Color.ink500)
                         ForEach(poolRows) { row in
-                            ChangePoolCard(
-                                item: row.item, project: row.project, version: row.version
-                            ) { reload() }
+                            if row.item.proposal.isStageDraft {
+                                DraftMergeCard(
+                                    item: row.item, project: row.project, version: row.version
+                                ) { reload() }
+                            } else {
+                                ChangePoolCard(
+                                    item: row.item, project: row.project, version: row.version
+                                ) { reload() }
+                            }
                         }
                     }
                     .padding(DS.Spacing.s24)
@@ -200,7 +206,7 @@ struct DecisionLogPage: View {
         }
         poolRows = scopes.flatMap { scope in
             ChangeLedger.load(project: scope.project, version: scope.version)
-                .filter(\.isPooled)
+                .filter { $0.isPooled || ($0.proposal.isStageDraft && $0.isPending) }
                 .reversed()
                 .map { PoolRow(item: $0, project: scope.project, version: scope.version) }
         }

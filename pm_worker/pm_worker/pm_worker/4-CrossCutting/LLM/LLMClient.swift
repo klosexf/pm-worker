@@ -17,16 +17,24 @@ nonisolated struct ChatMessage: Codable, Equatable {
     var content: String
     /// 附图（仅 user 消息有意义）：OpenAI 兼容 image_url 随 content 数组携带。
     var images: [ChatImage]?
+    /// 思考原文回传（仅 assistant 消息有意义）：历史轮 reasoning_content 随消息
+    /// 回发，模型免于每轮重新推敲上轮已想清的结论（2026-09-18，opencode /
+    /// OpenHands 双印证的做法，DeepSeek 端点收益直接）。nil = 不携带。
+    var reasoningContent: String?
 
-    init(role: Role, content: String, images: [ChatImage]? = nil) {
+    init(
+        role: Role, content: String, images: [ChatImage]? = nil,
+        reasoningContent: String? = nil
+    ) {
         self.role = role
         self.content = content
         self.images = images
+        self.reasoningContent = reasoningContent
     }
 
-    // Codable 兼容旧存量（无 images 字段的 JSON）
+    // Codable 兼容旧存量（无 images / reasoningContent 字段的 JSON）
     private enum CodingKeys: String, CodingKey {
-        case role, content, images
+        case role, content, images, reasoningContent
     }
 
     init(from decoder: Decoder) throws {
@@ -34,6 +42,7 @@ nonisolated struct ChatMessage: Codable, Equatable {
         role = try c.decode(Role.self, forKey: .role)
         content = try c.decode(String.self, forKey: .content)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
+        reasoningContent = try c.decodeIfPresent(String.self, forKey: .reasoningContent)
     }
 }
 
@@ -179,6 +188,9 @@ nonisolated enum LLMClient {
         struct Message: Codable {
             var role: String
             var content: MessageContent
+            /// 思考原文回传（DeepSeek reasoning_content）：nil 时字段整体缺席
+            ///（synthesized Codable 对 Optional 走 encodeIfPresent），端点零风险。
+            var reasoning_content: String? = nil
         }
         struct StreamOptions: Codable {
             var include_usage: Bool
@@ -198,7 +210,10 @@ nonisolated enum LLMClient {
         /// 有图按 [text, image_url…] 顺序展开。
         static func message(from m: ChatMessage) -> Message {
             guard let images = m.images, !images.isEmpty else {
-                return Message(role: m.role.rawValue, content: .text(m.content))
+                return Message(
+                    role: m.role.rawValue, content: .text(m.content),
+                    reasoning_content: m.reasoningContent
+                )
             }
             var parts: [MessageContent.ContentPart] = [
                 .init(type: "text", text: m.content, image_url: nil)
@@ -209,7 +224,10 @@ nonisolated enum LLMClient {
                     image_url: .init(url: image.dataURL)
                 ))
             }
-            return Message(role: m.role.rawValue, content: .parts(parts))
+            return Message(
+                role: m.role.rawValue, content: .parts(parts),
+                reasoning_content: m.reasoningContent
+            )
         }
     }
 
@@ -217,6 +235,13 @@ nonisolated enum LLMClient {
 
     /// 自动重试次数上限（与 openStreamWithRetry 的退避表 1s→2s 一一对应）。
     static let maxStreamRetries = 2
+
+    /// 产物生成回合（结构/原型/PRD）的单轮输出预算：65536 实测为方舟 glm 与主流
+    /// OpenAI 兼容端点接受的封顶值（与 escalatedRetryBudget 同源）。此前 32768 下
+    /// PRD 全档实测输出 25-33k 撞线截断，续写轮要把整段半成品回灌重算（多付一轮
+    /// 大额 prefill + 再等一轮生成）。max_tokens 是上限不是目标——输出自然收束时
+    /// 按实际量计费，抬高无成本；截断续写机制保留作极端长文兜底。
+    nonisolated static let artifactMaxTokens = 65536
 
     /// 是否瞬时故障：服务端过载/限流（429）与 5xx，通常几秒内自愈——
     /// 值得客户端退避重试吸收掉，而非把原始错误甩给用户。
@@ -229,7 +254,7 @@ nonisolated enum LLMClient {
     ///（保底覆盖 8192 抽取路径；封顶实测方舟 glm 与主流 OpenAI 兼容端点均接受）。
     /// 纯函数，测试直测。
     static func escalatedRetryBudget(_ maxTokens: Int) -> Int {
-        min(max(maxTokens * 2, 32768), 65536)
+        min(max(maxTokens * 2, 32768), artifactMaxTokens)
     }
 
     /// 重试等待期间的气泡状态文案（人话 + 进度）。纯函数，测试直测。
@@ -293,12 +318,14 @@ nonisolated enum LLMClient {
     ///   - messages: 对话历史（含 system prompt）
     ///   - maxTokens: 单次回复上限
     ///   - reasoningEffort: 思考强度（nil = 不发送，走服务端默认）
+    ///   - roundId: 轮次关联 id（usage/probe 归因对齐用；nil = 辅助调用无轮次）
     static func streamChat(
         stage: LLMStage,
         settings: LLMSettings,
         messages: [ChatMessage],
         maxTokens: Int = 4096,
-        reasoningEffort: String? = nil
+        reasoningEffort: String? = nil,
+        roundId: String? = nil
     ) throws -> AsyncThrowingStream<LLMDelta, Error> {
         guard let config = settings.stages[stage] else {
             throw LLMError.missingBaseURL
@@ -336,10 +363,20 @@ nonisolated enum LLMClient {
 
         return AsyncThrowingStream { continuation in
             let task = Task {
+                // 临时探针（2026-09-18）：网络侧到达节奏（见 StreamProbe 注释）
+                let probeT0 = Date()
+                let probeID = UUID().uuidString.prefix(8)
+                var probeStamps: [Double] = []
+                var probeRetries: [[String: Any]] = []
+                var probeOpenS: Double = 0
                 do {
                     let (bytes, response) = try await openStreamWithRetry(request) { code, attempt in
+                        probeRetries.append([
+                            "t": Date().timeIntervalSince(probeT0), "code": code, "attempt": attempt,
+                        ])
                         continuation.yield(.retrying(code: code, attempt: attempt))
                     }
+                    probeOpenS = Date().timeIntervalSince(probeT0)
 
                     var received = false
                     var receivedReasoning = false  // 思考分片到达（正文为零时区分失败成因）
@@ -350,6 +387,7 @@ nonisolated enum LLMClient {
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
                         guard line.hasPrefix("data:") else { continue }
+                        probeStamps.append(Date().timeIntervalSince(probeT0))
                         let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
                         if payload == "[DONE]" { break }
 
@@ -402,18 +440,54 @@ nonisolated enum LLMClient {
                     }
                     // 截断信号在用量记录前透出（消费方据此决定是否续写）
                     if truncated { continuation.yield(.truncated) }
-                    // 成功路径记一笔用量（失败/空流不记；M5 Task 5.4）
+                    // 成功路径记一笔用量（失败/空流不记；M5 Task 5.4）；
+                    // 2026-09-18 归因增强：roundId + 净耗时/首 token 延迟随记录落盘
                     CostTracker.shared.record(
                         Self.makeUsageRecord(
                             stage: stage, model: config.model, messages: messages,
-                            completionText: fullText, usage: usage
+                            completionText: fullText, usage: usage,
+                            roundId: roundId,
+                            totalS: probeStamps.last ?? 0,
+                            ttftS: probeStamps.first ?? 0
                         )
                     )
+                    // 临时探针：网络侧时间线落盘（相对请求起点的秒序列）
+                    StreamProbe.shared.append([
+                        "side": "net", "id": String(probeID),
+                        "roundId": roundId ?? "",
+                        "ts": probeT0.timeIntervalSince1970,
+                        "stage": stage.rawValue, "model": config.model,
+                        "effort": reasoningEffort ?? "", "maxTokens": maxTokens,
+                        "promptChars": messages.reduce(0) { $0 + $1.content.count },
+                        "openS": probeOpenS, "ttftS": probeStamps.first ?? 0,
+                        "totalS": probeStamps.last ?? 0, "lines": probeStamps.count,
+                        "truncated": truncated, "retries": probeRetries,
+                        "stamps": probeStamps,
+                    ])
                     continuation.finish()
                 } catch let error as URLError where error.code == .timedOut {
+                    // 临时探针：失败路径也留痕（超时是最可疑的隐形时间黑洞）
+                    StreamProbe.shared.append([
+                        "side": "net", "id": String(probeID),
+                        "roundId": roundId ?? "",
+                        "ts": probeT0.timeIntervalSince1970,
+                        "stage": stage.rawValue, "model": config.model,
+                        "error": "timeout", "openS": probeOpenS,
+                        "lines": probeStamps.count, "stamps": probeStamps,
+                        "retries": probeRetries,
+                    ])
                     // 空闲/总时长超时统一映射为明确的中文文案（⚠️ 收尾行可读）
                     continuation.finish(throwing: LLMError.streamTimeout)
                 } catch {
+                    StreamProbe.shared.append([
+                        "side": "net", "id": String(probeID),
+                        "roundId": roundId ?? "",
+                        "ts": probeT0.timeIntervalSince1970,
+                        "stage": stage.rawValue, "model": config.model,
+                        "error": String(describing: error), "openS": probeOpenS,
+                        "lines": probeStamps.count, "stamps": probeStamps,
+                        "retries": probeRetries,
+                    ])
                     continuation.finish(throwing: error)
                 }
             }
@@ -421,7 +495,17 @@ nonisolated enum LLMClient {
         }
     }
 
-    /// 非流式便捷封装（分类路由 / JSON 抽取等小请求用）。
+    /// 思考强度路由（模型路由原则）：对话/产物生成轮走 streamChat 由用户档位决定；
+    /// classify 阶段是产品内部辅助调用（要点表/记忆/方法论抽取、历史压缩摘要、
+    /// release-notes 等填表类任务），schema 与格式约束已兜底质量——默认压到 low，
+    /// 不再陪跑服务端默认 high 深度思考（思考 token 与正文同池计费，辅助调用每次
+    /// 白烧数十秒到分钟级，2026-09-18 定性）。显式 override 永远优先。
+    static func resolvedEffort(stage: LLMStage, override: String? = nil) -> String? {
+        override ?? (stage == .classify ? ThinkingEffort.low.apiValue : nil)
+    }
+
+    /// 非流式便捷封装（分类路由 / JSON 抽取等小请求用）。思考强度按
+    /// resolvedEffort(stage:) 路由（classify 默认 low）。
     /// 撞 max_tokens 截断时自动续写（MCP 无头生成原型 HTML 同样会截断），上限 2 次。
     /// 空流自动重试上限 1 次：字面空流（服务端抖动）同请求重发；思考烧满预算
     /// （reasoning 有、正文零，emptyAfterThinking）同请求重发大概率重演——
@@ -438,7 +522,7 @@ nonisolated enum LLMClient {
         var rounds = 0
         var emptyRetries = 0
         var budget = maxTokens
-        var effortOverride: String? = nil
+        var effortOverride = resolvedEffort(stage: stage)
         while true {
             var truncated = false
             let roundStart = result.count
@@ -497,7 +581,10 @@ nonisolated enum LLMClient {
         model: String,
         messages: [ChatMessage],
         completionText: String,
-        usage: StreamUsage?
+        usage: StreamUsage?,
+        roundId: String? = nil,
+        totalS: Double? = nil,
+        ttftS: Double? = nil
     ) -> UsageRecord {
         let ts = ISO8601.timestamp()
         if let usage, let prompt = usage.promptTokens, let completion = usage.completionTokens {
@@ -505,7 +592,7 @@ nonisolated enum LLMClient {
                 ts: ts, stage: stage.rawValue, model: model,
                 promptTokens: prompt, completionTokens: completion,
                 cacheHitTokens: min(usage.effectiveCacheHitTokens, prompt),
-                estimated: false
+                estimated: false, roundId: roundId, totalS: totalS, ttftS: ttftS
             )
         }
         return UsageRecord(
@@ -514,7 +601,7 @@ nonisolated enum LLMClient {
                 messages.map(\.content).joined(separator: "\n")
             ),
             completionTokens: TokenBreakdown.estimate(completionText),
-            estimated: true
+            estimated: true, roundId: roundId, totalS: totalS, ttftS: ttftS
         )
     }
 }

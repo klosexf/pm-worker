@@ -258,7 +258,8 @@ struct BacktrackDock: View {
                 }
             }
             .buttonStyle(.ds(.brand, size: .sm))
-            .disabled(store.isStreaming)
+            // 本会话口径（阶段 3）：回溯重发本会话消息，他会话的流不禁用本坞
+            .disabled(store.isSessionBusy(store.sessionId))
         }
     }
 

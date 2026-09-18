@@ -46,8 +46,8 @@ private enum SidebarModule {
 
 struct ProjectSidebar: View {
     @ObservedObject var model: AppModel
-    /// 会话流状态观察源：会话行右缘的生成指示点需要订阅 isStreaming /
-    /// streamingSessionID——SessionStore 是独立 ObservableObject 且被 AppModel
+    /// 会话流状态观察源：会话行右缘的生成指示点需要订阅 streams（per-session
+    /// 流态表）——SessionStore 是独立 ObservableObject 且被 AppModel
     /// 以 let 持有，仅观察 model 收不到其 @Published 变化。
     @ObservedObject private var store: SessionStore
 
@@ -187,49 +187,47 @@ struct ProjectSidebar: View {
                 .padding(.vertical, DS.Spacing.s8)
 
             // 任务/空间模块分段胶囊（方案 B：复用顶部模式胶囊的分段语言，
-            // 但更轻一档——无 V2 占位、计数徽章常驻，与模式胶囊拉开层级）
+            // 但更轻一档——无 V2 占位、计数徽章常驻，与模式胶囊拉开层级；
+            // 2026-09-17 呼吸感改版：段高 28、到列表起幅 16）
             moduleSegment
                 .padding(.horizontal, DS.Spacing.s12)
-                .padding(.bottom, DS.Spacing.s6)
+                .padding(.bottom, DS.Spacing.s16)
 
             // 单区视口：只显示当前模块（任务平铺 / 空间档案树）
-            List {
-                if activeModule == .tasks {
-                    ForEach(taskSessions) { session in
-                        taskRow(session: session)
-                            .listRowInsets(EdgeInsets())
-                            .listRowSeparator(.hidden)
-                    }
-                    if taskSessions.isEmpty {
-                        Text(search.isEmpty ? "暂无任务——新建任务未选项目时落在这里" : "没有匹配的任务")
+            // DSScroll + LazyVStack（2026-09-17 由 List 迁移）：List 的原生玻璃
+            // 轨道滚动条压不住（无 init 参数兜底路径），换 DSScroll 统一细胶囊
+            // edgeClearance：右缘贴栏分割条，滚动条内收让位（见 dsScrollDividerEdgeClearance）。
+            DSScroll(edgeClearance: dsScrollDividerEdgeClearance) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if activeModule == .tasks {
+                        ForEach(taskSessions) { session in
+                            taskRow(session: session)
+                        }
+                        if taskSessions.isEmpty {
+                            Text(search.isEmpty ? "暂无任务——新建任务未选项目时落在这里" : "没有匹配的任务")
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.ink300)
+                                .padding(.leading, DS.Spacing.s12)
+                                .padding(.top, DS.Spacing.s2)
+                        }
+                    } else {
+                        ForEach(Array(spaceProjects.enumerated()), id: \.element.name) { index, project in
+                            projectSection(project, index: index)
+                        }
+                        if spaceProjects.isEmpty {
+                            Text(
+                                search.isEmpty
+                                    ? "暂无项目——新建任务时选择关联项目，即可沉淀为项目空间"
+                                    : "没有匹配的项目或会话"
+                            )
                             .font(DS.Font.bodyXS)
                             .foregroundStyle(Color.ink300)
                             .padding(.leading, DS.Spacing.s12)
                             .padding(.top, DS.Spacing.s2)
-                    }
-                } else {
-                    ForEach(Array(spaceProjects.enumerated()), id: \.element.name) { index, project in
-                        projectSection(project, index: index)
-                            .listRowInsets(EdgeInsets())
-                            .listRowSeparator(.hidden)
-                    }
-                    if spaceProjects.isEmpty {
-                        Text(
-                            search.isEmpty
-                                ? "暂无项目——新建任务时选择关联项目，即可沉淀为项目空间"
-                                : "没有匹配的项目或会话"
-                        )
-                        .font(DS.Font.bodyXS)
-                        .foregroundStyle(Color.ink300)
-                        .padding(.leading, DS.Spacing.s12)
-                        .padding(.top, DS.Spacing.s2)
+                        }
                     }
                 }
             }
-            .listStyle(.sidebar)
-            // 隐藏 List 默认底色，透出外层 vibrancy
-            .scrollContentBackground(.hidden)
-            .dsScrollbar()
 
             // 底部账户区（原型 Sidebar 底部：ds-avatar 形制 + 本地优先 + MIT 开源）
             accountSection
@@ -333,7 +331,7 @@ struct ProjectSidebar: View {
     }
 
     /// 分段按钮：激活段白底浮起（与顶部模式胶囊同语言但轻一档——无 V2
-    /// 占位、26 高、计数徽章常驻；激活计数走 brand100/brandAccent）。
+    /// 占位、28 高、计数徽章常驻；激活计数走 brand100/brandAccent）。
     private func segmentButton(
         title: String, count: Int, module: SidebarModule, action: @escaping () -> Void
     ) -> some View {
@@ -351,7 +349,7 @@ struct ProjectSidebar: View {
                     .padding(.vertical, 1)
                     .background(Capsule().fill(isOn ? Color.brand100 : Color.overlayL2))
             }
-            .frame(maxWidth: .infinity, minHeight: 26)
+            .frame(maxWidth: .infinity, minHeight: 28)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.md)
                     .fill(isOn ? Color.surfaceBase : Color.clear)
@@ -407,10 +405,12 @@ struct ProjectSidebar: View {
 
     // MARK: - 功能导航（原型 NAV 六入口）
 
-    /// 导航行右缘徽章：快捷键走 .ds-kbd，文字标签走 .ds-tag。
+    /// 导航行右缘徽章：快捷键走 .ds-kbd，文字标签走 .ds-tag，
+    /// 数字胶囊 = 聚光灯待处置数（2026-09-17 钦定：知识库推荐入口）。
     private enum NavBadge {
         case kbd(String)
         case tag(String)
+        case count(Int)
     }
 
     private var navSection: some View {
@@ -436,7 +436,9 @@ struct ProjectSidebar: View {
             navRow(
                 icon: .books,
                 label: "知识库",
-                badge: nil,
+                badge: model.recommendations.isEmpty
+                    ? nil
+                    : .count(model.recommendations.count),
                 active: model.selection == .knowledgeHub
             ) {
                 model.selection = .knowledgeHub
@@ -451,7 +453,10 @@ struct ProjectSidebar: View {
                 model.selection = .decisionsPage
             }
         }
-        .padding(.horizontal, DS.Spacing.s8)
+        // 2026-09-17 导航呼吸感改版（方案 B「行高抬升」）：左缘 12 与下方
+        // 分段胶囊/分隔线对齐，顶部 6 与红绿灯行脱开
+        .padding(.horizontal, DS.Spacing.s12)
+        .padding(.top, DS.Spacing.s6)
     }
 
     private func navRow(
@@ -475,11 +480,22 @@ struct ProjectSidebar: View {
                         DSKbd(key: key)
                     case .tag(let text):
                         DSTag(title: text, variant: .neutral)
+                    case .count(let n):
+                        Text("\(n)")
+                            .font(DS.Font.mono2XS)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, DS.Spacing.s6)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(Color.brand600))
+                            .accessibilityLabel("\(n) 张待看推荐")
                     }
                 }
             }
-            .padding(.horizontal, DS.Spacing.s10)
-            .padding(.vertical, DS.Spacing.s6)
+            // 2026-09-17 导航呼吸感改版（方案 B）：垂直 6→10 行高 29→37
+            // （对齐系统侧栏 34-38 档，选中呈全高内缩胶囊），水平 10→12
+            .padding(.horizontal, DS.Spacing.s12)
+            .padding(.vertical, DS.Spacing.s10)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.lg)
                     .fill(active ? Color.overlayL2 : Color.clear)
@@ -489,16 +505,12 @@ struct ProjectSidebar: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 第一层：项目（档案块 = 分隔线 + 衬线标题行 + 子树）
+    // MARK: - 第一层：项目（档案块 = 留白分组 + 衬线标题行 + 子树；
+    //   2026-09-17 呼吸感改版：项目间分隔线退役，块距 20 由空隙承担）
 
     @ViewBuilder
     private func projectSection(_ project: ProjectNode, index: Int) -> some View {
         VStack(spacing: 0) {
-            if index > 0 {
-                DSDivider()
-                    .padding(.horizontal, DS.Spacing.s12)
-                    .padding(.vertical, DS.Spacing.s6)
-            }
             ArchiveProjectRow(
                 name: project.name,
                 isExpanded: expandedProjects.contains(project.name),
@@ -521,11 +533,16 @@ struct ProjectSidebar: View {
                 ForEach(project.versions) { version in
                     versionSection(project: project, version: version)
                 }
+                .padding(.top, DS.Spacing.s4)
             }
         }
+        // 首块起幅 8（衔接分段胶囊的 16 起幅），后续块间 20 = 留白分组
+        .padding(.top, index == 0 ? DS.Spacing.s8 : DS.Spacing.s20)
     }
 
     // MARK: - 第二层：版本 + 第三层：会话
+    //   （2026-09-17 呼吸感改版：会话组挂 1px 导轨——层级从「缩进」变「挂靠」，
+    //   版本行上距 6、版本行到会话组由会话行自身上下衬提供呼吸）
 
     @ViewBuilder
     private func versionSection(project: ProjectNode, version: VersionNode) -> some View {
@@ -551,18 +568,27 @@ struct ProjectSidebar: View {
                     )
                 }
             )
+            .padding(.top, DS.Spacing.s6)
             if expandedVersions.contains(key) {
-                ForEach(version.sessions) { session in
-                    sessionRow(project: project, version: version, session: session)
+                HStack(alignment: .top, spacing: 0) {
+                    Rectangle()
+                        .fill(Color.borderL1)
+                        .frame(width: 1)
+                    VStack(spacing: 0) {
+                        ForEach(version.sessions) { session in
+                            sessionRow(project: project, version: version, session: session)
+                        }
+                        if version.sessions.isEmpty {
+                            Text("暂无会话")
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.ink300)
+                                .padding(.leading, 26)
+                                .padding(.top, DS.Spacing.s2)
+                                .padding(.bottom, DS.Spacing.s6)
+                        }
+                    }
                 }
-                if version.sessions.isEmpty {
-                    Text("暂无会话")
-                        .font(DS.Font.bodyXS)
-                        .foregroundStyle(Color.ink300)
-                        .padding(.leading, 18)
-                        .padding(.top, DS.Spacing.s2)
-                        .padding(.bottom, DS.Spacing.s6)
-                }
+                .padding(.leading, DS.Spacing.s12)
             }
         }
     }
@@ -572,16 +598,19 @@ struct ProjectSidebar: View {
     ) -> some View {
         let isSelected = model.selection
             == .session(project: project.name, version: version.name, sessionId: session.id)
-        // 生成指示：流归属 = 该会话时行右缘亮呼吸点（流是全局单份的，
-        // streamingSessionID 钉在发起会话上，切到别的会话也能看出谁在生成）。
+        // 生成指示：该会话有流或占位进行中时行右缘亮呼吸点（流态按会话键隔离，
+        // 多会话并行生成各自点亮，互不串显）。
         // 待回复期（消息已上屏、回复未开流）同样亮点，与会话内思考占位卡同步。
-        let isGenerating = (store.isStreaming && store.streamingSessionID == session.id)
-            || (store.isPreparingReply && store.preparingSessionID == session.id)
+        let isGenerating = store.isSessionBusy(session.id)
+        let isDraft = SessionStore.isDraftSession(
+            project: project.name, version: version.name, sessionId: session.id
+        )
 
         return ArchiveSessionRow(
             title: session.title,
             isSelected: isSelected,
             isGenerating: isGenerating,
+            isDraft: isDraft,
             onTap: {
                 model.activeProject = project.name
                 model.selection = .session(
@@ -600,6 +629,16 @@ struct ProjectSidebar: View {
                     project: project.name, version: version.name,
                     sessionId: session.id, title: session.title
                 )
+            },
+            onToggleDraft: {
+                if let error = model.setSessionDraft(
+                    project: project.name, version: version.name,
+                    sessionId: session.id, isDraft: !isDraft
+                ) {
+                    model.notif = DSNotifMessage(
+                        variant: .error, title: "草稿预演切换失败", description: error
+                    )
+                }
             }
         )
     }
@@ -615,8 +654,7 @@ struct ProjectSidebar: View {
                 project: PMAgentStore.defaultProjectName, version: "unversioned",
                 sessionId: session.id
             )
-        let isGenerating = (store.isStreaming && store.streamingSessionID == session.id)
-            || (store.isPreparingReply && store.preparingSessionID == session.id)
+        let isGenerating = store.isSessionBusy(session.id)
 
         return ArchiveSessionRow(
             title: session.title,
@@ -793,6 +831,8 @@ struct ProjectSidebar: View {
 
 /// 行按钮样式：hover 轻底（overlayL1）、按下深一档（overlayL2），
 /// 选中底可配（档案方案会话行 = brandPopup 品牌紫，与全 app 选中语言统一）。
+/// 2026-09-17 呼吸感改版：行体圆角升级 lg（8）——配合行级水平内缩 8 形成
+/// 内缩胶囊选中态，不再全宽顶满。
 /// ButtonStyle 持不了 @State，hover 态由各行视图持有后以 Binding 传入。
 private struct SidebarTaskRowStyle: ButtonStyle {
     var isSelected = false
@@ -802,11 +842,11 @@ private struct SidebarTaskRowStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .background(
-                RoundedRectangle(cornerRadius: DS.Radius.md)
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
                     .fill(rowFill(pressed: configuration.isPressed))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.md)
+                RoundedRectangle(cornerRadius: DS.Radius.lg)
                     .fill(
                         Color.black.opacity(
                             configuration.isPressed && isSelected ? 0.08 : 0
@@ -855,7 +895,7 @@ private struct ArchiveProjectRow: View {
         Button(action: onTap) {
             HStack(spacing: DS.Spacing.s10) {
                 Text(name)
-                    .font(DS.Font.display2XS)
+                    .font(DS.Font.displayXS)
                     .foregroundStyle(Color.ink900)
                     .lineLimit(1)
                 Spacer(minLength: 0)
@@ -863,12 +903,14 @@ private struct ArchiveProjectRow: View {
                 ArchiveChevron(isExpanded: isExpanded)
             }
             .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s6)
+            .padding(.vertical, DS.Spacing.s8)
             .contentShape(Rectangle())
         }
         .buttonStyle(SidebarTaskRowStyle(hovered: $hovered))
+        // 行体水平内缩 8（呼吸感改版）：hover/选中底为内缩圆角胶囊
+        .padding(.horizontal, DS.Spacing.s8)
         // 「更多」挂在 Button 外层 overlay（sibling 而非嵌套），点击不触发行选中；
-        // 位于箭头左侧 = 行右 padding 12 + 箭头宽 10 + 间距 6
+        // 位于箭头左侧 = 行右 padding 12（胶囊内）+ 箭头宽 10 + 间距 6
         .overlay(alignment: .trailing) {
             moreButton
                 .padding(.trailing, DS.Spacing.s12 + DS.Spacing.s10 + DS.Spacing.s6)
@@ -970,12 +1012,14 @@ private struct ArchiveVersionRow: View {
                 ArchiveChevron(isExpanded: isExpanded)
             }
             .padding(.horizontal, DS.Spacing.s12)
-            .padding(.vertical, DS.Spacing.s4)
+            .padding(.vertical, DS.Spacing.s8)
             .contentShape(Rectangle())
         }
         .buttonStyle(SidebarTaskRowStyle(hovered: $hovered))
+        // 行体水平内缩 8（呼吸感改版）：hover/选中底为内缩圆角胶囊
+        .padding(.horizontal, DS.Spacing.s8)
         // 「更多」挂在 Button 外层 overlay（sibling 而非嵌套），点击不触发行选中；
-        // 位于箭头左侧 = 行右 padding 12 + 箭头宽 10 + 间距 6
+        // 位于箭头左侧 = 行右 padding 12（胶囊内）+ 箭头宽 10 + 间距 6
         .overlay(alignment: .trailing) {
             moreButton
                 .padding(.trailing, DS.Spacing.s12 + DS.Spacing.s10 + DS.Spacing.s6)
@@ -1039,7 +1083,9 @@ private struct ArchiveVersionRow: View {
 }
 
 /// 会话行（档案索引）：纯标题、行高 ≈32pt；
-/// 选中态 = brandPopup 品牌紫 + 左缘 2px 品牌条 + 文字提亮（不加粗）。
+/// 选中态 = brandPopup 品牌紫 + 左缘 2px 品牌条 + 文字提亮（不加粗）；
+/// 2026-09-17 呼吸感改版：行体水平内缩 8 + 圆角 lg，选中呈内缩胶囊不再顶满。
+/// 档案树中行体外再套 1px 导轨（versionSection），文本 x = 导轨 12 + 1 + 内缩 8 + 行衬 18。
 /// 右缘三个互斥装饰：最近活跃时间（任务区行，hover 让位）· 生成指示呼吸点
 /// （该会话正在生成时）·「更多」按钮（hover / 菜单展开时淡入，内含
 /// 重命名/删除菜单；任务区行多一项「转为项目」）。
@@ -1047,11 +1093,15 @@ private struct ArchiveSessionRow: View {
     let title: String
     let isSelected: Bool
     var isGenerating = false
+    /// 草稿预演会话（B1）：标题前「草稿」徽标 + 菜单切换项。
+    var isDraft = false
     /// 任务区行的右缘相对时间（「2 小时前」）；nil = 档案树行不显示。
     var time: String? = nil
     var onTap: () -> Void = {}
     var onRename: () -> Void = {}
     var onDelete: () -> Void = {}
+    /// 草稿预演切换（nil = 菜单不显示该项，如任务区会话）。
+    var onToggleDraft: (() -> Void)? = nil
     /// 任务区行专属：「转为项目」菜单项（nil = 档案树行不显示该项）。
     var onPromote: (() -> Void)? = nil
     @State private var hovered = false
@@ -1061,6 +1111,18 @@ private struct ArchiveSessionRow: View {
     var body: some View {
         Button(action: onTap) {
             HStack(spacing: 0) {
+                if isDraft {
+                    Text("草稿")
+                        .font(DS.Font.mono2XS)
+                        .foregroundStyle(Color.brand600)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.brand600.opacity(0.12))
+                        )
+                        .padding(.trailing, 5)
+                }
                 Text(title)
                     .font(DS.Font.bodySM)
                     .lineLimit(1)
@@ -1085,6 +1147,8 @@ private struct ArchiveSessionRow: View {
                 isSelected: isSelected, selectionFill: .brandPopup, hovered: $hovered
             )
         )
+        // 行体水平内缩 8（呼吸感改版）：hover/选中底为内缩圆角胶囊
+        .padding(.horizontal, DS.Spacing.s8)
         // 右缘装饰组挂在 Button 外层 overlay（sibling 而非嵌套），
         // 避免按钮套按钮的命中歧义；点击「更多」不会触发行选中。
         .overlay(alignment: .trailing) {
@@ -1148,6 +1212,16 @@ private struct ArchiveSessionRow: View {
                 ) {
                     menuOpen = false
                     onPromote()
+                }
+            }
+            if let onToggleDraft {
+                DSMenuItem(
+                    title: isDraft ? "退出草稿预演" : "转为草稿预演",
+                    icon: isDraft ? .close : .flask,
+                    titleFont: DS.Font.bodySM
+                ) {
+                    menuOpen = false
+                    onToggleDraft()
                 }
             }
             DSMenuItem(

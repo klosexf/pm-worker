@@ -42,8 +42,9 @@ final class KnowledgeTests: XCTestCase {
     // MARK: - 1. 抽取 prompt 与宽松解析
 
     func testExtractionPromptAndParse() {
-        // prompt 携带原文与 schema 约束
+        // prompt 携带原文与 schema 约束；transcript 置顶（确认链三连抽共享缓存前缀）
         let prompt = KnowledgeExtractor.extractionPrompt(transcript: "用户说：先访谈再定档")
+        XCTAssertTrue(prompt.hasPrefix("## 对话记录\n用户说：先访谈再定档"))
         XCTAssertTrue(prompt.contains("先访谈再定档"))
         XCTAssertTrue(prompt.contains("JSON"))
 
@@ -326,9 +327,45 @@ final class KnowledgeTests: XCTestCase {
         )
         XCTAssertEqual(recs.map(\.id), ["kp_3"])
 
-        // 标题派生：正文首行截 20 字
+        // 标题派生：正文首行清洗 + 句界截 32（2026-09-17 升级：不再 20 字硬切半句）
         XCTAssertEqual(Recommender.title(of: "第一行标题\n第二行"), "第一行标题")
-        XCTAssertEqual(Recommender.title(of: String(repeating: "长", count: 30)).count, 20)
+        XCTAssertEqual(Recommender.title(of: String(repeating: "长", count: 30)).count, 30)  // 30 字未超 32 上限不截
+        XCTAssertEqual(Recommender.title(of: String(repeating: "长", count: 40)).count, 32)
+        // 「定义：」引导词剥离
+        XCTAssertEqual(Recommender.title(of: "定义：KANO 需求分类"), "KANO 需求分类")
+        // 句界回退：超限长句在最近逗号处断，不硬切半句
+        let longSentence = String(repeating: "长", count: 30) + "，" + String(repeating: "尾", count: 30)
+        XCTAssertEqual(Recommender.title(of: longSentence), String(repeating: "长", count: 30))
+        // 是什么摘要：跳过标题行取正文首段
+        XCTAssertTrue(Recommender.plainSummary(of: "## 标题\n把需求分成三类再排优先级。问卷判定。").hasPrefix("把需求分成三类"))
+
+        // 详情弹层方案 B 三段解析：新卡三段多行结构逐行归段
+        let segments = Recommender.contentSegments(of:
+            "定义：方向词只是入口，不是需求。\n必须下钻确认真任务。\n做法：先复述字面诉求，再列真实任务层。\n适用边界：需求澄清阶段；核心任务确认即停。"
+        )
+        XCTAssertEqual(segments.definition, "方向词只是入口，不是需求。\n必须下钻确认真任务。")
+        XCTAssertEqual(segments.how, "先复述字面诉求，再列真实任务层。")
+        XCTAssertEqual(segments.boundary, "需求澄清阶段；核心任务确认即停。")
+
+        // 旧单行整段卡：段界标记前内联补换行后同路解析（不丢内容）
+        let inline = Recommender.contentSegments(
+            of: "定义：方向词只是入口。做法：先复述再收口。适用边界：澄清阶段。"
+        )
+        XCTAssertEqual(inline.definition, "方向词只是入口。")
+        XCTAssertEqual(inline.how, "先复述再收口。")
+        XCTAssertEqual(inline.boundary, "澄清阶段。")
+
+        // 自由卡（无任何段界标记）：首行归定义、其余归做法
+        let freeform = Recommender.contentSegments(of: "复述用户诉求后再动方案\n一次问清胜过多轮挤牙膏")
+        XCTAssertEqual(freeform.definition, "复述用户诉求后再动方案")
+        XCTAssertEqual(freeform.how, "一次问清胜过多轮挤牙膏")
+        XCTAssertNil(freeform.boundary)
+
+        // 半角冒号段界同样识别
+        let halfColon = Recommender.contentSegments(of: "定义:入口非需求\n做法:复述后收口\n适用边界:澄清期")
+        XCTAssertEqual(halfColon.definition, "入口非需求")
+        XCTAssertEqual(halfColon.how, "复述后收口")
+        XCTAssertEqual(halfColon.boundary, "澄清期")
     }
 
     // MARK: - 7. 记忆校准注入（经验按假设态标签注入）

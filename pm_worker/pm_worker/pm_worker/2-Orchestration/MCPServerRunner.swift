@@ -59,7 +59,7 @@ nonisolated enum MCPServerRunner {
                         ChatMessage(role: .system, content: systemPrompt),
                         ChatMessage(role: .user, content: userPrompt),
                     ],
-                maxTokens: 32768
+                maxTokens: LLMClient.artifactMaxTokens
             )
         }
 
@@ -446,17 +446,20 @@ nonisolated struct MCPToolHandlers {
                 )
             }
         case "generate_prototype":
-            guard Self.gatePassed(dir: dir, rel: "02-structure/confirmed.json") else {
+            // 闸口闭环 = 确认 ∨ 跳过（2026-09-17 路径选择，口径与 PipelineEngine 一致）
+            guard Self.gatePassed(dir: dir, rel: "02-structure/confirmed.json")
+                || Self.gatePassed(dir: dir, rel: "02-structure/skipped.json") else {
                 throw MCPToolError.gate(
                     "结构产物尚未确认（02-structure/confirmed.json 缺失）——"
-                        + "请先在 App 里完成②结构阶段并确认，再生成原型。"
+                        + "请先在 App 里完成②结构阶段并确认（或按路径选择跳过），再生成原型。"
                 )
             }
         case "generate_prd":
-            guard Self.gatePassed(dir: dir, rel: "03-prototypes/confirmed.json") else {
+            guard Self.gatePassed(dir: dir, rel: "03-prototypes/confirmed.json")
+                || Self.gatePassed(dir: dir, rel: "03-prototypes/skipped.json") else {
                 throw MCPToolError.gate(
                     "原型产物尚未确认（03-prototypes/confirmed.json 缺失）——"
-                        + "请先在 App 里完成③原型阶段并确认，再撰写 PRD。"
+                        + "请先在 App 里完成③原型阶段并确认（或按路径选择跳过），再撰写 PRD。"
                 )
             }
         default:

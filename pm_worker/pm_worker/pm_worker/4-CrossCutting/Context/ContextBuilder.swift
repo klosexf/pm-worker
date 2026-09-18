@@ -78,7 +78,8 @@ final class ContextBuilder: ObservableObject {
     /// - skillJudge: 技能判定兜底通道（混合路由，2026-09-15 用户钦定）——本地检索
     ///   零命中时调用，入参（判定查询, 技能清单[(id, when_to_use)]），返回判出的技能名
     ///   （[] = 判定为不需要技能；nil = 通道不可用）。nil = 未接线（旧行为：零命中退锚点）
-    /// - returns: systemPrompt 已含规则/记忆/技能正文/检索四段 + 自检清单 pitfalls；历史段预算见 breakdown
+    /// - returns: systemPrompt = 骨架 + 规则层冻结段 + 自检清单 pitfalls（易变的
+    ///   记忆/技能正文/检索不在此，见 injectionText + ContextTail 尾条协议）；历史段预算见 breakdown
     func assemble(
         stage: LLMStage,
         project: String,
@@ -216,8 +217,11 @@ final class ContextBuilder: ObservableObject {
         let order: [ContextSegment] = [.history, .retrieval, .skillBodies, .memory]
         trimmed = order.filter { trimmed.contains($0) }
 
-        // ── ⑦ 注入区文本（空段省略；整体为空 → promptBuilder 收到 ""，记忆区整段不出现）
-        var sections = ["### 规则层（全局产品约束，常驻）\n\(rulesText)"]
+        // ── ⑦ 动态材料文本（空段省略；整体为空 → 无尾条）：
+        //     记忆/技能正文/检索每轮随语义命中与记忆收纳变化——不嵌入 systemPrompt
+        //     （否则其后全部对话历史的前缀缓存连坐失效），经 ContextTail 尾条协议
+        //     由 SessionStore 追加在当前用户消息之后。规则层是冻结段，不在此（见 ⑧）。
+        var sections: [String] = []
         if !memoryText.isEmpty {
             sections.append("### 记忆（版本 > 项目，新覆盖旧，不得矛盾）\n\(memoryText)")
         }
@@ -231,9 +235,13 @@ final class ContextBuilder: ObservableObject {
         }
         let injection = sections.joined(separator: "\n\n")
 
-        // ── ⑧ 完整 system prompt（promptBuilder 骨架 + 注入区）
-        //     + pitfalls 自检清单（Task 4.8：确定性路由，拼到尾部）
-        var systemPrompt = promptBuilder(injection)
+        // ── ⑧ 完整 system prompt（promptBuilder 骨架 + 规则层冻结段）
+        //     + pitfalls 自检清单（Task 4.8：确定性路由，拼到尾部）。
+        //     promptBuilder 恒收 ""——动态材料不再嵌入骨架注入位（AgentPrompts 的
+        //     injection 参数保留作直调兼容，主线恒空）；规则层静态常驻，留冻结段
+        //     （约束权威性 + 跨轮次字节级一致的可缓存前缀）。
+        var systemPrompt = promptBuilder("")
+        systemPrompt += "\n\n### 规则层（全局产品约束，常驻）\n\(rulesText)"
         let pitfalls = Self.stagePitfalls(stage: stage, database: database)
         if !pitfalls.isEmpty {
             let lines = pitfalls.map { "- [\($0.skill)] \($0.pitfall)" }
@@ -258,6 +266,7 @@ final class ContextBuilder: ObservableObject {
                 trimmed: trimmed
             ),
             retrieval: retriever == nil ? nil : trace,
+            injectionText: injection,
             injectedSkillBodies: skillBlocks.map { "\($0.id)：\n\($0.body)" },
             calibration: calibration,
             pitfalls: pitfalls,

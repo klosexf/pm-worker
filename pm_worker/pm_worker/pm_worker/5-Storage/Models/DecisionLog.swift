@@ -30,6 +30,16 @@ nonisolated enum OwnershipTag: String {
     }
 }
 
+/// 系统记账决策类别（区别于话题讨论决策）：风险应对 / 风险解除 / 变更池毕业。
+/// 这些是业务流程触发的确定性记账，不经历话题讨论，因此天然无 topic /
+/// userAsk / turningPoints——渲染层按此出「记账卡」，而非降级成「历史格式」。
+nonisolated enum LedgerKind: String {
+    case riskMitigation = "风险应对"
+    case riskResolution = "风险解除"
+    case toNextVersion = "纳入后续版本"
+    case routeSelection = "路径选择"
+}
+
 /// 决策条目：决策 / WHY / 排除方案 / 置信度 / 待验证 五字段缺一不可。
 nonisolated struct DecisionRecord: Codable, Equatable {
     var id: String
@@ -51,6 +61,16 @@ nonisolated struct DecisionRecord: Codable, Equatable {
     /// 可选存储：合成 Codable 用 decodeIfPresent——旧行无此键不炸解码
     /// （非可选数组会严格 decode 导致历史行被静默丢弃）。
     var turningPoints: [TurningPoint]?
+    /// 结论依据（可选富化）：支撑数据 / 核心逻辑链路 / 参考事实或案例三槽。
+    /// 历史行无此键 → 解码 nil，渲染降级为仅 why 一行。
+    var basis: DecisionBasis?
+    /// 取代的旧否决（可选，2026-09-18 supersedes 协议）：形如 ["d_xxx#0"]——
+    /// 决策 id + 被推翻否决的序号。本决策推翻历史决策的某条否决（典型：当初
+    /// 临时否决注明「需验证」，后续裁决翻转）时由 LLM 在 decision 块回填。
+    /// 注入层（rejectionsInjection / supersedableRejections）跳过被取代条目
+    /// （生效视图），决策档案渲染保留全量历史（路过视图）。append-only 不改写
+    /// 旧行，取代关系由新行携带。历史行无此键 → 解码 nil。
+    var supersedes: [String]?
     var createdAt: String
 
     init(
@@ -65,6 +85,8 @@ nonisolated struct DecisionRecord: Codable, Equatable {
         topic: String? = nil,
         userAsk: String? = nil,
         turningPoints: [TurningPoint]? = nil,
+        basis: DecisionBasis? = nil,
+        supersedes: [String]? = nil,
         createdAt: String = ISO8601.timestamp()
     ) {
         self.id = id
@@ -78,11 +100,24 @@ nonisolated struct DecisionRecord: Codable, Equatable {
         self.topic = topic
         self.userAsk = userAsk
         self.turningPoints = turningPoints
+        self.basis = basis
+        self.supersedes = supersedes
         self.createdAt = createdAt
     }
 
     /// 是否为富话题记录（决定档案渲染形态）。
     var isTopicEnriched: Bool { !(topic ?? "").isEmpty }
+
+    /// 系统记账判别：决策文本命中确定性写入前缀 → 对应记账类别（nil = 非记账）。
+    /// 前缀与 RiskStore.mitigationDecision / resolutionDecision、
+    /// AppModel 变更池毕业写入的 decision 首缀严格一致。
+    var ledgerKind: LedgerKind? {
+        if decision.hasPrefix("【风险应对】") { return .riskMitigation }
+        if decision.hasPrefix("【风险解除】") { return .riskResolution }
+        if decision.hasPrefix("纳入后续版本：") { return .toNextVersion }
+        if decision.hasPrefix("【路径选择】") { return .routeSelection }
+        return nil
+    }
 }
 
 nonisolated struct RejectedAlternative: Codable, Equatable {
@@ -113,6 +148,21 @@ nonisolated struct TurningPoint: Codable, Equatable {
     }
 
     var ownership: OwnershipTag? { owner.flatMap(OwnershipTag.init(rawValue:)) }
+}
+
+/// 结论依据（2026-09-17 富化）：话题闭合决策必填的「为什么」结构化三槽——
+/// 支撑数据 / 核心逻辑链路 / 参考事实或案例。事后回溯时看 basis 就能还原
+/// 当时为什么这么判断；缺一手数据的槽写明依据来源（行业共识/类比案例/用户原话）。
+/// 历史行无此键 → 解码 nil（合成 Codable 对可选属性用 decodeIfPresent）。
+nonisolated struct DecisionBasis: Codable, Equatable {
+    var data: String?    // 支撑数据
+    var logic: String?   // 核心逻辑链路
+    var facts: String?   // 参考的事实或案例
+
+    /// 三槽全空 = 无有效依据（渲染层据此整节省略）。
+    var isEmpty: Bool {
+        (data ?? "").isEmpty && (logic ?? "").isEmpty && (facts ?? "").isEmpty
+    }
 }
 
 /// 💀 命中回写条目：风险触发信号被结算时自动 append。

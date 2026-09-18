@@ -20,11 +20,12 @@ struct InspectorPanel: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
 
+    // 知识点 Tab 已移除（2026-09-17 钦定）：语义检索收口到左栏知识库整页，
+    // 右栏回归「会话伴随上下文」三 Tab（文件 / 决策日志 / 风险）
     enum InspectorTab: String, CaseIterable, Identifiable {
         case artifacts = "文件"
         case decisions = "决策日志"
         case radar = "风险"
-        case knowledge = "知识点"
 
         var id: String { rawValue }
     }
@@ -39,7 +40,6 @@ struct InspectorPanel: View {
                         DSTabItem(InspectorTab.artifacts, InspectorTab.artifacts.rawValue),
                         DSTabItem(InspectorTab.decisions, InspectorTab.decisions.rawValue),
                         DSTabItem(InspectorTab.radar, InspectorTab.radar.rawValue),
-                        DSTabItem(InspectorTab.knowledge, InspectorTab.knowledge.rawValue),
                     ],
                     selection: $model.inspectorTab
                 )
@@ -63,8 +63,6 @@ struct InspectorPanel: View {
                     DecisionLogTab()
                 case .radar:
                     RiskLedgerTab()
-                case .knowledge:
-                    KnowledgeTab()
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -266,6 +264,18 @@ struct ArtifactsPanelView: View {
                         onAddToConversation: { entry in
                             // 「添加到对话」：把引用排队给输入坞（ConversationView 消费）
                             model.requestAddFileReference(relativePath: entry.relativePath)
+                        },
+                        canPromoteToMaster: { entry in
+                            // 阶段 4 台账选主：非主槽位原型槽位文件才显示；
+                            // 版本 busy（流/待回复进行中）时隐藏——流完成会写原型
+                            // 槽位，此刻选主会与落盘竞态（AppModel 侧另有兜底拦截）。
+                            AppModel.isPromotablePrototypePath(entry.relativePath)
+                                && !model.sessionStore.isVersionBusy(
+                                    project: project, version: version
+                                )
+                        },
+                        onSelectAsMaster: { entry in
+                            model.setAsMasterPrototype(relativePath: entry.relativePath)
                         }
                     )
                 }

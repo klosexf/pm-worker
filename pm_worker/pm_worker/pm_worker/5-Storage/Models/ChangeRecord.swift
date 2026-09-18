@@ -40,6 +40,16 @@ nonisolated struct ChangeProposalRecord: Codable, Equatable {
     /// 登记时的检查点阶段（PipelineRun.Stage rawValue）。
     var checkpointStage: String
     var createdAt: String
+    // MARK: 草稿预演扩展（B1，可选字段——旧行无这些键，解码兼容）
+    /// 提案种类：nil = 普通变更提案；"stage_draft" = 草稿预演推进提案
+    ///（产物在提案目录，合并动作 = 复制入主线 + 主线状态机推进）。
+    var kind: String?
+    /// 草稿预演所属会话（提案目录按它分槽：05-artifacts/proposals/<sessionId>/）。
+    var draftSessionId: String?
+    /// 草稿预演已推进到的阶段（PipelineRun.Stage rawValue）。
+    var draftStage: String?
+
+    var isStageDraft: Bool { kind == "stage_draft" }
 
     init(
         id: String = IDGenerator.next("chg"),
@@ -50,7 +60,10 @@ nonisolated struct ChangeProposalRecord: Codable, Equatable {
         instruction: String? = nil,
         impacts: [String]? = nil,
         checkpointStage: String,
-        createdAt: String = ISO8601.timestamp()
+        createdAt: String = ISO8601.timestamp(),
+        kind: String? = nil,
+        draftSessionId: String? = nil,
+        draftStage: String? = nil
     ) {
         self.id = id
         self.idea = idea
@@ -61,6 +74,9 @@ nonisolated struct ChangeProposalRecord: Codable, Equatable {
         self.impacts = impacts
         self.checkpointStage = checkpointStage
         self.createdAt = createdAt
+        self.kind = kind
+        self.draftSessionId = draftSessionId
+        self.draftStage = draftStage
     }
 }
 
@@ -161,8 +177,13 @@ nonisolated enum ChangeLedger {
     }
 
     /// append 失败静默（台账缺行只丢状态不留痕，不阻塞主流程）。
+    /// 锁约定：与其他 jsonl 写入器一致持 PMAgentStore.ioLock，段内经
+    /// appendLineLocked 落行（本函数无存在性检查，持锁段即单次追加，
+    /// 勿在持锁段内再调会自行加锁的 appendLine）。
     static func append(_ entry: ChangeLogEntry, project: String, version: String) {
-        try? PMAgentStore.appendLine(entry, to: url(project: project, version: version))
+        PMAgentStore.ioLock.lock()
+        defer { PMAgentStore.ioLock.unlock() }
+        try? PMAgentStore.appendLineLocked(entry, to: url(project: project, version: version))
     }
 
     /// 提案 id → 处置结果（提案卡渲染已处置态用）。

@@ -25,11 +25,31 @@ nonisolated struct ThinkData: Codable, Equatable {
     var dur: Int
     var steps: [Step]
 
-    /// 摘要行：「思考了 Ns · M 步 · <技能>」。技能 ≤2 个直接点名（明确显示所应用
-    /// 技能名，折叠态即可见），≥3 收敛为「技能 ×K」防摘要行过长。
+    /// 知识引用（2026-09-17 钦定：系统层「参考知识卡」）——本轮 Context Builder
+    /// 注入的卡命中（id → 标题），回答气泡底部渲染引用条；默认空兼容旧行。
+    var knowledgeRefs: [String: String]? = nil
+    /// reasoning 原文全文（2026-09-18 思考展示升级）：完成态展开可回看全文，不再
+    /// 只留截断步骤。合成 Codable 对 optional 走 decodeIfPresent/encodeIfPresent——
+    /// 旧存量行缺 key 解码为 nil、nil 不写盘，双向兼容。
+    var full: String? = nil
+    /// 确认链跳转历史（2026-09-18 持久化）：链式回合的阶段跳标签（如「正在抽取
+    /// 澄清要点表…」→「正在沉淀记忆与方法论…」→「正在生成结构产物…」）。进行中
+    /// 时间线随流收起，这里保留全程打勾痕迹——单跳/双跳链（②③闸口）在流式期
+    /// 无打勾行，完成态展开恒可见。普通聊天轮无链 → nil。
+    var phaseTrail: [String]? = nil
+
+    /// 摘要行：「「收束句」 · 思考了 Ns · <技能>」（2026-09-18 内容化改版：折叠行
+    /// 以推理尾部收束句开头——那才是最有信息量的部分；原「M 步」计数是行数+
+    /// 技能数的虚标，移除）。技能 ≤2 个直接点名（折叠态即可见所应用技能名），
+    /// ≥3 收敛为「技能 ×K」防摘要行过长；纯技能无推理时退化为元信息行。
     var summary: String {
         let skillNames = steps.compactMap(\.skill)
-        var parts = ["思考了 \(dur)s · \(steps.count) 步"]
+        var parts: [String] = []
+        if let closing = steps.last(where: { $0.text != nil })?.text {
+            let headline = closing.count > 48 ? String(closing.prefix(48)) + "…" : closing
+            parts.append("「\(headline)」")
+        }
+        parts.append("思考了 \(dur)s")
         switch skillNames.count {
         case 1: parts.append(skillNames[0])
         case 2: parts.append(skillNames.joined(separator: "、"))
@@ -39,24 +59,46 @@ nonisolated struct ThinkData: Codable, Equatable {
         return parts.joined(separator: " · ")
     }
 
-    /// 从 reasoning 原文构造（按行拆步骤；截断超长行，保留可解释性不泄露全文）。
-    /// skills：本轮实际注入的技能 id（Context Builder 命中：语义命中 + 阶段核心
-    /// 确定性注入）——作为技能步骤置于推理步骤之前，摘要行随之点名。
-    static func from(reasoning: String, duration: Int, skills: [String] = []) -> ThinkData? {
+    /// 从 reasoning 原文构造（按行拆步骤；截断超长行，保留可解释性不泄露全文；
+    /// 全文随 full 字段持久化，展开可回看）。skills：本轮实际注入的技能 id
+    /// （Context Builder 命中：语义命中 + 阶段核心确定性注入）——作为技能步骤
+    /// 置于推理步骤之前，摘要行随之点名。
+    /// knowledgeRefs：本轮注入的知识卡命中（id→标题），气泡底部引用条数据源。
+    static func from(
+        reasoning: String, duration: Int, skills: [String] = [],
+        knowledgeRefs: [String: String]? = nil,
+        phaseTrail: [String]? = nil
+    ) -> ThinkData? {
         let lines = reasoning
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        // 步骤上限 12 条，单条截 200 字——结论级信任，非全文
-        let reasoningSteps = lines.prefix(12).map { line in
+        // 折叠摘要：上限 12 条、单条截 200 字——结论级信任，全文走 full 字段。
+        // 2026-09-18 尾部优先：reasoning 头部通常是复述任务、尾部才是收束决策，
+        // 超限时保留首 2 条（任务锚定）+ 省略提示行 + 末 10 条（收束）。
+        let step: (String) -> Step = { line in
             Step(text: String(line.prefix(200)), skill: nil, detail: nil, dur: nil)
         }
+        let reasoningLines: [String]
+        if lines.count > 12 {
+            reasoningLines = Array(lines.prefix(2))
+                + ["（中间省略 \(lines.count - 12) 条，展开可看全文）"]
+                + Array(lines.suffix(10))
+        } else {
+            reasoningLines = lines
+        }
+        let reasoningSteps = reasoningLines.map(step)
         let skillSteps = skills.map { skill in
             Step(text: nil, skill: skill, detail: "已注入本轮提示词上下文", dur: nil)
         }
         let steps = skillSteps + reasoningSteps
-        guard !steps.isEmpty else { return nil }
-        return ThinkData(dur: duration, steps: steps)
+        // 无推理无技能但有知识引用时也要构造（引用条是气泡底部的独立信息层）
+        guard !steps.isEmpty || knowledgeRefs?.isEmpty == false else { return nil }
+        return ThinkData(
+            dur: duration, steps: steps, knowledgeRefs: knowledgeRefs,
+            full: reasoning.isEmpty ? nil : reasoning,
+            phaseTrail: (phaseTrail?.isEmpty == false) ? phaseTrail : nil
+        )
     }
 }
 
@@ -107,9 +149,9 @@ nonisolated struct MilestoneDim: Codable, Equatable {
 nonisolated struct CompactionData: Codable, Equatable {
     /// 摘要全文（程序恢复用；content 是注记头 + 摘要的 UI/Finder 可读形态）。
     var summary: String
-    /// 本条摘要覆盖的被丢轮边界签名（恢复 compactBoundary 用）。
+    /// 本条摘要覆盖的被丢轮边界签名（恢复压缩缓存 boundary 用）。
     var boundary: String
-    /// 被丢条目数（恢复 compactSummarizedCount 用）。
+    /// 被丢条目数（恢复压缩缓存 count 用）。
     var droppedCount: Int
     /// 压缩前上下文 token 估算（审计）。
     var tokensBefore: Int
@@ -144,6 +186,10 @@ nonisolated struct DiscussionEntry: Codable, Equatable, Identifiable {
     var compaction: CompactionData?
     /// 变更提案载荷（role == .system 提案行携带，渲染为变更提案卡；处置状态查 changes.jsonl）。
     var changeProposal: ChangeProposalRecord?
+    /// 静默事件行（role == .system 且为 true）：照常落盘（审计/回放/链式判定数据源），
+    /// 但 UI 不渲染——其语义已由当轮 AI 回答的开场承接句承载（快速通道受理 / 跨门
+    /// 风险提醒 / 阶段推进确认三类，2026-09-17 钦定「系统行融合进 AI 回答」）。
+    var silent: Bool?
     var createdAt: String
 
     init(
@@ -159,6 +205,7 @@ nonisolated struct DiscussionEntry: Codable, Equatable, Identifiable {
         milestones: [MilestoneStamp]? = nil,
         compaction: CompactionData? = nil,
         changeProposal: ChangeProposalRecord? = nil,
+        silent: Bool? = nil,
         createdAt: String
     ) {
         self.id = id
@@ -173,12 +220,20 @@ nonisolated struct DiscussionEntry: Codable, Equatable, Identifiable {
         self.milestones = milestones
         self.compaction = compaction
         self.changeProposal = changeProposal
+        self.silent = silent
         self.createdAt = createdAt
     }
 
-    // Codable 兼容旧存量（无 images / files / fileChanges / milestones / compaction / changeProposal 字段的 discussions.jsonl）
+    /// 静默行判据（displayItems 过滤 + 合并行走排除共用）。
+    /// 旧存量「⚡ 已排队」排队提示行（2026-09-18 停止发射）按静默处理：
+    /// 落盘留痕不变，UI 不再渲染。
+    var isSilent: Bool {
+        silent == true || (role == .system && content.hasPrefix("⚡ 已排队"))
+    }
+
+    // Codable 兼容旧存量（无 images / files / fileChanges / milestones / compaction / changeProposal / silent 字段的 discussions.jsonl）
     private enum CodingKeys: String, CodingKey {
-        case id, sessionId, role, content, think, memory, images, files, fileChanges, milestones, compaction, changeProposal, createdAt
+        case id, sessionId, role, content, think, memory, images, files, fileChanges, milestones, compaction, changeProposal, silent, createdAt
     }
 
     init(from decoder: Decoder) throws {
@@ -195,6 +250,7 @@ nonisolated struct DiscussionEntry: Codable, Equatable, Identifiable {
         milestones = try c.decodeIfPresent([MilestoneStamp].self, forKey: .milestones)
         compaction = try c.decodeIfPresent(CompactionData.self, forKey: .compaction)
         changeProposal = try c.decodeIfPresent(ChangeProposalRecord.self, forKey: .changeProposal)
+        silent = try c.decodeIfPresent(Bool.self, forKey: .silent)
         createdAt = try c.decode(String.self, forKey: .createdAt)
     }
 }
@@ -212,18 +268,9 @@ nonisolated enum ReferencedFileMaterial {
     /// 单轮最多注入正文的文件数（超出只标注路径，不注入正文）。
     static let maxFiles = 8
 
-    /// system prompt 尾部追加引用文件段（无引用 → 原样返回，零开销）。
-    static func augment(
-        systemPrompt: String, refs: [String], project: String, version: String
-    ) -> String {
-        guard let section = section(refs: refs, project: project, version: version) else {
-            return systemPrompt
-        }
-        return systemPrompt + "\n\n" + section
-    }
-
     /// 注入段全文（refs 全空 → nil）。路径去重保序；读取失败逐条标注，
     /// 让模型能如实告知用户「这个文件读不到」，而不是含糊搪塞。
+    /// 消费点 = 动态材料尾条（前缀缓存改造后不再追加 system prompt）。
     static func section(refs: [String], project: String, version: String) -> String? {
         let paths = deduped(refs)
         guard !paths.isEmpty else { return nil }
@@ -329,6 +376,28 @@ nonisolated enum ReferencedFileMaterial {
     }
 }
 
+// MARK: - 动态材料尾条（前缀缓存改造，ContextTail 协议的发送侧）
+
+/// 尾条组装辅助（nonisolated：纯值变换，测试直测）。
+nonisolated enum VolatileTailMaterial {
+    /// 尾条消息全文：user 角色 + 自述头——非用户新发言，模型须遵守其中约束
+    /// （记忆新覆盖旧）并回答上一条用户消息。头部措辞承接 injectionSection
+    /// 原有的「回答不得与下列内容矛盾」约束语义。
+    static func message(_ tail: String) -> String {
+        "【动态材料 · 系统注入】以下是本轮动态装配的材料（记忆/技能/检索参考/引用文件正文/阶段状态），"
+            + "不是用户新发言；请遵守其中约束作答，记忆条目新覆盖旧，回答不得与下列内容矛盾。\n\n"
+            + tail
+    }
+
+    /// 追加尾条到历史末尾（当前用户消息之后）：[system 冻结][历史 append-only]
+    /// [当前 user][动态材料]——前缀缓存的可命中区止于动态材料之前。
+    /// tail 为空原样返回（无标记轮次不产生多余消息）。
+    static func appending(_ history: [ChatMessage], tail: String) -> [ChatMessage] {
+        guard !tail.isEmpty else { return history }
+        return history + [ChatMessage(role: .user, content: message(tail))]
+    }
+}
+
 /// 会话投影：从 discussions.jsonl 分组而来，不单独落盘。
 nonisolated struct SessionSummary: Identifiable, Equatable {
     var id: String  // sessionId
@@ -355,6 +424,114 @@ nonisolated struct StreamPublishThrottle {
     }
 }
 
+/// 阶段时间线单跳（2026-09-18 确认链多跳进度）：确认链/生成链的每段阶段文案
+/// 依次入轨，前置跳标 done（UI 打勾），当前跳未 done（呼吸点 + 流光）。
+nonisolated struct PhaseStep: Equatable {
+    var label: String
+    var done: Bool
+}
+
+/// 单会话流态快照（阶段 1 流态扇出）：per-session 键值的值类型，字段与旧全局
+/// 单流同名位一一对应。跨隔离传递用显式 nonisolated（工程默认 MainActor 隔离）。
+nonisolated struct StreamState: Equatable {
+    var isStreaming = false
+    var isPreparing = false
+    /// 展示正文：发布点经 StreamDisplayPayload.make(full:) 算出——完整产物块
+    /// 已剥离、进行中块已裁除，只剩块间正文（不再是全文原样）。
+    var text = ""
+    var think = ""
+    var skills: [String] = []
+    /// 阶段时间线（DSH 左脊时间线轻量版）：原 phase 单行文案升级为多跳轨迹——
+    /// 确认链「要点表 → 记忆 → 方法论 → 生成」逐跳入轨，长等待显性化为可见进度。
+    var phaseTrail: [PhaseStep] = []
+    var retry: String?
+    var startedAt: Date?
+    /// 结构化产物事实（与展示文本解耦，见 StreamDisplayPayload）：
+    /// 完整块列表 + 进行中块名/行数——流式进度卡与块卡的渲染依据。
+    var artifactBlocks: [ArtifactParser.ArtifactBlock] = []
+    var inProgressName = ""
+    var inProgressLines = 0
+}
+
+/// 流式盒（2026-09-18 吞吐修复，探针实证）：per-session ObservableObject。
+/// 流式增量只触碰盒自身 objectWillChange，订阅者只有流式气泡子视图——
+/// 对话页等大视图不再随每个 delta 整页重渲染（修复前：3103 次发布 × ~0.3s
+/// 整页重渲染吃满 MainActor，883s 轮网络侧仅 45.5s）。
+@MainActor
+final class StreamBox: ObservableObject {
+    @Published var value: StreamState
+    init(_ value: StreamState = StreamState()) { self.value = value }
+    // 铁律：@MainActor ObservableObject 在流收尾/空态剪枝时被销毁，
+    // 必须退出隔离销毁路径，否则 isolated-deinit 触发 malloc 崩溃（同 PipelineEngine）。
+    nonisolated deinit {}
+}
+
+/// 流式发布尾窗（2026-09-18 吞吐修复，探针实证）：流式态 UI 只拿字符串尾部，
+/// 流式气泡的 Text 布局成本常数化（61k 字符全量逐次重排曾拖垮消费循环）。
+/// 全量语义不变：streamReply 的本地 full/reasoning 持续累积，落盘 / 续写 /
+/// 停止收尾 / 终值补发一律全量。
+enum StreamPublishTail {
+    /// 正文尾窗：保底可视上下文（流式气泡自动吸底，视野集中在尾部）。
+    static let textChars = 12000
+    /// 思考尾窗：思考卡本就是流式预览（全文随完成卡落盘）。
+    static let thinkChars = 4000
+    /// 实时思考流尾窗（展开态 liveReasoning 渲染量）：280pt 限高 ≈ 十几行可视量。
+    /// 2026-09-18 复测钉死：正文阶段满速 4186 delta/s、思考阶段仅 17.8/s——
+    /// 时间全耗在展开态每次发布重排 4000 字符 + 底部锚定滚动（~200ms × 1268 次）。
+    static let liveThinkChars = 900
+
+    static func clip(_ source: String, limit: Int) -> String {
+        guard source.count > limit else { return source }
+        return String(source.suffix(limit))
+    }
+}
+
+/// 流式正文展示载荷（2026-09-18 进度卡回归修复）：识别事实在发布点用**全量
+/// full** 计算、结构化下发，与展示文本彻底解耦——此前「尾窗裁剪 + 拼回开栏」
+/// 被实测打穿（四反引号 prd 块内嵌 ``` 围栏把拼回的三反引号开栏误判闭合、
+/// 多块场景 radar 开栏在窗内但不收卡），根因是展示文本被裁剪后识别标记不可靠。
+nonisolated struct StreamDisplayPayload: Equatable {
+    /// 剥离完整产物块、裁掉进行中块之后的块间正文（已保尾裁剪）。
+    var display = ""
+    /// 已闭合的完整产物块（流式 ArtifactBlocksSection 渲染源）。
+    var blocks: [ArtifactParser.ArtifactBlock] = []
+    /// 进行中（未闭合）产物块名；空 = 无。
+    var inProgressName = ""
+    /// 进行中块已生成行数（全量口径，修复前从尾窗计虚低）。
+    var inProgressLines = 0
+
+    /// 全量 full → 展示载荷。发布点每次 text 发布调用（解析 ~1ms 级 ×
+    /// 0.1s 节流，MainActor 占比 <5%，探针实证正文阶段本就满速）。
+    static func make(full rawFull: String) -> StreamDisplayPayload {
+        var payload = StreamDisplayPayload()
+        // 占位模仿残留清洗先于解析（模型照抄的系统标注行不进气泡，与旧视图层口径一致）
+        let full = ArtifactParser.scrubImitatedPlaceholders(in: rawFull)
+        let blocks = ArtifactParser.parseArtifactBlocks(in: full)
+        payload.blocks = blocks
+        let incomplete = ArtifactParser.parseIncompleteArtifact(in: full)
+        payload.inProgressName = incomplete?.name ?? ""
+        if let partial = incomplete?.partial {
+            payload.inProgressLines =
+                partial.split(separator: "\n", omittingEmptySubsequences: false).count
+        }
+        var display = blocks.isEmpty
+            ? full
+            : ArtifactParser.stripArtifactBlocks(in: full, placeholderFor: { _ in "" })
+        if incomplete != nil, let marker = display.range(of: "```artifact:", options: .backwards) {
+            // 开栏可能是更长反引号（````artifact:），前缀反引号一并裁掉
+            var cutStart = marker.lowerBound
+            while cutStart > display.startIndex,
+                  display[display.index(before: cutStart)] == "`" {
+                cutStart = display.index(before: cutStart)
+            }
+            display = String(display[..<cutStart])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        payload.display = StreamPublishTail.clip(display, limit: StreamPublishTail.textChars)
+        return payload
+    }
+}
+
 /// 会话运行时：读侧投影 + 写侧 append-then-verify。
 @MainActor
 final class SessionStore: ObservableObject {
@@ -364,65 +541,140 @@ final class SessionStore: ObservableObject {
 
     /// 当前会话的消息（UI 渲染源）。
     @Published private(set) var entries: [DiscussionEntry] = []
-    /// 流式回复中的增量文本（未落盘的尾部）。
-    @Published var streamingText: String = ""
-    /// 流式思考中的增量（思考卡 spinner 数据源，未落盘）。
-    @Published var streamingThink: String = ""
-    /// 瞬时故障自动重试中的状态文案（429/5xx，LLMClient 退避等待期）；nil = 非重试态。
-    /// 流式气泡据此显示「模型服务繁忙，自动重试中…」，让等待显得有意为之。
-    @Published var streamingRetry: String?
-    /// 本轮流式回复引用的技能 id（Context Builder 命中并注入）——
-    /// 思考中态思考卡即时显示「引用技能」；流结束随 think 步骤落盘。
-    @Published var streamingSkills: [String] = []
-    /// 确认链/生成链进行中的阶段文案（如「正在抽取澄清要点表…」）；nil = 通用「正在思考…」。
-    /// 闸口确认背后是多跳串行 LLM 往返（要点表抽取/记忆与方法论沉淀/下游生成），
-    /// 占位卡据此显示当前在等哪一步——慢等待显性化，不像假死。
-    @Published var streamingPhase: String?
-    @Published private(set) var isStreaming = false
-    /// 流式回复的归属会话（nil = 无流进行）。UI 据此只在发起会话内渲染流式气泡——
-    /// 生成途中切换会话时，其他会话不得显示同一份生成内容。
-    @Published private(set) var streamingSessionID: String?
 
-    /// 本轮流式回复的起始时刻（nil = 无流）：交接条（值班单）实时计时数据源。
-    /// 与 isStreaming / streamingSessionID 同生命周期翻转。
-    @Published private(set) var streamingStartedAt: Date?
+    // MARK: - 多会话流态（阶段 1 流态扇出：全局单流 → per-session 并行流）
 
-    /// 用户消息已上屏、回复流尚未开启（提示词组装 / 历史压缩等前置网络往返期间）
-    /// 的「待回复」态：UI 与流式气泡同位渲染思考占位卡——发送瞬间即见「正在思考」，
-    /// 不必等首个网络往返才出现。开流（streamReply）即转正为流式态。
-    @Published private(set) var isPreparingReply = false
-    /// 待回复态归属会话（与 streamingSessionID 同语义：只在该会话渲染占位气泡，
-    /// 生成途中切会话不得显示同一份占位）。
-    @Published private(set) var preparingSessionID: String?
-
-    /// 发送链路乐观置位（幂等）：流式或待回复进行中不动，防覆盖归属会话。
-    func beginPreparingReply(sessionID: String) {
-        guard !isStreaming, !isPreparingReply else { return }
-        isPreparingReply = true
-        preparingSessionID = sessionID
-    }
-
-    /// 清除待回复态（开流转正 / 停止 / 错误 / 闸口早退路径统一收口）。
-    func endPreparingReply() {
-        isPreparingReply = false
-        preparingSessionID = nil
-    }
-
-    // MARK: - Steering / Follow-up 双队列（P3，借鉴 pi-agent-core）
-
-    /// 插话队列：流式期间收到，在截断续写边界注入当前回复上下文；
-    /// 流正常结束前未注入 → 全部转入 followUpQueue 自动续发。
+    /// 单会话流态盒表（key = sessionId）：取代旧 [String: StreamState] 值字典
+    /// （2026-09-18 吞吐修复，探针实证）。key 存在即「有内容」（流式 / 待回复 /
+    /// 增量 / 重试与阶段文案任一非空），全空即移除（空态不留键）。**流式增量只
+    /// 触碰盒自身 objectWillChange，不经过本表**——本表仅在成员增删（开流/收流/
+    /// 占位起止）时发布，对话页等大视图不再随每个 delta 整页重渲染。
+    /// 并发流互不污染；外部读点经 currentStream（本会话口径）/ isStreaming
+    /// （全局资源闸口径）/ isSessionBusy（归属判据）。
+    @Published private(set) var streamBoxes: [String: StreamBox] = [:]
+    /// 流态快照（兼容读点）：测试断言与一次性布尔判读用，每键取盒内当前值。
+    /// **流式增量不经过此快照**——依赖逐 delta 更新的读点必须订阅 StreamBox，
+    /// 读快照只会在成员增删时看到新值（流中恒为上次快照）。
+    var streams: [String: StreamState] { streamBoxes.mapValues { $0.value } }
+    /// 单会话插话队列（key = sessionId）：流式期间收到，在截断续写边界注入该会话
+    /// 当前回复上下文；流正常结束前未注入 → 转入该会话 followUpQueues 自动续发。
     /// 排队期不落盘（仅 UI 显示排队气泡），注入生效时随 appendPinned 落盘。
-    @Published private(set) var steeringQueue: [DiscussionEntry] = []
-    /// 结束后队列：本轮流式收尾后逐条作为新输入自动续发（走完整 send 链路）。
-    @Published private(set) var followUpQueue: [DiscussionEntry] = []
+    @Published private(set) var steeringQueues: [String: [DiscussionEntry]] = [:]
+    /// 单会话结束后队列（key = sessionId）：该轮流式收尾后逐条作为新输入自动续发。
+    @Published private(set) var followUpQueues: [String: [DiscussionEntry]] = [:]
 
-    /// 流式期间（含待回复期）插话（AppModel.sendMessage 分流入口；调用方保证在发起会话内）：
-    /// 入队即返回，不打断当前生成；待回复期入队的插话在流开启的首个边界统一注入。
-    /// 空闲时调用是 no-op。
+    /// 任意会话有流进行中（全局口径，阶段 3 后仅存兼容读点）：流态扇出后
+    /// 业务判据已迁 isSessionBusy（会话归属）/ isVersionBusy（版本归属），
+    /// 保留供测试与全局观测（侧栏总闸类读点）。
+    var isStreaming: Bool { streamBoxes.values.contains { $0.value.isStreaming } }
+    /// 任意会话有待回复占位（全局口径，同 isStreaming）。
+    var isPreparingReply: Bool { streamBoxes.values.contains { $0.value.isPreparing } }
+    /// 当前打开会话的流态快照（nil = 本会话无流/占位）：UI 本会话口径读点统一入口。
+    var currentStream: StreamState? { streamBoxes[sessionId]?.value }
+    /// 当前会话的插话队列（排队气泡数据源）。
+    var currentSteeringQueue: [DiscussionEntry] { steeringQueues[sessionId] ?? [] }
+    /// 当前会话的结束后队列。
+    var currentFollowUpQueue: [DiscussionEntry] { followUpQueues[sessionId] ?? [] }
+
+    /// 指定会话是否有流式回复或待回复占位进行中（per-session 归属判据统一入口：
+    /// 流式/排队气泡渲染、侧栏生成指示点、插话分流）。
+    func isSessionBusy(_ sessionID: String) -> Bool {
+        guard let box = streamBoxes[sessionID] else { return false }
+        return box.value.isStreaming || box.value.isPreparing
+    }
+
+    // MARK: 版本级 busy 判据（阶段 3）：流 → 发起上下文登记表
+
+    /// 活动流会话 → 发起上下文（sessionId → (project, version)）：isVersionBusy /
+    /// isProjectBusy 的数据源。与 streams 键**同生命周期**——开流/占位置位点登记
+    /// （performSend / performSendSystemTurn / 乐观置位），键清理点一并注销
+    /// （mutateStream 空态剪枝 / streamReply defer / stopGeneration），防泄漏。
+    /// 非 @Published：每次登记/注销都与同一轮 streams 变更同帧发生，UI 经
+    /// streams 的 objectWillChange 自然重估 isVersionBusy 读点。
+    private var streamContexts: [String: (project: String, version: String)] = [:]
+
+    /// 开流/占位置位时登记发起上下文（内部通道，与 beginPreparingReply /
+    /// mutateStream(isStreaming:) 置位点成对调用）。
+    private func registerStreamContext(_ origin: StreamOrigin) {
+        streamContexts[origin.sessionId] = (project: origin.project, version: origin.version)
+    }
+
+    /// 指定版本是否有流式回复或待回复占位进行中（版本级 busy 判据，阶段 3）：
+    /// 结构锁（删除/改名/移动等 discussions.jsonl 整文件重写与版本目录操作）、
+    /// 确认坞/风险闸等版本闸口动作只被「目标版本自身的流」拦截——他会话
+    /// 他版本的并发流不再挡路（B 会话的流不锁死 A 会话的交互）。
+    func isVersionBusy(project: String, version: String) -> Bool {
+        streamContexts.contains { sessionID, ctx in
+            ctx.project == project && ctx.version == version && isSessionBusy(sessionID)
+        }
+    }
+
+    /// 指定项目的任一版本是否有流进行中（项目级结构锁：整目录改名/删除
+    /// 影响该项目全部版本的 jsonl，任一版本流中都要拦）。
+    func isProjectBusy(project: String) -> Bool {
+        streamContexts.contains { sessionID, ctx in
+            ctx.project == project && isSessionBusy(sessionID)
+        }
+    }
+
+    /// per-session 流态便捷写入口：key 不存在先插初始值；写完全空则移除 key
+    /// （空态不留键）。SessionStore 内部流态写入的唯一通道（internal 供多会话
+    /// 流态单测驱动状态机）。空态剪枝连带注销该会话的发起上下文登记
+    /// （streamContexts 与 streams 键同生命周期，防泄漏）。
+    /// 盒已存在时只触碰盒（发布走盒自身 objectWillChange）；成员增删才发布本表。
+    func mutateStream(_ sessionID: String, _ body: (inout StreamState) -> Void) {
+        var state = streamBoxes[sessionID]?.value ?? StreamState()
+        body(&state)
+        if state == StreamState() {
+            streamBoxes[sessionID] = nil
+            streamContexts[sessionID] = nil
+        } else if let box = streamBoxes[sessionID] {
+            box.value = state
+        } else {
+            streamBoxes[sessionID] = StreamBox(state)
+        }
+    }
+
+    /// 闸口链阶段文案写入（AppModel 确认链直写迁移入口）：新阶段文案入轨
+    /// phaseTrail（既有跳标 done、新跳为当前跳）；nil = 链尾收尾，全部标 done
+    /// （此刻流已结束、完成卡即将接管，无僵尸 key）。重复写入相同的未完成
+    /// label 幂等（防重试路径重复入轨）。归属钉定 origin 语义留阶段 2。
+    func setStreamPhase(_ text: String?, for sessionID: String? = nil) {
+        let id = sessionID ?? sessionId
+        guard text != nil || streamBoxes[id] != nil else { return }  // 清空且无 key：免空转
+        mutateStream(id) {
+            if let text {
+                if let last = $0.phaseTrail.last, !last.done, last.label == text { return }
+                for i in $0.phaseTrail.indices { $0.phaseTrail[i].done = true }
+                $0.phaseTrail.append(PhaseStep(label: text, done: false))
+            } else {
+                for i in $0.phaseTrail.indices { $0.phaseTrail[i].done = true }
+            }
+        }
+    }
+
+    /// 发送链路乐观置位（幂等，per-session）：本会话流式或待回复进行中不动。
+    /// origin 非空时同步登记发起上下文（streamContexts）：待回复窗口（提示词
+    /// 组装等前置往返）即计入 isVersionBusy，防「占位期版本判空闲」竞态。
+    func beginPreparingReply(sessionID: String, origin: StreamOrigin? = nil) {
+        if let origin { registerStreamContext(origin) }
+        guard streams[sessionID]?.isStreaming != true,
+              streams[sessionID]?.isPreparing != true else { return }
+        mutateStream(sessionID) { $0.isPreparing = true }
+    }
+
+    /// 清除待回复态（per-session，缺省 = 当前会话）：开流转正 / 停止 / 错误 /
+    /// 闸口早退路径统一收口；空态键随之移除。
+    func endPreparingReply(sessionID: String? = nil) {
+        mutateStream(sessionID ?? sessionId) { $0.isPreparing = false }
+    }
+
+    /// 流式期间（含待回复期）插话（AppModel.sendMessage 分流入口；调用方保证在
+    /// 发起会话内）：入队即返回，不打断当前生成；条目进**当前会话**队列，
+    /// 待回复期入队的插话在流开启的首个边界统一注入。空闲时调用是 no-op。
     func enqueueSteering(_ text: String) {
-        guard isStreaming || isPreparingReply else { return }
-        steeringQueue.append(makeEntry(role: .user, content: text))
+        guard isSessionBusy(sessionId) else { return }
+        steeringQueues[sessionId, default: []].append(makeEntry(role: .user, content: text))
     }
 
     /// 思考强度（reasoning_effort，DeepSeek 思考模式档位）：high = 服务端默认不发送。
@@ -448,39 +700,39 @@ final class SessionStore: ObservableObject {
 
     // MARK: - 停止生成（用户主动取消流式回复）
 
-    /// 进行中的生成任务（send/sendSystemTurn 内部经 trackGeneration 包裹）；
-    /// nil = 空闲。持有句柄是唯一可靠的取消通道——调用方 Task 散落在各视图/编排层，无法回收。
-    private var generationTask: Task<Void, Never>?
-    /// 当前句柄的身份令牌：停止后立即重发时旧任务的收尾不会误清新句柄。
-    private var generationTaskID = UUID()
+    /// 进行中的生成任务（per-session，send/sendSystemTurn 内部经 trackGeneration
+    /// 包裹，key = sessionId）；nil = 该会话空闲。持有句柄是唯一可靠的取消通道——
+    /// 调用方 Task 散落在各视图/编排层，无法回收。
+    private var generationTasks: [String: (task: Task<Void, Never>, token: UUID)] = [:]
 
-    /// 用户主动停止当前生成：**同步**翻转流式状态（发送钮 ≤300ms 内回「发送」、
-    /// 流式气泡即时收起、侧栏呼吸点即时熄灭），再取消底层网络流。
-    /// 已生成的部分内容由 streamReply 的取消收尾路径保留落盘（含「⏹ 已停止」注记）。
-    /// 插话语义是「补指令给当前生成」——停止即一并作废（排队气泡消失，不落盘）。
-    func stopGeneration() {
-        endPreparingReply()  // 待回复占位一并收起（此时生成任务可能尚未起跑）
-        guard let task = generationTask else { return }
-        generationTask = nil
-        generationTaskID = UUID()  // 令牌失配：旧任务完成时不再清新句柄
-        isStreaming = false
-        streamingSessionID = nil
-        streamingStartedAt = nil
-        steeringQueue = []
-        followUpQueue = []
-        task.cancel()
+    /// 用户主动停止指定会话（缺省 = 当前会话）的生成：**同步**翻转该会话流式状态
+    /// （发送钮 ≤300ms 内回「发送」、流式气泡即时收起、侧栏呼吸点即时熄灭），
+    /// 再取消底层网络流。已生成的部分内容由 streamReply 的取消收尾路径保留落盘
+    /// （含「⏹ 已停止」注记）。插话语义是「补指令给当前生成」——停止即一并作废
+    /// （该会话排队气泡消失，不落盘）；其他会话的流态/队列/任务不受影响。
+    func stopGeneration(sessionID: String? = nil) {
+        let id = sessionID ?? sessionId
+        endPreparingReply(sessionID: id)  // 待回复占位一并收起（此时生成任务可能尚未起跑）
+        if let handle = generationTasks.removeValue(forKey: id) {
+            handle.task.cancel()
+        }
+        streamBoxes[id] = nil  // 该会话流态整体收起（含增量/重试行/阶段文案）
+        streamContexts[id] = nil  // 发起上下文登记一并注销（与流态键同生命周期）
+        steeringQueues[id] = nil
+        followUpQueues[id] = nil
     }
 
-    /// 生成任务追踪（可停止句柄的来源）：send/sendSystemTurn 的实际工作包在其中。
-    /// internal 供测试（停止延迟 ≤300ms 断言直测）。
-    func trackGeneration(_ operation: @escaping () async -> Void) async {
-        let id = UUID()
-        generationTaskID = id
+    /// 生成任务追踪（可停止句柄的来源，per-session）：send/sendSystemTurn 的实际
+    /// 工作包在其中。sessionID 缺省 = 当前会话（测试直驱用）。internal 供测试
+    /// （停止延迟 ≤300ms 断言直测）。
+    func trackGeneration(sessionID: String? = nil, _ operation: @escaping () async -> Void) async {
+        let id = sessionID ?? sessionId
+        let token = UUID()
         let task = Task { await operation() }
-        generationTask = task
+        generationTasks[id] = (task, token)
         await task.value
         // 句柄仍指向本任务时才清空（停止 → 立即重发的新任务不被旧收尾误清）
-        if generationTaskID == id { generationTask = nil }
+        if generationTasks[id]?.token == token { generationTasks[id] = nil }
     }
 
     /// 取消类错误判定（停止路径 vs 真实错误）：Swift 任务取消（CancellationError）
@@ -500,9 +752,15 @@ final class SessionStore: ObservableObject {
         reasoning: String,
         duration: Int,
         skills: [String],
+        knowledgeRefs: [String: String]? = nil,
+        phaseTrail: [String]? = nil,
         sessionId: String
     ) -> (assistant: DiscussionEntry?, note: DiscussionEntry) {
-        let thinkData = ThinkData.from(reasoning: reasoning, duration: duration, skills: skills)
+        let thinkData = ThinkData.from(
+            reasoning: reasoning, duration: duration,
+            skills: skills, knowledgeRefs: knowledgeRefs,
+            phaseTrail: phaseTrail
+        )
         let assistant: DiscussionEntry? = partial.isEmpty ? nil : DiscussionEntry(
             id: UUID().uuidString,
             sessionId: sessionId,
@@ -628,6 +886,89 @@ final class SessionStore: ObservableObject {
         self.sessionId = ""
     }
 
+    // MARK: - 会话标记（草稿预演等，B1；独立 session-flags.json，与标题覆盖互不影响）
+
+    /// 会话级标记（草稿预演）：draft = 草稿预演会话；draftStage = 预演推进位置
+    ///（PipelineRun.Stage rawValue）。独立文件存储——session-meta.json 保持
+    /// [String: String] 标题表不变量，旧版本 App 互不干扰。
+    nonisolated struct SessionFlags: Codable, Equatable {
+        var draft: Bool?
+        var draftStage: String?
+    }
+
+    nonisolated static func sessionFlagsURL(project: String, version: String) -> URL {
+        PMAgentStore.jsonlURL(project: project, version: version, file: "session-flags.json")
+    }
+
+    nonisolated static func sessionFlags(project: String, version: String) -> [String: SessionFlags] {
+        let url = sessionFlagsURL(project: project, version: version)
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: SessionFlags].self, from: data)) ?? [:]
+    }
+
+    nonisolated static func flags(
+        ofSession sessionId: String, project: String, version: String
+    ) -> SessionFlags {
+        sessionFlags(project: project, version: version)[sessionId] ?? SessionFlags()
+    }
+
+    /// 覆盖写单会话标记（读-改-写整表，原子落盘；MainActor 调用方串行）。
+    nonisolated static func setFlags(
+        _ flags: SessionFlags, forSession sessionId: String,
+        project: String, version: String
+    ) throws {
+        var table = sessionFlags(project: project, version: version)
+        if flags == SessionFlags() {
+            table[sessionId] = nil  // 空标记不留键（删会话/退出草稿后目录干净）
+        } else {
+            table[sessionId] = flags
+        }
+        try JSONEncoder().encode(table).write(
+            to: sessionFlagsURL(project: project, version: version), options: .atomic
+        )
+    }
+
+    /// 是否草稿预演会话。
+    nonisolated static func isDraftSession(
+        project: String, version: String, sessionId: String
+    ) -> Bool {
+        flags(ofSession: sessionId, project: project, version: version).draft == true
+    }
+
+    /// 草稿预演推进位置（非草稿会话返回 nil）。
+    nonisolated static func draftStage(
+        project: String, version: String, sessionId: String
+    ) -> PipelineRun.Stage? {
+        let f = flags(ofSession: sessionId, project: project, version: version)
+        guard f.draft == true else { return nil }
+        return f.draftStage.flatMap { PipelineRun.Stage(rawValue: $0) } ?? .clarify
+    }
+
+    /// 标记/取消草稿预演（取消时清推进位置）。返回错误文案，nil = 成功。
+    nonisolated static func setDraft(
+        project: String, version: String, sessionId: String, isDraft: Bool
+    ) -> String? {
+        var f = flags(ofSession: sessionId, project: project, version: version)
+        f.draft = isDraft ? true : nil
+        if !isDraft { f.draftStage = nil }
+        do {
+            try setFlags(f, forSession: sessionId, project: project, version: version)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// 草稿预演推进位置前移（产物落盘成功后调用；非草稿会话 no-op）。
+    nonisolated static func advanceDraftStage(
+        project: String, version: String, sessionId: String, to stage: PipelineRun.Stage
+    ) {
+        var f = flags(ofSession: sessionId, project: project, version: version)
+        guard f.draft == true else { return }
+        f.draftStage = stage.rawValue
+        try? setFlags(f, forSession: sessionId, project: project, version: version)
+    }
+
     /// 任务 → 空间转化（任务行菜单「转为项目」）：把某会话的全部行从源
     /// discussions.jsonl 迁到目标（原始字节不重编码，未命中行保留原样），
     /// 并迁移标题覆盖与被引用的附图文件（copy 不 move——源任务区其他会话
@@ -729,26 +1070,31 @@ final class SessionStore: ObservableObject {
         let url = PMAgentStore.jsonlURL(project: project, version: version, file: "discussions.jsonl")
         entries = PMAgentStore.readLines(DiscussionEntry.self, from: url)
             .filter { $0.sessionId == sessionId }
-        // 冷启动恢复压缩缓存（P2）：取本会话最近一条压缩行，恢复滚动摘要三元组，
-        // s08 压缩从上次边界无缝续跑（不重算已摘要轮）。无压缩行 → 缓存保持空。
+        // 冷启动恢复压缩缓存（P2，阶段 2 per-session 键值化）：取本会话最近一条
+        // 压缩行，恢复滚动摘要三元组到该会话的键，s08 压缩从上次边界无缝续跑
+        //（不重算已摘要轮）。无压缩行 → 该键清空（磁盘是事实源）。
         if let last = entries.last(where: { $0.compaction != nil }),
            let data = last.compaction {
-            compactSummary = data.summary
-            compactBoundary = data.boundary
-            compactSummarizedCount = data.droppedCount
+            compactions[sessionId] = CompactionCache(
+                summary: data.summary, boundary: data.boundary, count: data.droppedCount
+            )
         } else {
-            compactSummary = ""
-            compactBoundary = ""
-            compactSummarizedCount = 0
+            compactions[sessionId] = nil
         }
-        // 流进行中不清增量：切回发起会话仍能看到生成过程（气泡渲染由
-        // streamingSessionID 门控，其他会话不会误显示）；流结束时统一清空。
-        if streamingSessionID == nil {
-            streamingText = ""
-            streamingThink = ""
-            streamingSkills = []
-            streamingPhase = nil
-        }
+        // 流态按会话键隔离（streams[sessionId]）：增量/占位/阶段文案只在其归属
+        // 会话渲染，切会话互不泄漏——旧单流时代需在此手动清全局增量，键值化后
+        // 天然隔离；他会话进行中的流态保留在键里，切回仍可见（流收尾 defer 移除键）。
+    }
+
+    /// 任意会话的只读投影（origin 化基建）：按 (project, version) 读盘、按 sessionId
+    /// 过滤。内存 entries 只驻当前打开会话（open 仅加载当前会话），异步链中途
+    /// 需要 origin 会话内容（上下文组装/历史）时从这里读盘取——磁盘是事实源。
+    func entries(project: String, version: String, sessionId: String) -> [DiscussionEntry] {
+        let url = PMAgentStore.jsonlURL(
+            project: project, version: version, file: "discussions.jsonl"
+        )
+        return PMAgentStore.readLines(DiscussionEntry.self, from: url)
+            .filter { $0.sessionId == sessionId }
     }
 
     // MARK: - 写入（append + write-then-verify，E5）
@@ -783,14 +1129,20 @@ final class SessionStore: ObservableObject {
         return entry
     }
 
-    /// 按发起会话上下文落盘（流式回复专用）：写到 origin 的 jsonl，
-    /// 内存收纳仍以「属于当前打开会话」为准。
+    /// 撤回乐观上屏的待发送消息（采纳排队逃生门等）：仅从内存消息流移除——
+    /// 此类条目从未落盘，无磁盘动作；已落盘的条目不走这里。
+    func discardStaged(_ entry: DiscussionEntry) {
+        entries.removeAll { $0.id == entry.id }
+    }
+
+    /// 按发起会话上下文落盘（流式回复/后台完成落盘段专用）：写到 origin 的 jsonl，
+    /// 内存收纳仍以「属于当前打开会话」为准（按 id 去重，同 append）。
     func appendPinned(_ entry: DiscussionEntry, origin: StreamOrigin) throws {
         let url = PMAgentStore.jsonlURL(
             project: origin.project, version: origin.version, file: "discussions.jsonl"
         )
         try appendVerified(entry, to: url)
-        if entry.sessionId == sessionId {
+        if entry.sessionId == sessionId, !entries.contains(where: { $0.id == entry.id }) {
             entries.append(entry)
         }
     }
@@ -818,6 +1170,8 @@ final class SessionStore: ObservableObject {
         }
     }
 
+    /// - Parameter sessionID: 条目归属会话（nil = 当前打开会话）。后台完成落盘段
+    ///   传 origin.sessionId，让系统行钉回发起会话（即使该会话不在前台）。
     func makeEntry(
         role: DiscussionEntry.Role,
         content: String,
@@ -827,11 +1181,13 @@ final class SessionStore: ObservableObject {
         files: [String]? = nil,
         fileChanges: [FileChangeSummary]? = nil,
         milestones: [MilestoneStamp]? = nil,
-        changeProposal: ChangeProposalRecord? = nil
+        changeProposal: ChangeProposalRecord? = nil,
+        silent: Bool? = nil,
+        sessionID: String? = nil
     ) -> DiscussionEntry {
         DiscussionEntry(
             id: UUID().uuidString,
-            sessionId: sessionId,
+            sessionId: sessionID ?? sessionId,
             role: role,
             content: content,
             think: think,
@@ -841,13 +1197,15 @@ final class SessionStore: ObservableObject {
             fileChanges: fileChanges,
             milestones: milestones,
             changeProposal: changeProposal,
+            silent: silent,
             createdAt: ISO8601DateFormatter().string(from: Date())
         )
     }
 
     // MARK: - 流式发送（M2：阶段化 system prompt + 思考捕获）
 
-    /// 发送用户消息并流式接收回复；完成后整条落盘（流式期间 UI 由 streamingText 驱动）。
+    /// 发送用户消息并流式接收回复；完成后整条落盘（流式期间 UI 由本会话流态
+    /// streams[origin.sessionId].text 驱动）。
     /// - Parameters:
     ///   - stage: LLM 阶段（取该阶段模型配置）
     ///   - systemPrompt: 由 AgentPrompts 构造的阶段化 system prompt（含记忆注入区）
@@ -863,7 +1221,15 @@ final class SessionStore: ObservableObject {
     ///     并在本轮 system prompt 尾部注入文件原文（ReferencedFileMaterial）——
     ///     模型据此真正读到内容，不再回答「无法访问文件系统」
     ///   - skills: 本轮引用的技能 id（Context Builder 命中注入，AppModel 组装时取得）
-    ///   - onAssistant: 回复完成后的回调（产物解析、轮次推进等由编排层处理）
+    ///   - knowledgeRefs: 本轮注入的知识卡命中（id→标题；气泡底部引用条，2026-09-17）
+    ///   - pinnedOrigin: 发起上下文快照（nil = 入口现取）。AppModel 发送链在提示词
+    ///     组装（网络往返）前快照下传——往返期间用户切会话/项目时 origin 不漂移。
+    ///   - prototypeSnapshot: 原型冲突检测快照（阶段 4，相对路径 → 期望 SHA256）。
+    ///     发起时槽位文件的指纹，随发送链下传并经 onAssistant 回调透传给编排层
+    ///     落盘段做乐观校验（后写者分槽并立）。仅原型阶段生效——performSend 内
+    ///     按 stage 闸死，非原型阶段误传也强制失效。回调第二参数即本值。
+    ///   - onAssistant: 回复完成后的回调（产物解析、轮次推进等由编排层处理）；
+    ///     第二参数为本轮生效的原型快照（非原型阶段 / followUp 续发轮为 nil）
     func send(
         _ text: String,
         settings: LLMSettings,
@@ -873,15 +1239,23 @@ final class SessionStore: ObservableObject {
         imageFiles: [String] = [],
         fileRefs: [String] = [],
         skills: [String] = [],
+        knowledgeRefs: [String: String]? = nil,
         stagedUserEntry: DiscussionEntry? = nil,
-        onAssistant: ((DiscussionEntry) -> Void)? = nil
+        pinnedOrigin: StreamOrigin? = nil,
+        prototypeSnapshot: [String: String]? = nil,
+        onAssistant: ((DiscussionEntry, [String: String]?) -> Void)? = nil
     ) async {
-        // 打包进可取消句柄（stopGeneration 的取消来源）；仍 await 完成，调用方语义不变
-        await self.trackGeneration {
+        // 打包进可取消句柄（stopGeneration 的取消来源，按发起会话登记）；仍 await
+        // 完成，调用方语义不变。origin 优先用调用方快照（链入口钉定），缺省入口
+        // 现取：句柄键与流态键同源，生成途中用户切会话不漂移。
+        let origin = pinnedOrigin ?? StreamOrigin(project: project, version: version, sessionId: sessionId)
+        await self.trackGeneration(sessionID: origin.sessionId) {
             await self.performSend(
                 text, settings: settings, stage: stage, systemPrompt: systemPrompt,
                 maxTokens: maxTokens, imageFiles: imageFiles, fileRefs: fileRefs,
-                skills: skills, stagedUserEntry: stagedUserEntry, onAssistant: onAssistant
+                skills: skills, knowledgeRefs: knowledgeRefs,
+                stagedUserEntry: stagedUserEntry, onAssistant: onAssistant, origin: origin,
+                prototypeSnapshot: prototypeSnapshot
             )
         }
     }
@@ -895,37 +1269,56 @@ final class SessionStore: ObservableObject {
         imageFiles: [String],
         fileRefs: [String],
         skills: [String],
+        knowledgeRefs: [String: String]? = nil,
         stagedUserEntry: DiscussionEntry? = nil,
-        onAssistant: ((DiscussionEntry) -> Void)?
+        onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?,
+        origin: StreamOrigin,
+        prototypeSnapshot: [String: String]? = nil
     ) async {
-        // 发起时快照上下文：生成途中用户可能切换会话/项目，
-        // 回复必须落回发起会话（否则串会话），回调也仅在仍在发起会话时执行。
-        let origin = StreamOrigin(project: project, version: version, sessionId: sessionId)
+        // 阶段 4 原型快照：仅原型回合生效（非原型阶段调用方误传也强制失效，防误校验）。
+        // followUp 续发轮不带快照（drainFollowUps 不透传，下方调用缺省 nil）——
+        // 首轮自写盘后快照必然失配，续发迭代轮落主槽位是正常迭代语义
+        //（v1 边界：续发窗口内外部写入不检测）。
+        let effectiveSnapshot = stage == .prototype ? prototypeSnapshot : nil
+        // origin 已由调用方快照下传（send 入口 / drainFollowUps / AppModel 链入口）：
+        // 生成途中用户可能切换会话/项目，回复与历史组装必须以发起上下文为准
+        //（否则串会话/串版本），回调也按后台完成语义执行（AppModel 以 origin 口径落盘）。
         // 待回复占位（幂等）：AppModel.sendMessage 已随乐观上屏置位——此处兜住
         // followUp 续发等未经该入口的调用方，覆盖 buildHistory 压缩摘要的网络往返。
-        beginPreparingReply(sessionID: origin.sessionId)
+        // 占位置位即登记发起上下文（版本级 busy 判据数据源，与流态键同生命周期）。
+        beginPreparingReply(sessionID: origin.sessionId, origin: origin)
         do {
             // 乐观上屏通道：调用方已提前入列的用户条目原样落盘（同 id 不重复上屏）；
             // 未走该通道的调用方（followUps 续发 / 系统链路）照旧在此构造。
-            let userEntry = stagedUserEntry ?? makeEntry(
+            // 条目归属与落盘位置一律钉 origin（makeEntry 缺省取当前会话，切走后即错）。
+            var userEntry = stagedUserEntry ?? makeEntry(
                 role: .user, content: text,
                 images: imageFiles.isEmpty ? nil : imageFiles,
                 files: fileRefs.isEmpty ? nil : fileRefs
             )
-            try append(userEntry)
+            userEntry.sessionId = origin.sessionId
+            try appendPinned(userEntry, origin: origin)
 
-            // 引用文件读盘注入（本轮 system prompt 尾部；system 段不占历史预算）
-            let prompt = ReferencedFileMaterial.augment(
-                systemPrompt: systemPrompt, refs: fileRefs,
-                project: project, version: version
+            // 前缀缓存改造（2026-09-17，ContextTail 协议）：systemPrompt 可能是
+            // 「冻结段 + marker + 动态材料」复合体——拆开后冻结段进 system 消息，
+            // 动态材料与引用文件正文合并为「动态材料尾条」，以独立 user 消息追加在
+            // 当前用户消息之后。system 与历史随之成为 append-only 可缓存前缀
+            //（记忆/技能/检索每轮变化曾嵌入 system 中部，使其后历史连坐失效）。
+            // 引用文件正文按 origin 版本目录读盘（切走后读当前版本会注错内容）。
+            let (frozenSystem, injectionTail) = ContextTail.split(systemPrompt)
+            let fileSection = ReferencedFileMaterial.section(
+                refs: fileRefs, project: origin.project, version: origin.version
             )
-            var history = await buildHistory(systemPrompt: prompt, settings: settings)
-            // 当轮 user 消息带图：进模型前从 attachments/ 读回并编码为 base64
+            let tail = [injectionTail, fileSection ?? ""]
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n\n")
+            var history = await buildHistory(origin: origin, systemPrompt: frozenSystem, settings: settings)
+            // 当轮 user 消息带图：进模型前从 attachments/ 读回并编码为 base64（origin 口径）
             if !imageFiles.isEmpty,
                let config = settings.stages[stage], config.supportsImages {
                 let chatImages = imageFiles.compactMap { name -> ChatImage? in
                     guard let data = PMAgentStore.readAttachment(
-                        name, project: project, version: version
+                        name, project: origin.project, version: origin.version
                     ) else { return nil }
                     let ext = (name as NSString).pathExtension.lowercased()
                     let mime = Self.imageMIME(forExtension: ext)
@@ -938,9 +1331,15 @@ final class SessionStore: ObservableObject {
                     )
                 }
             }
+            // 动态材料尾条：追加在当前用户消息之后（离生成点最近——材料遵循度受益于
+            // 近因注意力；永不入盘、不占历史预算，投影回灌天然不含它）
+            history = VolatileTailMaterial.appending(history, tail: tail)
             try await streamReply(
                 origin: origin, history: history, stage: stage, settings: settings,
-                maxTokens: maxTokens, skills: skills, onAssistant: onAssistant
+                maxTokens: maxTokens, skills: skills, knowledgeRefs: knowledgeRefs,
+                onAssistant: onAssistant.map { fn in
+                    { entry in fn(entry, effectiveSnapshot) }
+                }
             )
             // 正常完成后消费 followUp 队列（P3）：插话续发走完整发送链路。
             // 停止（stopGeneration 清队列 + 任务取消）与错误路径不消费。
@@ -949,7 +1348,7 @@ final class SessionStore: ObservableObject {
                 systemPrompt: systemPrompt, maxTokens: maxTokens, onAssistant: onAssistant
             )
         } catch {
-            endPreparingReply()  // 流式开启前即失败：占位气泡必须收起
+            endPreparingReply(sessionID: origin.sessionId)  // 流式开启前即失败：占位气泡必须收起
             // 用户主动停止（流式开始前的取消，如历史摘要/落盘阶段）：
             // 不写 ⚠️ 错误行，只落「⏹ 已停止」注记（stopGeneration 已即时翻转 UI）
             if Self.isCancellation(error) {
@@ -960,14 +1359,17 @@ final class SessionStore: ObservableObject {
                 try? appendPinned(stopped.note, origin: origin)
                 return
             }
-            // 错误收尾：排队中的插话一并作废（用户重发即可），避免半途状态残留
-            steeringQueue = []
-            followUpQueue = []
-            streamingText = ""
-            streamingThink = ""
-            streamingSkills = []
-            streamingPhase = nil
-            streamingStartedAt = nil
+            // 错误收尾：本会话排队中的插话一并作废（用户重发即可），流态清零只动本 key，
+            // 避免半途状态残留
+            steeringQueues[origin.sessionId] = nil
+            followUpQueues[origin.sessionId] = nil
+            mutateStream(origin.sessionId) {
+                $0.text = ""
+                $0.think = ""
+                $0.skills = []
+                $0.phaseTrail = []
+                $0.startedAt = nil
+            }
             var errorEntry = makeEntry(
                 role: .system,
                 content: "⚠️ \(error.localizedDescription)"
@@ -999,24 +1401,35 @@ final class SessionStore: ObservableObject {
     /// 合成指令不落盘为用户消息（它不是用户说的），仅进模型上下文。
     /// 注记照常落盘（审计轨迹），UI 层把它并入随后的助手气泡顶部，不再渲染成独立胶囊。
     /// - Returns: 收尾口径（自然完成 vs 停止/出错）；风险采纳落实据此决定是否流转状态。
+    /// - Parameter pinnedOrigin: 发起上下文快照（nil = 入口现取）。确认链多跳 LLM
+    ///   往返期间用户可能切会话/项目——AppModel 在链入口快照一次全链下传，
+    ///   防中途漂移到切换后会话（phase 文案/流态/落盘同源）。
+    /// - Parameter prototypeSnapshot: 原型冲突检测快照（阶段 4，同 send；确认链 /
+    ///   机器门重生成 / 回退重做等系统触发的原型生成回合照常携带）。
     @discardableResult
     func sendSystemTurn(
         note: String?,
+        noteSilent: Bool = false,
         userPrompt: String,
         settings: LLMSettings,
         stage: LLMStage,
         systemPrompt: String,
         maxTokens: Int = 16384,
         skills: [String] = [],
-        onAssistant: ((DiscussionEntry) -> Void)? = nil
+        pinnedOrigin: StreamOrigin? = nil,
+        prototypeSnapshot: [String: String]? = nil,
+        onAssistant: ((DiscussionEntry, [String: String]?) -> Void)? = nil
     ) async -> SystemTurnOutcome {
         var outcome = SystemTurnOutcome.interrupted
+        // 发起会话快照下传：句柄键与流态键同源（同 send），生成途中切会话不漂移
+        let origin = pinnedOrigin ?? StreamOrigin(project: project, version: version, sessionId: sessionId)
         // 打包进可取消句柄（stopGeneration 的取消来源）
-        await self.trackGeneration {
+        await self.trackGeneration(sessionID: origin.sessionId) {
             outcome = await self.performSendSystemTurn(
-                note: note, userPrompt: userPrompt, settings: settings, stage: stage,
-                systemPrompt: systemPrompt, maxTokens: maxTokens, skills: skills,
-                onAssistant: onAssistant
+                note: note, noteSilent: noteSilent, userPrompt: userPrompt, settings: settings,
+                stage: stage, systemPrompt: systemPrompt, maxTokens: maxTokens, skills: skills,
+                onAssistant: onAssistant, origin: origin,
+                prototypeSnapshot: prototypeSnapshot
             )
         }
         return outcome
@@ -1024,28 +1437,46 @@ final class SessionStore: ObservableObject {
 
     private func performSendSystemTurn(
         note: String?,
+        noteSilent: Bool = false,
         userPrompt: String,
         settings: LLMSettings,
         stage: LLMStage,
         systemPrompt: String,
         maxTokens: Int,
         skills: [String],
-        onAssistant: ((DiscussionEntry) -> Void)?
+        onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?,
+        origin: StreamOrigin,
+        prototypeSnapshot: [String: String]? = nil
     ) async -> SystemTurnOutcome {
-        isStreaming = true  // 先置位：注记行直接并入流式气泡，避免「独立胶囊 → 并入」闪烁
-        streamingStartedAt = Date()
-        let origin = StreamOrigin(project: project, version: version, sessionId: sessionId)
+        // 阶段 4 原型快照闸（同 performSend）：仅原型回合生效
+        let effectiveSnapshot = stage == .prototype ? prototypeSnapshot : nil
+        // 开流即登记发起上下文（版本级 busy 判据数据源，与流态键同生命周期）
+        registerStreamContext(origin)
+        mutateStream(origin.sessionId) {
+            $0.isStreaming = true  // 先置位：注记行直接并入流式气泡，避免「独立胶囊 → 并入」闪烁
+            $0.startedAt = Date()
+        }
         do {
             if let note {
-                let noteEntry = makeEntry(role: .system, content: note)
-                try append(noteEntry)
+                // 回合注记钉回发起会话（链中途切会话不串：落盘也走 origin 的 jsonl）
+                // noteSilent：注记语义已由 AI 回答开场承接句承载时，落盘静默、UI 不渲染
+                var noteEntry = makeEntry(role: .system, content: note, silent: noteSilent ? true : nil)
+                noteEntry.sessionId = origin.sessionId
+                try appendPinned(noteEntry, origin: origin)
             }
 
-            var history = await buildHistory(systemPrompt: systemPrompt, settings: settings)
+            // 前缀缓存改造（2026-09-17）：冻结段进 system，动态材料尾条追加在
+            // 合成 userPrompt 之后（同 performSend，ContextTail 协议）
+            let (frozenSystem, injectionTail) = ContextTail.split(systemPrompt)
+            var history = await buildHistory(origin: origin, systemPrompt: frozenSystem, settings: settings)
             history.append(ChatMessage(role: .user, content: userPrompt))
+            history = VolatileTailMaterial.appending(history, tail: injectionTail)
             try await streamReply(
                 origin: origin, history: history, stage: stage, settings: settings,
-                maxTokens: maxTokens, skills: skills, onAssistant: onAssistant
+                maxTokens: maxTokens, skills: skills,
+                onAssistant: onAssistant.map { fn in
+                    { entry in fn(entry, effectiveSnapshot) }
+                }
             )
             // 正常完成后消费 followUp 队列（P3）；完成后才记 .completed
             await drainFollowUps(
@@ -1054,9 +1485,8 @@ final class SessionStore: ObservableObject {
             )
             return .completed
         } catch {
-            isStreaming = false
             // streamReply 未进入即抛错（如历史组装失败）时其 defer 不执行，此处兜底清流起点
-            streamingStartedAt = nil
+            mutateStream(origin.sessionId) { $0.isStreaming = false; $0.startedAt = nil }
             // 用户主动停止（流式开始前的取消）：只落「⏹ 已停止」注记，不写 ⚠️ 错误行
             if Self.isCancellation(error) {
                 let stopped = Self.makeStoppedTurn(
@@ -1066,14 +1496,17 @@ final class SessionStore: ObservableObject {
                 try? appendPinned(stopped.note, origin: origin)
                 return .interrupted
             }
-            // 错误收尾：排队中的插话一并作废（用户重发即可），避免半途状态残留
-            steeringQueue = []
-            followUpQueue = []
-            streamingText = ""
-            streamingThink = ""
-            streamingSkills = []
-            streamingPhase = nil
-            streamingStartedAt = nil
+            // 错误收尾：本会话排队中的插话一并作废（用户重发即可），流态清零只动本 key，
+            // 避免半途状态残留
+            steeringQueues[origin.sessionId] = nil
+            followUpQueues[origin.sessionId] = nil
+            mutateStream(origin.sessionId) {
+                $0.text = ""
+                $0.think = ""
+                $0.skills = []
+                $0.phaseTrail = []
+                $0.startedAt = nil
+            }
             var errorEntry = makeEntry(
                 role: .system,
                 content: "⚠️ \(error.localizedDescription)"
@@ -1100,96 +1533,182 @@ final class SessionStore: ObservableObject {
 
     // MARK: - Follow-up 续发（P3）
 
-    /// 消费 followUp 队列：逐条作为新输入走完整发送链路（落盘 user 条目 +
+    /// 消费该会话的 followUp 队列：逐条作为新输入走完整发送链路（落盘 user 条目 +
     /// 历史组装 + 流式回复）。调用方已在可取消句柄内，不再经 trackGeneration。
-    /// 续发期间用户切走发起会话 → 终止并清队列（插话不跨会话自动执行）；
-    /// 续发轮出错时 performSend 内部已清队列，循环自然终止。
+    /// 续发轮携带原 origin（origin.sessionId = 原会话），跨上下文也按 origin 落盘。
+    /// 续发轮出错时 performSend 内部已清该会话队列，循环自然终止。
+    /// （阶段 2 收口：续发闸从「用户仍停留发起上下文」改为「目标会话空闲」——
+    /// 历史按 origin 读盘、落盘按 origin 钉回后，跨上下文续发已安全；会话有流/
+    /// 占位进行中（如用户已在该会话手动发起新回合）则保留队列本轮不消费，
+    /// 待该会话下一次收尾的 drainFollowUps 续接，避免并发流互踩。）
     private func drainFollowUps(
         origin: StreamOrigin,
         settings: LLMSettings,
         stage: LLMStage,
         systemPrompt: String,
         maxTokens: Int,
-        onAssistant: ((DiscussionEntry) -> Void)?
+        onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?
     ) async {
-        while !followUpQueue.isEmpty, !Task.isCancelled {
-            guard project == origin.project, version == origin.version,
-                  sessionId == origin.sessionId else {
-                followUpQueue = []
-                return
-            }
-            let pending = followUpQueue
-            followUpQueue = []
+        while let pending = followUpQueues[origin.sessionId], !pending.isEmpty,
+              !Task.isCancelled {
+            guard !isSessionBusy(origin.sessionId) else { return }
+            followUpQueues[origin.sessionId] = nil
             let text = pending.map(\.content).joined(separator: "\n\n")
             await performSend(
                 text, settings: settings, stage: stage, systemPrompt: systemPrompt,
                 maxTokens: maxTokens, imageFiles: [], fileRefs: [],
-                skills: [], onAssistant: onAssistant
+                skills: [], onAssistant: onAssistant, origin: origin
             )
         }
     }
 
-    /// 历史压缩摘要缓存（s08 滚动压缩）：被丢旧轮摘要一次、缓存复用；
-    /// 边界移动时只摘要新增被丢轮（旧摘要 + 新轮 → 更新摘要），不全量重算。
-    private var compactSummary = ""
-    private var compactBoundary = ""
-    private var compactSummarizedCount = 0
+    /// 历史压缩摘要缓存（s08 滚动压缩，阶段 2 per-session 键值化）：被丢旧轮摘要
+    /// 一次、缓存复用；边界移动时只摘要新增被丢轮（旧摘要 + 新轮 → 更新摘要），
+    /// 不全量重算。按 sessionId 分键——后台流与前台流各有各的压缩游标，互不覆盖。
+    /// internal 供单测驱动（分键不串的关键锚点）。
+    var compactions: [String: CompactionCache] = [:]
 
-    private func buildHistory(
-        systemPrompt: String, settings: LLMSettings
+    /// 单会话压缩缓存三元组（值类型，键入 compactions）。
+    struct CompactionCache {
+        var summary: String
+        var boundary: String
+        var count: Int
+    }
+
+    /// 历史组装（origin 口径）对外入口：先走 assembledHistory 编排投影/预算/压缩，
+    /// 再按门控收敛思考回传（只挂最后一轮，见 keepRecentReasoning）。
+    func buildHistory(
+        origin: StreamOrigin, systemPrompt: String, settings: LLMSettings
+    ) async -> [ChatMessage] {
+        let replay = Self.replaysReasoning(settings: settings)
+        let messages = await assembledHistory(
+            origin: origin, systemPrompt: systemPrompt, settings: settings,
+            replayReasoning: replay
+        )
+        guard replay else { return messages }
+        return HistoryProjection.keepRecentReasoning(in: messages)
+    }
+
+    /// 历史思考回传门控（2026-09-18，借鉴 opencode / OpenHands 双印证）：
+    /// DeepSeek 端点多轮对话回传历史 reasoning_content，维持思考连贯、免每轮
+    /// 重新推敲上轮已想清的结论（对应个案分析里的复读复述与对账空转）。
+    /// 其他 provider 暂不回传（GLM/豆包思考协议不同，白名单按需扩展）；
+    /// 非思考轮 think 为空天然无回传，门控只需圈定端点族。纯函数，测试直测。
+    nonisolated static func replaysReasoning(settings: LLMSettings) -> Bool {
+        settings.chatConfig.provider == "deepseek"
+    }
+
+    /// 分块压缩阈值（2026-09-18，借鉴 OpenHands Condenser 摊薄缓存重建成本）：
+    /// 新增被丢轮不足该 token 数时暂缓滚动摘要——新被丢轮以原文垫在旧摘要之后，
+    /// system+摘要+稳定历史保持 append-only，前缀缓存持续命中；积累满一块才做
+    /// 一次摘要（缓存重建从「超预算后每轮一次」摊薄为「每块一次」）。
+    nonisolated static let compactionDeferralTokens = 3000
+
+    /// 是否暂缓滚动压缩（纯函数，测试直测）：仅当确实新增了被丢轮且增量不足一块。
+    nonisolated static func shouldDeferCompaction(
+        droppedCount: Int, cachedCount: Int, newDroppedTokens: Int
+    ) -> Bool {
+        droppedCount > cachedCount && newDroppedTokens < compactionDeferralTokens
+    }
+
+    /// 历史组装编排：条目来源按 origin 归属——当前打开会话用内存投影；
+    /// 否则读盘该 (project, version) 的 jsonl 过滤 origin.sessionId（后台会话/跨上下文
+    /// 续发轮的历史不再错拿前台会话）。投影管道与预算裁剪不变。internal 供单测驱动。
+    private func assembledHistory(
+        origin: StreamOrigin, systemPrompt: String, settings: LLMSettings,
+        replayReasoning: Bool
     ) async -> [ChatMessage] {
         // 投影管道（HistoryProjection）：entries → LLM 消息 → 预算裁剪 → 摘要垫头
+        let sourceEntries: [DiscussionEntry]
+        if origin.sessionId == sessionId {
+            sourceEntries = entries
+        } else {
+            sourceEntries = Self.readSessionEntries(
+                project: origin.project, version: origin.version, sessionId: origin.sessionId
+            )
+        }
         let history = [ChatMessage(role: .system, content: systemPrompt)]
-            + HistoryProjection.projectEntries(entries)
+            + HistoryProjection.projectEntries(sourceEntries, replayReasoning: replayReasoning)
         let (kept, dropped) = HistoryProjection.splitByBudget(history, budget: historyTokenBudget)
         guard !dropped.isEmpty else { return kept }
 
-        // 摘要缓存命中：边界未变直接复用
+        // 摘要缓存命中：边界未变直接复用（per-session 键）
         let boundary = HistoryProjection.droppedBoundary(dropped)
-        if boundary == compactBoundary, !compactSummary.isEmpty {
-            return HistoryProjection.historyWithSummary(kept: kept, summary: compactSummary)
+        let cache = compactions[origin.sessionId]
+        if let cache, boundary == cache.boundary, !cache.summary.isEmpty {
+            return HistoryProjection.historyWithSummary(kept: kept, summary: cache.summary)
+        }
+
+        // 分块暂缓（借鉴 OpenHands Condenser）：边界小幅移动时复用旧摘要，
+        // 新被丢轮原文垫头——前缀字节级不变保住缓存，满一块才滚动摘要一次
+        let base = min(cache?.count ?? 0, dropped.count)
+        let newDropped = dropped.dropFirst(base)
+        if let cache, !cache.summary.isEmpty,
+           Self.shouldDeferCompaction(
+               droppedCount: dropped.count, cachedCount: cache.count,
+               newDroppedTokens: TokenBreakdown.estimate(
+                   newDropped.map(\.content).joined(separator: "\n")
+               )
+           ) {
+            return HistoryProjection.historyWithSummary(
+                kept: kept, summary: cache.summary, bridging: Array(newDropped)
+            )
         }
 
         // 滚动压缩：旧摘要 + 新增被丢轮 → 一次性 LLM 摘要（classify 档）
-        let base = min(compactSummarizedCount, dropped.count)
-        let newDropped = dropped.dropFirst(base)
         let transcript = newDropped
             .map { "\($0.role == .user ? "用户" : "助手")：\($0.content)" }
             .joined(separator: "\n")
         if let updated = try? await oneShot(
             HistoryProjection.compactSummaryPrompt(
-                previous: compactSummary, transcript: String(transcript.suffix(12000))
+                previous: cache?.summary ?? "", transcript: String(transcript.suffix(12000))
             ),
             settings: settings, stage: .classify, maxTokens: 800
         ), !updated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let summary = updated.trimmingCharacters(in: .whitespacesAndNewlines)
-            compactSummary = summary
-            compactBoundary = boundary
-            compactSummarizedCount = dropped.count
+            compactions[origin.sessionId] = CompactionCache(
+                summary: summary, boundary: boundary, count: dropped.count
+            )
             // 压缩结果落盘（P2）：role == .system 注记行 + CompactionData 载荷，
             // 冷启动恢复缓存、Finder 可读。写盘失败不阻塞主流程。
+            // origin 直用 buildHistory 收到的快照（阶段 2 修 originForHistory 实时读 bug）：
+            // 历史组装期间用户切会话，压缩行仍落回发起会话。
             saveCompaction(
                 summary: summary, boundary: boundary, droppedCount: dropped.count,
                 tokensBefore: TokenBreakdown.estimate(
                     history.map(\.content).joined(separator: "\n")
                 ),
-                origin: originForHistory
+                origin: origin
             )
             return HistoryProjection.historyWithSummary(kept: kept, summary: summary)
         }
-        // 摘要失败（模型不可用等）：降级为纯丢弃（旧行为），不阻塞主流程
+        // 摘要失败（模型不可用等）：有旧摘要时降级为「旧摘要 + 新被丢轮原文垫头」
+        //（优于旧行为的纯丢弃——纯丢弃连旧摘要一起丢，前情全失）；无旧摘要维持纯丢弃
+        if let cache, !cache.summary.isEmpty {
+            return HistoryProjection.historyWithSummary(
+                kept: kept, summary: cache.summary, bridging: Array(newDropped)
+            )
+        }
         return kept
     }
 
-    /// 压缩落盘的归属会话（performSend/performSendSystemTurn 进入时快照；
-    /// 历史组装期间用户切会话不串行——与流式回复同一钉回语义）。
-    private var originForHistory: StreamOrigin {
-        StreamOrigin(project: project, version: version, sessionId: sessionId)
+    /// 读盘指定 (project, version) 会话条目（buildHistory 的后台会话来源）：
+    /// nonisolated 静态读盘，不触碰 MainActor 状态。读不到（新会话尚无 jsonl）
+    /// 按空历史处理——发送链先 append 用户条目，ensureWorkspace 已由调用链保障。
+    nonisolated static func readSessionEntries(
+        project: String, version: String, sessionId: String
+    ) -> [DiscussionEntry] {
+        let url = PMAgentStore.jsonlURL(
+            project: project, version: version, file: "discussions.jsonl"
+        )
+        return PMAgentStore.readLines(DiscussionEntry.self, from: url)
+            .filter { $0.sessionId == sessionId }
     }
 
     /// 压缩摘要落盘（P2）：追加 role == .system 的压缩注记行——content = 注记头 +
     /// 摘要全文（UI 渲染压缩卡片、Finder 可读），compaction 载荷存恢复元数据。
-    private func saveCompaction(
+    /// internal 供单测回归（origin 钉定：落盘条目 sessionId == origin.sessionId）。
+    func saveCompaction(
         summary: String, boundary: String, droppedCount: Int, tokensBefore: Int,
         origin: StreamOrigin
     ) {
@@ -1217,24 +1736,32 @@ final class SessionStore: ObservableObject {
         settings: LLMSettings,
         maxTokens: Int,
         skills: [String] = [],
+        knowledgeRefs: [String: String]? = nil,
         onAssistant: ((DiscussionEntry) -> Void)?
     ) async throws {
-        isStreaming = true
-        streamingSessionID = origin.sessionId
-        endPreparingReply()  // 开流转正：待回复占位无缝切换为真实流式态
-        streamingText = ""
-        streamingThink = ""
-        streamingSkills = skills
+        // 开流转正：本会话待回复占位无缝切换为真实流式态（归属由 key 承载）
+        mutateStream(origin.sessionId) {
+            $0.isStreaming = true
+            $0.isPreparing = false
+            $0.text = ""
+            $0.think = ""
+            $0.skills = skills
+        }
         let startedAt = Date()
-        streamingStartedAt = startedAt
+        // 提速归因（2026-09-18）：轮次 id 贯穿 usage/probe——同一轮的多次请求
+        //（空流重试/续写）与 App 侧时间线可对齐；start 探针 = 组装完成、流即将开启
+        //（与用户消息 createdAt 的差值 = 组装/排队耗时）
+        let roundId = UUID().uuidString
+        mutateStream(origin.sessionId) { $0.startedAt = startedAt }
+        StreamProbe.shared.append([
+            "side": "app-start", "roundId": roundId,
+            "stage": stage.rawValue, "ts": startedAt.timeIntervalSince1970,
+        ])
         defer {
-            isStreaming = false
-            streamingSessionID = nil
-            streamingStartedAt = nil
-            streamingSkills = []
-            streamingRetry = nil  // 错误上抛等所有出口统一清态，防「重试中」行残留
-            streamingPhase = nil  // 阶段文案随流收尾统一清态，防残留到下一轮占位
-            endPreparingReply()
+            // 只清本 key（含占位/重试行/阶段文案/增量），他会话并发流不受影响；
+            // 发起上下文登记一并注销（与流态键同生命周期，防泄漏）
+            streamBoxes[origin.sessionId] = nil
+            streamContexts[origin.sessionId] = nil
         }
 
         var full = ""
@@ -1259,13 +1786,17 @@ final class SessionStore: ObservableObject {
         var retryEffort: ThinkingEffort? = nil  // nil = 沿用用户档位
         // 用户停止（生成任务被取消）：立即中断接收，已生成部分收尾落盘保留
         var stopped = false
+        // 临时探针（2026-09-18）：App 侧消费/发布节奏（见 StreamProbe 注释）
+        var probeConsume: [Double] = []
+        var probePubs: [[String: Any]] = []
+        var probeEvents: [[String: Any]] = []
         do {
             while !Task.isCancelled {
+                probeEvents.append(["t": Date().timeIntervalSince(startedAt), "ev": "round-start"])
                 // steering 注入（P3）：截断续写边界——当前流已结束、下一次 LLM 调用前。
-                // 插话此刻落盘（排队气泡转正）并进入续写上下文。
-                if !steeringQueue.isEmpty {
-                    let pending = steeringQueue
-                    steeringQueue = []
+                // 插话此刻落盘（排队气泡转正）并进入续写上下文（本会话队列）。
+                if let pending = steeringQueues[origin.sessionId], !pending.isEmpty {
+                    steeringQueues[origin.sessionId] = nil
                     for msg in pending {
                         try? appendPinned(msg, origin: origin)
                         messages.append(ChatMessage(role: .user, content: msg.content))
@@ -1273,7 +1804,8 @@ final class SessionStore: ObservableObject {
                 }
                 let stream = try LLMClient.streamChat(
                     stage: stage, settings: settings, messages: messages, maxTokens: retryBudget,
-                    reasoningEffort: (retryEffort ?? thinkingEffort).apiValue
+                    reasoningEffort: (retryEffort ?? thinkingEffort).apiValue,
+                    roundId: roundId
                 )
                 var truncated = false
                 let roundStart = full.count
@@ -1282,15 +1814,46 @@ final class SessionStore: ObservableObject {
                         switch delta {
                         case .text(let text):
                             full += text
-                            if streamingRetry != nil { streamingRetry = nil }
-                            if textGate.shouldPublish() { streamingText = full }
+                            probeConsume.append(Date().timeIntervalSince(startedAt))
+                            mutateStream(origin.sessionId) {
+                                if $0.retry != nil { $0.retry = nil }
+                                if textGate.shouldPublish() {
+                                    // 展示文本 + 结构化产物事实都在发布点用全量 full
+                                    // 算好（StreamDisplayPayload.make），识别链不再依赖
+                                    // 被裁剪的展示文本
+                                    let payload = StreamDisplayPayload.make(full: full)
+                                    $0.text = payload.display
+                                    $0.artifactBlocks = payload.blocks
+                                    $0.inProgressName = payload.inProgressName
+                                    $0.inProgressLines = payload.inProgressLines
+                                    probePubs.append([
+                                        "t": Date().timeIntervalSince(startedAt),
+                                        "k": "t", "len": full.count,
+                                    ])
+                                }
+                            }
                         case .reasoning(let chunk):
                             reasoning += chunk
-                            if streamingRetry != nil { streamingRetry = nil }
-                            if thinkGate.shouldPublish() { streamingThink = reasoning }
+                            probeConsume.append(Date().timeIntervalSince(startedAt))
+                            mutateStream(origin.sessionId) {
+                                if $0.retry != nil { $0.retry = nil }
+                                if thinkGate.shouldPublish() {
+                                    $0.think = StreamPublishTail.clip(reasoning, limit: StreamPublishTail.thinkChars)
+                                    probePubs.append([
+                                        "t": Date().timeIntervalSince(startedAt),
+                                        "k": "r", "len": reasoning.count,
+                                    ])
+                                }
+                            }
                         case .retrying(let code, let attempt):
                             // 瞬时故障自动重试中：气泡状态行（首次正文到达即清除）
-                            streamingRetry = LLMClient.retryStatusText(code: code, attempt: attempt)
+                            probeEvents.append([
+                                "t": Date().timeIntervalSince(startedAt),
+                                "ev": "retrying", "code": code, "attempt": attempt,
+                            ])
+                            mutateStream(origin.sessionId) {
+                                $0.retry = LLMClient.retryStatusText(code: code, attempt: attempt)
+                            }
                         case .truncated:
                             truncated = true
                         }
@@ -1303,15 +1866,24 @@ final class SessionStore: ObservableObject {
                     emptyRetries += 1
                     retryBudget = LLMClient.escalatedRetryBudget(retryBudget)
                     retryEffort = .low
+                    probeEvents.append([
+                        "t": Date().timeIntervalSince(startedAt),
+                        "ev": "empty-after-thinking", "budget": retryBudget,
+                    ])
                     continue
                 } catch LLMClient.LLMError.emptyStream
                     where !Task.isCancelled && full.count == roundStart && emptyRetries < 1 {
                     // 字面空流（服务端抖动）重试（上限 1 次）：同请求重发。
                     emptyRetries += 1
+                    probeEvents.append(["t": Date().timeIntervalSince(startedAt), "ev": "empty-stream"])
                     continue
                 }
                 guard truncated, continueRounds < 2 else { break }
                 continueRounds += 1
+                probeEvents.append([
+                    "t": Date().timeIntervalSince(startedAt),
+                    "ev": "trunc-continue", "round": continueRounds,
+                ])
                 // 把本轮已生成的正文回灌为 assistant 前缀，要求模型从断点无缝续写。
                 let roundText = String(full[full.index(full.startIndex, offsetBy: roundStart)...])
                 guard !roundText.isEmpty else { break }
@@ -1329,35 +1901,48 @@ final class SessionStore: ObservableObject {
         }
 
         // 未注入的插话 → followUp（P3）：流自然结束（未截断或续写上限）时，
-        // 排队中的插话作为新输入自动续发，不丢失。停止路径（stopped）队列已清。
-        if !stopped, !steeringQueue.isEmpty {
-            followUpQueue.append(contentsOf: steeringQueue)
-            steeringQueue = []
+        // 本会话排队中的插话作为新输入自动续发，不丢失。停止路径（stopped）队列已清。
+        if !stopped, let pending = steeringQueues[origin.sessionId], !pending.isEmpty {
+            followUpQueues[origin.sessionId, default: []].append(contentsOf: pending)
+            steeringQueues[origin.sessionId] = nil
         }
 
         // 终值补发（含停止路径）：节流窗口内的尾部 delta 也进 UI（紧随其后转正式条目并清空）。
-        streamingText = full
-        streamingThink = reasoning
+        mutateStream(origin.sessionId) { $0.text = full; $0.think = reasoning }
 
         let duration = Int(Date().timeIntervalSince(startedAt))
+        // 临时探针：App 侧消费/发布时间线落盘（相对轮起点的秒序列）
+        StreamProbe.shared.append([
+            "side": "app", "roundId": roundId,
+            "ts": startedAt.timeIntervalSince1970,
+            "stage": stage.rawValue, "durS": duration,
+            "textChars": full.count, "thinkChars": reasoning.count,
+            "consume": probeConsume, "pubs": probePubs, "events": probeEvents,
+        ])
+        // 确认链跳转历史快照（defer 清键前读取）：链式回合持久化全程跳标签，
+        // 完成态展开恒可见（流式期打勾行只覆盖多跳链的第 2 跳起）
+        let chainTrail = streams[origin.sessionId]?.phaseTrail.map(\.label)
         // 停止收尾/正常收尾共用同一构造：部分（或完整）内容原文保留、sessionId 钉回发起会话
         let stoppedTurn = Self.makeStoppedTurn(
             partial: full, reasoning: reasoning, duration: duration,
-            skills: skills, sessionId: origin.sessionId
+            skills: skills, knowledgeRefs: knowledgeRefs,
+            phaseTrail: chainTrail, sessionId: origin.sessionId
         )
         if let assistantEntry = stoppedTurn.assistant {
             try appendPinned(assistantEntry, origin: origin)
         }
-        streamingText = ""
-        streamingThink = ""
+        mutateStream(origin.sessionId) { $0.text = ""; $0.think = "" }
         if stopped {
             // 「⏹ 已停止」注记：停止的唯一持久反馈（有无部分内容文案分两态）
             try? appendPinned(stoppedTurn.note, origin: origin)
         }
-        // 完成回调（产物解析 / 阶段推进等编排副作用）仅在自然完成且用户仍停留在
-        // 发起会话时执行——被停止的中途回合不得推进阶段或解析半截产物；
-        // 回调读取当前 pipeline 上下文，已切走则只落盘，副作用随会话保留待后续。
-        if !stopped, let assistantEntry = stoppedTurn.assistant, origin.sessionId == sessionId {
+        // 完成回调（产物解析 / 阶段推进等编排副作用）——阶段 2 后台完成语义：
+        // 自然完成（非停止/非错误）即回调，无论用户是否停留在发起会话。
+        // AppModel 落盘段以 origin 口径执行（回复落盘已按 origin 钉回，回调再补
+        // 产物解析/系统行/事件日志）；被停止的中途回合不回调——不得推进阶段或
+        // 解析半截产物。旧门（origin.sessionId == 当前 sessionId）会漏掉后台
+        // 完成的落盘段，产物只在用户恰好停留时才写盘。
+        if !stopped, let assistantEntry = stoppedTurn.assistant {
             onAssistant?(assistantEntry)
         }
     }

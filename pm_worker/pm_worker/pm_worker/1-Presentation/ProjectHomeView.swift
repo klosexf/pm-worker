@@ -40,7 +40,8 @@ struct ProjectHomeView: View {
     @State private var showCompare = false
 
     var body: some View {
-        DSScroll {
+        // 右栏展开时本栏右缘贴 HSplitView 分割条，滚动条内收让位（见 dsScrollDividerEdgeClearance）。
+        DSScroll(edgeClearance: dsScrollDividerEdgeClearance) {
             VStack(alignment: .leading, spacing: DS.Spacing.s32) {
                 // 封板黄条置顶：项目存在已封板版本时提示（最新封板版本号）
                 if let latestReleased = releasedVersions.max() {
@@ -53,6 +54,7 @@ struct ProjectHomeView: View {
                 section("目标收敛句") {
                     TextEditor(text: $goalStatement)
                         .font(DS.Font.bodyBase)
+                        .scrollIndicators(.never)  // macOS 26 滚动条槽静止也绘制
                         .dsTextarea(focused: false, minHeight: 56)
                         .onChange(of: goalStatement) { _, _ in saveProject() }
                 }
@@ -296,14 +298,37 @@ struct ProjectHomeView: View {
                             .background(Capsule().fill(Color.statusSuccessSurface1))
                     }
                 }
-                // 四阶段状态点（M1 骨架：全灰；M2 状态机接入后点亮）
+                // 四阶段状态点（磁盘点亮，2026-09-17 路径选择）：确认 = 品牌色；
+                // 跳过 = 灰点 + 「跳过」+ 补做入口；停驻 = 品牌色 + 「停驻」；未达 = 灰。
                 HStack(spacing: DS.Spacing.s16) {
-                    ForEach(["澄清", "结构", "原型", "PRD"], id: \.self) { stage in
+                    ForEach(stageDots(version)) { dot in
                         HStack(spacing: DS.Spacing.s4) {
-                            Circle().fill(Color.overlayL2).frame(width: 5, height: 5)
-                            Text(stage)
+                            Circle().fill(dot.light.dotColor).frame(width: 5, height: 5)
+                            Text(dot.name)
                                 .font(DS.Font.bodyXS)
-                                .foregroundStyle(Color.ink500)
+                                .foregroundStyle(dot.light == .dim ? Color.ink500 : Color.ink700)
+                            if dot.light == .skipped {
+                                Text("跳过")
+                                    .font(DS.Font.bodyXS)
+                                    .foregroundStyle(Color.ink300)
+                                if let target = dot.backfill, !isReleased {
+                                    Button("补做") {
+                                        // 补做：开新会话切到该版本上下文，删跳过标记重新生成
+                                        model.selection = .session(
+                                            project: projectName, version: version,
+                                            sessionId: UUID().uuidString
+                                        )
+                                        model.requestBackfill(to: target)
+                                    }
+                                    .buttonStyle(.ds(.ghost, size: .sm))
+                                    .help("补做先前跳过的\(dot.name)：删跳过标记，重新生成并确认")
+                                }
+                            }
+                            if dot.light == .stopped {
+                                Text("停驻")
+                                    .font(DS.Font.bodyXS)
+                                    .foregroundStyle(Color.ink300)
+                            }
                         }
                     }
                 }
@@ -341,6 +366,67 @@ struct ProjectHomeView: View {
             }
         }
         .dsCard(padding: DS.Spacing.s16)
+    }
+
+    // MARK: - 四阶段磁盘点亮（2026-09-17 路径选择）
+
+    /// 单点点亮态（磁盘事实源推导）。
+    private enum StageLight {
+        case confirmed  // 阶段闭环：confirmed.json（PRD 看产物落盘）→ 品牌色
+        case skipped    // 路径选择跳过：skipped.json → 灰点 + 「跳过」+ 可补做
+        case stopped    // ③「到原型为止」停驻：confirmed + stopped-here.json
+        case dim        // 未达 → 灰
+
+        var dotColor: Color {
+            switch self {
+            case .confirmed, .stopped: Color.brand600
+            case .skipped: Color.ink300
+            case .dim: Color.overlayL2
+            }
+        }
+    }
+
+    /// 时间线单点信息（Identifiable 按阶段名）。
+    private struct StageDot: Identifiable {
+        let name: String
+        let light: StageLight
+        /// 跳过阶段的补做目标（仅 skipped 态非 nil）。
+        let backfill: PipelineRun.Stage?
+        var id: String { name }
+    }
+
+    /// 四阶段点亮态磁盘推导（与 PipelineEngine.deriveStage 同源口径）。
+    private func stageDots(_ version: String) -> [StageDot] {
+        let dir = PMAgentStore.versionURL(project: projectName, version: version)
+        let fm = FileManager.default
+        let has = { (rel: String) in fm.fileExists(atPath: dir.appendingPathComponent(rel).path) }
+        func gate(_ rel: String) -> StageLight {
+            has("\(rel)/confirmed.json") ? .confirmed
+                : (has("\(rel)/skipped.json") ? .skipped : .dim)
+        }
+        let structureLight = gate("02-structure")
+        var prototypeLight = gate("03-prototypes")
+        if prototypeLight == .confirmed, has(PipelineEngine.stopHereMarker) {
+            prototypeLight = .stopped
+        }
+        return [
+            StageDot(
+                name: "澄清",
+                light: has(ArtifactPath.clarification) ? .confirmed : .dim, backfill: nil
+            ),
+            StageDot(
+                name: "结构", light: structureLight,
+                backfill: structureLight == .skipped ? .structure : nil
+            ),
+            StageDot(
+                name: "原型", light: prototypeLight,
+                backfill: prototypeLight == .skipped ? .prototype : nil
+            ),
+            StageDot(
+                name: "PRD",
+                light: has(ArtifactPath.prd) ? .confirmed : .dim, backfill: nil
+            ),
+        ]
     }
 
     // MARK: - project.json 读写

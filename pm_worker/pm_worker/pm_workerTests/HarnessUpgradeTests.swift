@@ -383,7 +383,7 @@ final class HarnessUpgradeTests: XCTestCase {
 
     func testClarifyPromptMentionsQualityGate() {
         // 质量门契约进入 clarify prompt 冻结段（模型诚实填 missing 的激励）
-        let prompt = AgentPrompts.clarify(rounds: 2, limit: 5, injection: "")
+        let prompt = AgentPrompts.clarify(injection: "")
         XCTAssertTrue(prompt.contains("质量门"))
         XCTAssertTrue(prompt.contains("禁止为凑轮次虚构缺项"))
     }
@@ -391,7 +391,7 @@ final class HarnessUpgradeTests: XCTestCase {
     func testClarifyPromptMentionsAmbiguityDecomposition() {
         // 含混请求拆解内建澄清 prompt（skills-inventory §4.3 P1 · incoming-request-advisor
         // 二选一裁决：每轮必读走确定性注入，不做语义检索的独立技能卡）
-        let prompt = AgentPrompts.clarify(rounds: 2, limit: 5, injection: "")
+        let prompt = AgentPrompts.clarify(injection: "")
         XCTAssertTrue(prompt.contains("含混请求拆解"))
         XCTAssertTrue(prompt.contains("真实任务"))
     }
@@ -399,7 +399,7 @@ final class HarnessUpgradeTests: XCTestCase {
     func testClarifyPromptMentionsDiscussionAndFirstPrinciples() {
         // 正面回答讨论 + 主动建议 + 第一性原理三条契约进入 clarify prompt 冻结段；
         // 自检 rubric 同步兜底（模型自评可查）
-        let prompt = AgentPrompts.clarify(rounds: 2, limit: 5, injection: "")
+        let prompt = AgentPrompts.clarify(injection: "")
         XCTAssertTrue(prompt.contains("正面回答讨论"))
         XCTAssertTrue(prompt.contains("不回避、不绕到提问"))
         XCTAssertTrue(prompt.contains("主动提出你的建议和想法"))
@@ -413,7 +413,7 @@ final class HarnessUpgradeTests: XCTestCase {
     func testClarifyPromptCoreBehaviorConstraints() {
         // 核心行为约束五条契约（需求穿透+小白视角 / 先排问题 / 延伸 / 开工前对齐 / 说人话）
         // 进入 clarify prompt 冻结段；自检 rubric 同步兜底
-        let prompt = AgentPrompts.clarify(rounds: 2, limit: 5, injection: "")
+        let prompt = AgentPrompts.clarify(injection: "")
         XCTAssertTrue(prompt.contains("需求穿透"))                 // 约束 11
         XCTAssertTrue(prompt.contains("如果长辈第一次用会怎样"))     // 小白视角检验标准
         XCTAssertTrue(prompt.contains("先排问题，不排功能"))         // 约束 12

@@ -68,20 +68,47 @@ final class ReferencedFileTests: XCTestCase {
         XCTAssertTrue(text.contains("不要"), "须显式禁止『无法访问文件系统』式回答")
     }
 
+    // MARK: - 动态材料尾条协议（前缀缓存改造：引用文件正文并入尾条）
+
+    func testContextTailComposeSplitRoundtrip() {
+        // 空尾 = 原样（不产生标记，split 恒得空尾）
+        let frozen = "冻结 system prompt"
+        XCTAssertEqual(ContextTail.compose(system: frozen, tail: ""), frozen)
+        XCTAssertEqual(ContextTail.split(frozen).system, frozen)
+        XCTAssertEqual(ContextTail.split(frozen).tail, "")
+
+        // 往返恒等：compose → split 还原冻结段与动态材料（字节级）
+        let tail = "### 记忆\n- [结论] 目标用户是独立开发者"
+        let composed = ContextTail.compose(system: frozen, tail: tail)
+        XCTAssertTrue(composed.contains(ContextTail.marker), "复合 prompt 须含分割标记")
+        let (system, extracted) = ContextTail.split(composed)
+        XCTAssertEqual(system, frozen)
+        XCTAssertEqual(extracted, tail)
+    }
+
+    func testTailAppendingAddsSingleUserMessageAfterHistory() {
+        let history = [
+            ChatMessage(role: .system, content: "冻结 system"),
+            ChatMessage(role: .user, content: "用户问题"),
+        ]
+        // 空尾原样返回（无多余消息）
+        XCTAssertEqual(VolatileTailMaterial.appending(history, tail: ""), history)
+
+        // 非空尾：追加一条 user 角色尾条（当前用户消息之后），携带自述头防误认为用户发言
+        let withTail = VolatileTailMaterial.appending(history, tail: "### 检索参考\n- [卡名/scope]")
+        XCTAssertEqual(withTail.count, history.count + 1)
+        XCTAssertEqual(withTail.last?.role, .user)
+        XCTAssertTrue(withTail.last?.content.contains("【动态材料 · 系统注入】") ?? false)
+        XCTAssertTrue(withTail.last?.content.contains("不是用户新发言") ?? false)
+        XCTAssertTrue(withTail.last?.content.contains("### 检索参考") ?? false)
+        // 历史本体不被改写
+        XCTAssertEqual(Array(withTail.prefix(history.count)), history)
+    }
+
     func testAugmentWithoutRefsIsIdentity() {
-        let prompt = "系统提示词"
-        XCTAssertEqual(
-            ReferencedFileMaterial.augment(
-                systemPrompt: prompt, refs: [], project: project, version: version
-            ),
-            prompt
-        )
-        XCTAssertEqual(
-            ReferencedFileMaterial.augment(
-                systemPrompt: prompt, refs: ["  "], project: project, version: version
-            ),
-            prompt
-        )
+        // 引用文件段归位尾条后，无引用 = 无段落（section nil），尾条协议由上方两用例覆盖
+        XCTAssertNil(section([]))
+        XCTAssertNil(section(["  "]))
     }
 
     func testMissingFileIsReportedInsteadOfSilentlyDropped() throws {

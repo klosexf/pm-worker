@@ -40,6 +40,14 @@ struct WindowChromeConfigurator: NSViewRepresentable {
             WindowChromeConfigurator.configure(window)
             guard let window, attachedWindow !== window else { return }
             attachedWindow = window
+            // 首击直达：pane 宿主视图随布局懒挂载——挂窗时扫一遍 + 两次延迟补扫
+            // （configure 每帧回调，扫树不能放那里，是性能陷阱）。
+            FirstMouseDelivery.enable(in: window)
+            for delay in [0.5, 2.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
+                    if let window { FirstMouseDelivery.enable(in: window) }
+                }
+            }
             WindowFrameMemory.restore(into: window)
             observeFrameChanges(of: window)
         }
@@ -90,10 +98,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
         if !window.styleMask.contains(.fullSizeContentView) {
             window.styleMask.insert(.fullSizeContentView)
         }
-        // 后台窗口第一击直达控件（2026-09-16「采纳方案点了没反应」事故根因之一）：
-        // 用户在 IDE / 手机镜像 / 笔记多窗口间来回切时，从后台点本 App 的第一击
-        // 默认只激活窗口、不送达按钮——每次都白点。改为 Xcode 式工具 App 手感。
-        FirstMouseDelivery.enable(for: window)
+        // 后台窗口第一击直达控件：见 FirstMouseDelivery（挂窗时扫树补丁，
+        // 不在此每帧路径——configure 逐帧回调，扫树是性能陷阱）。
         // 窗口背景不整体可拖（否则对话区等正文区域长按会拖动整个窗口）；
         // 移动窗口改由顶栏行的 WindowDragArea 接管。
         // 隐藏系统红绿灯（关闭 / 最小化 / 缩放）——顶部安全区随之不再预留
@@ -118,18 +124,29 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 /// 未覆写 acceptsFirstMouse，走 NSView 默认 = 不接受）。本 App 是多窗口工作流
 /// 里的常驻工具——用户从 IDE / 镜像 / 笔记切回来点台账、确认坞，第一击必须
 /// 生效，否则永远「点了没反应」。
-/// 实现：给本窗口内容视图的**具体类**（NSHostingView<ContentView>，SwiftUI
-/// 自动生成的子类）补一个 acceptsFirstMouse override——class_addMethod 只挂
-/// 这一棵类，不改 NSView 全局默认；幂等（每类只装一次），重复挂载零副作用。
+/// 实现：遍历窗口视图树，给每个 **NSHostingView 系类**（根 + HSplitView 各
+/// pane 的宿主视图是不同泛型实例，2026-09-17 修正：只补根类不生效——真正
+/// 的命中目标是 pane 宿主视图）补 acceptsFirstMouse override——class_addMethod
+/// 只挂命中的类，不改 NSView 全局默认；幂等（每类只装一次）。
 @MainActor
 enum FirstMouseDelivery {
     private static var enabledClasses: Set<ObjectIdentifier> = []
 
-    static func enable(for window: NSWindow) {
+    static func enable(in window: NSWindow) {
         guard let contentView = window.contentView else { return }
-        let cls: AnyClass = type(of: contentView)
+        patchTree(contentView)
+    }
+
+    private static func patchTree(_ view: NSView) {
+        patch(view)
+        view.subviews.forEach(patchTree)
+    }
+
+    private static func patch(_ view: NSView) {
+        let cls: AnyClass = type(of: view)
         let key = ObjectIdentifier(cls)
         guard !enabledClasses.contains(key) else { return }
+        guard isHostingView(cls) else { return }
         let sel = #selector(NSView.acceptsFirstMouse(for:))
         // 判断 cls 是否**直接**定义了该方法（class_getInstanceMethod 会命中
         // 继承链上的 NSView 实现，不能用它判重）——直接定义才允许改写，否则新增。
@@ -148,9 +165,20 @@ enum FirstMouseDelivery {
         } else if class_addMethod(cls, sel, imp, types) {
             // 新增 override 成功
         } else {
-            return // 竞态兜底：加挂失败不重复标记，下次挂载重试
+            return // 竞态兜底：加挂失败不重复标记，下次扫描重试
         }
         enabledClasses.insert(key)
+    }
+
+    /// 宿主视图判定：类或其任意祖先的运行时名含 NSHostingView
+    /// （覆盖泛型特化与 SwiftUI 内部 ViewHost 等子类命名）。
+    private static func isHostingView(_ cls: AnyClass) -> Bool {
+        var c: AnyClass? = cls
+        while let current = c, current as AnyObject !== NSView.self {
+            if NSStringFromClass(current).contains("NSHostingView") { return true }
+            c = class_getSuperclass(current)
+        }
+        return false
     }
 
     /// 只为借 IMP 的空壳视图：语义 = 第一击一律送达（与 DividerHandle 同签名，

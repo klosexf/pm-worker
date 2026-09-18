@@ -304,11 +304,15 @@ nonisolated extension MethodologyCard {
 
         let fullBody = body.joined(separator: "\n")
         let annotationHeader = "## 实战注记"
+        let principleHeader = "## 为什么有效"
         var content = fullBody
+        var principle: String?
         var annotations: [Annotation] = []
 
+        // 先拆注记区（「## 实战注记」之后全部是注记），再在正文区拆「## 为什么有效」节
+        //（写时富化 2026-09-17：principle 节位于正文与注记区之间；旧卡无此节照常解析）
         if let range = fullBody.range(of: annotationHeader) {
-            content = String(fullBody[..<range.lowerBound])
+            let beforeAnnotations = String(fullBody[..<range.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let annotationBlock = String(fullBody[range.upperBound...])
             for line in annotationBlock.split(separator: "\n") {
@@ -333,6 +337,19 @@ nonisolated extension MethodologyCard {
                 }
                 annotations.append(Annotation(date: "", project: "", note: note))
             }
+            if let pRange = beforeAnnotations.range(of: principleHeader) {
+                principle = String(beforeAnnotations[pRange.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                content = String(beforeAnnotations[..<pRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                content = beforeAnnotations
+            }
+        } else if let pRange = fullBody.range(of: principleHeader) {
+            principle = String(fullBody[pRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            content = String(fullBody[..<pRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
             content = fullBody.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -346,6 +363,7 @@ nonisolated extension MethodologyCard {
             supersededBy: fields["supersededBy"].flatMap { $0 == "null" ? nil : $0 },
             created: fields["created"] ?? ISO8601.dayString(),
             content: content,
+            principle: principle,
             annotations: annotations
         )
     }

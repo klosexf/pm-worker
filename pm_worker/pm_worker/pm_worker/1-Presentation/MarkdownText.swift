@@ -424,8 +424,8 @@ nonisolated enum MarkdownParser {
 
 // MARK: - 渲染视图
 
-/// 对话内容 Markdown 渲染（方案 A「阅读栏 · 刻度阶梯」）：块级 VStack，正文 chatBase 15
-/// （行距 1.72×）、导语 16、标题刻度阶梯 26/21/17/15、小节标签 13、表格 13.5、
+/// 对话内容 Markdown 渲染（方案 A「阅读栏 · 刻度阶梯」）：块级 VStack，正文 chatBodySize 14
+/// （行距 1.72×）、导语 15、标题刻度阶梯 26/21/17/15、小节标签 13、表格 13.5、
 /// 行内代码 12.5、代码块 mono 13——字级刻度 + 样式差协同承担层级。
 /// 跨块连续选取：相邻正文块（标题/段落）聚合为 ProseTextView 合并渲染成
 /// 单个 Text——SwiftUI textSelection 只在单个 Text 内生效，逐块独立 Text 时
@@ -439,14 +439,16 @@ nonisolated enum MarkdownParser {
 /// longDocument 长文档阅读档（.md 产物预览弹框等整篇场景）：
 /// 合并 Text 遇上万字符级整篇文档会退化成巨型 Text——CoreText 排版超线性
 /// （实测 10k 字 ≈1.3s 主线程阻塞，`.fixedSize` 全高求值放大 pass 数），
-/// 且普通 VStack 一次性排版全部块、离屏 mermaid WKWebView 也全部实例化。
+/// 且整篇一次性排版会让离屏 mermaid WKWebView 也全部实例化。
 /// 该档位做两件事：① prose 合并分块封顶（单 Text ≤ 8 块且 ≤ 1200 字，
-/// 拖选跨块能力保留在块内，块间断开可接受）；② LazyVStack 惰性布局，
-/// 首屏只排可见段，离屏图表/表格滚动到才渲染。
+/// 拖选跨块能力保留在块内，块间断开可接受）；② 整篇急切排版（VStack，
+/// 2026-09-17 弹框滚动卡顿修复）——LazyVStack 的估算高度修正 / 进视口
+/// 排版尖刺 / scrollTo 落估算几何在滚动期表现为持续卡顿（见
+/// legacySegmentsView 注释），急切档开窗成本由 sheet 呈现动画遮盖。
 struct MarkdownText: View {
     let text: String
-    /// 段落基准字号（默认 chatBase 15）。
-    var bodySize: CGFloat = 15
+    /// 段落基准字号（默认 chatBodySize 14）。
+    var bodySize: CGFloat = DS.Typography.chatBodySize
     /// true = mermaid 围栏直接内联渲染；false（流式期间）= 降级为代码块——
     /// 流式中的 mermaid 源未闭合、逐 tick 变化，内联渲染会让 WKWebView
     /// 每次快照都整页重载，等流结束（正式条目）再渲染图表。
@@ -467,7 +469,7 @@ struct MarkdownText: View {
     private static let proseChunkChars = 1200
 
     init(
-        _ text: String, bodySize: CGFloat = 15, liveMermaid: Bool = true,
+        _ text: String, bodySize: CGFloat = DS.Typography.chatBodySize, liveMermaid: Bool = true,
         longDocument: Bool = false, readingMeasure: CGFloat? = nil,
         semanticSections: Bool = false
     ) {
@@ -509,7 +511,13 @@ struct MarkdownText: View {
         }
     }
 
-    /// 原路径：整条回答不按 ## 分节，块序列照排（longDocument 档走 LazyVStack）。
+    /// 原路径：整条回答不按 ## 分节，块序列照排。
+    /// longDocument 档同样走 VStack 急切排版（2026-09-17 弹框滚动卡顿修复）：
+    /// LazyVStack 有三个卡顿源——①未物化行按估算高度占位，实际高度算出后
+    /// 反复修正 offset，滚动一顿一顿；②新行进视口才排版，每行一次主线程
+    /// 排版尖刺；③拖动细胶囊 scrollTo(y:) 落在估算几何上忽跳忽停。
+    /// 急切一次性排版把成本挪到开窗瞬间（sheet 呈现动画遮盖），滚动期零
+    /// 排版、内容几何稳定——对话页每条消息本就整条急切排版，同款承受力。
     @ViewBuilder
     private func legacySegmentsView(_ blocks: [MarkdownParser.Block]) -> some View {
         let segments = longDocument
@@ -519,14 +527,8 @@ struct MarkdownText: View {
                 proseCharLimit: Self.proseChunkChars
             )
             : Self.segments(from: blocks)
-        if longDocument {
-            LazyVStack(alignment: .leading, spacing: DS.Typography.paragraphSpacing) {
-                segmentList(segments)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: DS.Typography.paragraphSpacing) {
-                segmentList(segments)
-            }
+        VStack(alignment: .leading, spacing: DS.Typography.paragraphSpacing) {
+            segmentList(segments)
         }
     }
 

@@ -3,7 +3,9 @@
 //  pm_workerTests
 //
 //  M4 Task 4.1 + 4.8：Context Builder 唯一注入收口 + pitfalls 确定性路由进自检清单。
-//  - 规则层常驻注入（预算极小也不裁）
+//  - 规则层常驻注入（预算极小也不裁；冻结段留 systemPrompt）
+//  - 动态材料（记忆/技能正文/检索）不进 systemPrompt——injectionText 承载，
+//    由 SessionStore 以「动态材料尾条」追加（前缀缓存改造，ContextTail 协议）
 //  - 记忆段注入 + 假设态校准文本排段尾（预算压力下最先被裁的位置语义）
 //  - token 预算裁剪优先级（history → retrieval → skillBodies → memory；rules 永不裁）
 //  - 技能正文渐进式披露（命中才注入正文，未命中不注入）
@@ -154,7 +156,9 @@ final class ContextBuilderTests: XCTestCase {
             memoryContext: memoryText, calibration: calibration
         ) { "骨架。" + $0 }
 
-        let prompt = assembly.systemPrompt
+        // 动态材料不进 systemPrompt（ContextTail 尾条协议），全文在 injectionText
+        XCTAssertFalse(assembly.systemPrompt.contains("### 记忆"))
+        let prompt = assembly.injectionText
         XCTAssertTrue(prompt.contains("### 记忆（版本 > 项目，新覆盖旧，不得矛盾）"))
         XCTAssertTrue(prompt.contains("目标用户是独立开发者"))
         XCTAssertTrue(prompt.contains("[经验·假设态] 该用户偏好先看反例再定方案"))
@@ -205,14 +209,14 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertEqual(assembly.breakdown.segments[.history], 0)
         // 检索预算 1 → 卡片行全裁（段省略）
         XCTAssertTrue(assembly.breakdown.trimmed.contains(.retrieval))
-        XCTAssertFalse(assembly.systemPrompt.contains("### 检索参考"))
+        XCTAssertFalse(assembly.injectionText.contains("### 检索参考"))
         // 技能正文预算 5 → 整块丢弃（不截断正文，保持技能完整性）
         XCTAssertTrue(assembly.breakdown.trimmed.contains(.skillBodies))
-        XCTAssertFalse(assembly.systemPrompt.contains("BUDGET_SKILL_BODY_SENTINEL"))
+        XCTAssertFalse(assembly.injectionText.contains("BUDGET_SKILL_BODY_SENTINEL"))
         XCTAssertTrue(assembly.injectedSkillBodies.isEmpty)
         // 记忆预算 5 → 尾部逐行丢至空（段省略）
         XCTAssertTrue(assembly.breakdown.trimmed.contains(.memory))
-        XCTAssertFalse(assembly.systemPrompt.contains("### 记忆"))
+        XCTAssertFalse(assembly.injectionText.contains("### 记忆"))
         XCTAssertLessThanOrEqual(assembly.breakdown.segments[.memory] ?? 99, 5)
         // rules 常驻不裁
         XCTAssertFalse(assembly.breakdown.trimmed.contains(.rules))
@@ -260,11 +264,11 @@ final class ContextBuilderTests: XCTestCase {
             memoryContext: "", calibration: []
         ) { "骨架。" + $0 }
 
-        // 命中技能正文注入（带 id 标头，按相关度降序）
-        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：技能X"))
-        XCTAssertTrue(assembly.systemPrompt.contains("PROGRESSIVE_X_SENTINEL"))
+        // 命中技能正文注入（带 id 标头，按相关度降序）——动态材料进 injectionText
+        XCTAssertTrue(assembly.injectionText.contains("#### 技能：技能X"))
+        XCTAssertTrue(assembly.injectionText.contains("PROGRESSIVE_X_SENTINEL"))
         // 未命中技能正文不注入——渐进式披露（E11 在组装层的证明）
-        XCTAssertFalse(assembly.systemPrompt.contains("PROGRESSIVE_Y_SENTINEL"))
+        XCTAssertFalse(assembly.injectionText.contains("PROGRESSIVE_Y_SENTINEL"))
         XCTAssertEqual(assembly.injectedSkillBodies.count, 1)
         XCTAssertTrue(assembly.injectedSkillBodies[0].hasPrefix("技能X：\n"))
         // skillIds 与注入正文同口径（过预算裁剪后实际注入的技能 id）
@@ -313,9 +317,9 @@ final class ContextBuilderTests: XCTestCase {
             memoryContext: "", calibration: []
         ) { "骨架。" + $0 }
 
-        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：语义技能"))
+        XCTAssertTrue(assembly.injectionText.contains("#### 技能：语义技能"))
         // 锚点不注入：语义命中存在 = 意图已表达，阶段不再强制塞技能
-        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertFalse(assembly.injectionText.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["语义技能"])
         // 计数收口：注入的语义技能 +1，未注入的锚点 0
         let counts = try await database.dbQueue.read { db -> [String: Int] in
@@ -353,8 +357,8 @@ final class ContextBuilderTests: XCTestCase {
         ) { "骨架。" + $0 }
 
         // 技能段整段省略（零注入），锚点也不兜底
-        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
-        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertFalse(assembly.injectionText.contains("### 技能正文"))
+        XCTAssertFalse(assembly.injectionText.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertTrue(assembly.skillIds.isEmpty)
         XCTAssertTrue(assembly.injectedSkillBodies.isEmpty)
         // 未注入不计命中数
@@ -394,8 +398,8 @@ final class ContextBuilderTests: XCTestCase {
             memoryContext: "", calibration: []
         ) { "骨架。" + $0 }
 
-        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：高保真原型设计"))
-        XCTAssertTrue(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertTrue(assembly.injectionText.contains("#### 技能：高保真原型设计"))
+        XCTAssertTrue(assembly.injectionText.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
         // 兜底注入计入命中数（正文实际进上下文 = 实际应用）
         let anchorHits = try await database.dbQueue.read { db in
@@ -444,8 +448,8 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertEqual(probe.calls, 1)
         XCTAssertEqual(probe.lastQuery, "这个按钮应该放在哪里")
         XCTAssertEqual(probe.lastCandidateIDs, ["高保真原型设计"])
-        XCTAssertTrue(assembly.systemPrompt.contains("#### 技能：高保真原型设计"))
-        XCTAssertTrue(assembly.systemPrompt.contains("JUDGE_SENTINEL"))
+        XCTAssertTrue(assembly.injectionText.contains("#### 技能：高保真原型设计"))
+        XCTAssertTrue(assembly.injectionText.contains("JUDGE_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
         // 判定结果进检查器报告
         XCTAssertEqual(assembly.skillJudgeReport?.available, true)
@@ -484,8 +488,8 @@ final class ContextBuilderTests: XCTestCase {
             skillJudge: { _, _ in [] }
         ) { "骨架。" + $0 }
 
-        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
-        XCTAssertFalse(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertFalse(assembly.injectionText.contains("### 技能正文"))
+        XCTAssertFalse(assembly.injectionText.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertTrue(assembly.skillIds.isEmpty)
         XCTAssertEqual(assembly.skillJudgeReport?.available, true)
         XCTAssertEqual(assembly.skillJudgeReport?.picked, [])
@@ -525,7 +529,7 @@ final class ContextBuilderTests: XCTestCase {
 
         XCTAssertEqual(probe.calls, 0)
         XCTAssertNil(assembly.skillJudgeReport)  // 未调用 → 无报告
-        XCTAssertTrue(assembly.systemPrompt.contains("LOCAL_HIT_SENTINEL"))
+        XCTAssertTrue(assembly.injectionText.contains("LOCAL_HIT_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["技能X"])
     }
 
@@ -552,7 +556,7 @@ final class ContextBuilderTests: XCTestCase {
             skillJudge: { _, _ in nil }
         ) { "骨架。" + $0 }
 
-        XCTAssertTrue(assembly.systemPrompt.contains("STAGE_ANCHOR_SENTINEL"))
+        XCTAssertTrue(assembly.injectionText.contains("STAGE_ANCHOR_SENTINEL"))
         XCTAssertEqual(assembly.skillIds, ["高保真原型设计"])
         XCTAssertEqual(assembly.skillJudgeReport?.available, false)
     }
@@ -579,7 +583,7 @@ final class ContextBuilderTests: XCTestCase {
             skillJudge: { _, _ in nil }
         ) { "骨架。" + $0 }
 
-        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
+        XCTAssertFalse(assembly.injectionText.contains("### 技能正文"))
         XCTAssertTrue(assembly.skillIds.isEmpty)
         XCTAssertEqual(assembly.skillJudgeReport?.available, false)
     }
@@ -662,13 +666,14 @@ final class ContextBuilderTests: XCTestCase {
             return "骨架。" + injection
         }
 
-        // 空段省略：记忆/技能正文/检索段整段不出现
-        let prompt = assembly.systemPrompt
-        XCTAssertFalse(prompt.contains("### 记忆"))
-        XCTAssertFalse(prompt.contains("### 技能正文"))
-        XCTAssertFalse(prompt.contains("### 检索参考"))
-        // 规则层常驻 → 注入区非空（promptBuilder 必拿到规则段）
-        XCTAssertTrue(capturedInjection.contains("### 规则层"))
+        // 空段省略：记忆/技能正文/检索段整段不出现（动态材料为空 → 无尾条）
+        XCTAssertTrue(assembly.injectionText.isEmpty)
+        XCTAssertFalse(assembly.systemPrompt.contains("### 记忆"))
+        XCTAssertFalse(assembly.systemPrompt.contains("### 技能正文"))
+        XCTAssertFalse(assembly.systemPrompt.contains("### 检索参考"))
+        // promptBuilder 恒收空串（动态材料不再嵌骨架注入位）；规则层留冻结段
+        XCTAssertEqual(capturedInjection, "")
+        XCTAssertTrue(assembly.systemPrompt.contains("### 规则层"))
         // 空库无命中但 trace 仍可观测
         let trace = try XCTUnwrap(assembly.retrieval)
         XCTAssertTrue(trace.hits.isEmpty)

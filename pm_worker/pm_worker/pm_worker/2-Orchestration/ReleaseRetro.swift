@@ -38,10 +38,17 @@ nonisolated struct ReleaseRetro: Equatable {
     var confirmOutcomes: [String: Int] = [:]
     /// 决策留痕条数（decisions.jsonl 全量行）。
     var decisions: Int = 0
+    /// 本版采纳的方法论卡标题（events.jsonl methodAdopt，出现顺序）。
+    var methodAdoptions: [String] = []
+    /// 本版推荐被跳过总次数（events.jsonl methodSkip）。
+    var methodSkips: Int = 0
+    /// 同版本内被跳过 ≥2 次的卡标题（该质疑：补充案例、更新或退场）。
+    var methodQuestionable: [String] = []
 
     /// 三类信号全空 → 不渲染复盘段。
     var isEmpty: Bool {
         proposals == 0 && invalidations.isEmpty && confirmOutcomes.isEmpty
+            && methodAdoptions.isEmpty && methodSkips == 0
     }
 
     // MARK: - 渲染
@@ -74,6 +81,15 @@ nonisolated struct ReleaseRetro: Equatable {
         }
         if let segment = confirmSegment { lines.append("- \(segment)") }
         if decisions > 0 { lines.append("- 决策留痕 \(decisions) 条（decisions.jsonl）") }
+        // 方法论使用报告（2026-09-17 钦定反哺机制③）：确定性统计，
+        // 素材随版落 release-notes，并作下版本开工档案袋的输入
+        if !methodAdoptions.isEmpty {
+            lines.append("- 方法论使用：采纳 \(methodAdoptions.count) 张（\(methodAdoptions.prefix(4).joined(separator: "、"))）")
+        }
+        if methodSkips > 0 { lines.append("- 方法论推荐被跳过 \(methodSkips) 次") }
+        if !methodQuestionable.isEmpty {
+            lines.append("- 待校准：\(methodQuestionable.joined(separator: "、"))——本版连续被跳过，建议补充案例、更新或退场")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -155,6 +171,26 @@ nonisolated struct ReleaseRetro: Equatable {
             outcomeCounts[outcome, default: 0] += 1
         }
         retro.confirmOutcomes = outcomeCounts
+
+        // 方法论使用分布（events.jsonl methodAdopt / methodSkip，2026-09-17 钦定）：
+        // detail 协议 = "id|标题"（AppModel 采纳/跳过时写入）
+        var adoptions: [String] = []
+        var skipTitles: [String: Int] = [:]
+        for event in events {
+            let title = event.detail.split(separator: "|", maxSplits: 1)
+                .dropFirst().first.map(String.init) ?? event.detail
+            switch event.kind {
+            case .methodAdopt: adoptions.append(title)
+            case .methodSkip: skipTitles[title, default: 0] += 1
+            default: break
+            }
+        }
+        retro.methodAdoptions = adoptions
+        retro.methodSkips = skipTitles.values.reduce(0, +)
+        retro.methodQuestionable = skipTitles
+            .filter { $0.value >= 2 }
+            .map(\.key)
+            .sorted()
 
         // 决策留痕条数
         retro.decisions = PMAgentStore.readLines(

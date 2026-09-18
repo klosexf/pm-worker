@@ -59,6 +59,9 @@ struct RiskRecord: Codable, Equatable {
     var originRef: String
     /// 结算时回填：决策日志编号 / 重开原因 / 自留说明
     var resolution: String?
+    /// 执行包产物（采纳落实闭环落盘的 md，相对版本目录如
+    /// 05-artifacts/risk-plans/r_xx.md；nil = 未走落实/旧条目）
+    var planArtifact: String?
     var createdAt: String
     var closedAt: String?
 
@@ -73,6 +76,7 @@ struct RiskRecord: Codable, Equatable {
         status: Status = .open,
         originRef: String,
         resolution: String? = nil,
+        planArtifact: String? = nil,
         createdAt: String = ISO8601.timestamp(),
         closedAt: String? = nil
     ) {
@@ -86,6 +90,7 @@ struct RiskRecord: Codable, Equatable {
         self.status = status
         self.originRef = originRef
         self.resolution = resolution
+        self.planArtifact = planArtifact
         self.createdAt = createdAt
         self.closedAt = closedAt
     }

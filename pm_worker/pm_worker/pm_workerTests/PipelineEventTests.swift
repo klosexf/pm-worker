@@ -125,18 +125,23 @@ final class PipelineEventTests: XCTestCase {
     // MARK: - ③ 稳定前缀（缓存命中契约）
 
     func testClarifyPrefixStableAcrossRounds() {
-        let p1 = AgentPrompts.clarify(rounds: 1, limit: 5, injection: "")
-        let p4 = AgentPrompts.clarify(rounds: 4, limit: 5, injection: "")
-        let prefix = commonPrefix(p1, p4)
-        // 冻结段完整落在公共前缀里（角色/约束/自评审起点）
-        XCTAssertTrue(prefix.contains("角色：资深产品顾问"))
-        XCTAssertTrue(prefix.contains("轮次耗尽仍有必填项缺失"))
-        // 轮次是易变段：不在公共前缀（1 轮 vs 4 轮首个差异即轮次行）
-        XCTAssertFalse(prefix.contains("已问 1 轮"))
-        XCTAssertFalse(prefix.contains("已问 4 轮"))
-        // 轮次行在尾部（注入区之后）
-        let p = AgentPrompts.clarify(rounds: 2, limit: 5, injection: "### 规则层")
-        XCTAssertGreaterThan(p.range(of: "## 当前轮次")!.lowerBound, p.range(of: "注入区")!.lowerBound)
+        // 2026-09-18 迁移后更强断言：轮次状态/基底段出冻结段（clarifyStateSection
+        // → volatileTail 尾条），澄清 system prompt 跨轮次字节级不变
+        let p1 = AgentPrompts.clarify(injection: "")
+        let p4 = AgentPrompts.clarify(injection: "")
+        XCTAssertEqual(p1, p4, "冻结段跨轮次字节级一致（前缀缓存全量命中）")
+        XCTAssertTrue(p1.contains("角色：资深产品顾问"))
+        XCTAssertTrue(p1.contains("轮次耗尽仍有必填项缺失"))
+        XCTAssertFalse(p1.contains("澄清轮次状态"), "轮次状态段不得残留冻结段")
+        XCTAssertFalse(p1.contains("轮，剩余"), "轮次计数行不得残留冻结段")
+        XCTAssertFalse(p1.contains("增补基底"), "基底段不得残留冻结段")
+
+        // 轮次状态独立产出：随轮次变化（尾条数据源）
+        let s1 = AgentPrompts.clarifyStateSection(rounds: 1, limit: 5)
+        let s4 = AgentPrompts.clarifyStateSection(rounds: 4, limit: 5)
+        XCTAssertTrue(s1.contains("已问 1 轮，剩余 4 轮"))
+        XCTAssertTrue(s4.contains("已问 4 轮，剩余 1 轮"))
+        XCTAssertNotEqual(s1, s4)
     }
 
     func testInjectionSectionAtTail() {
@@ -187,21 +192,8 @@ final class PipelineEventTests: XCTestCase {
         )
         XCTAssertTrue(prdPrompt.contains("歧义处理"))
 
-        let clarifyPrompt = AgentPrompts.clarify(rounds: 1, limit: 5, injection: "")
+        let clarifyPrompt = AgentPrompts.clarify(injection: "")
         XCTAssertFalse(clarifyPrompt.contains("歧义处理"))
     }
 
-    // MARK: - Private
-
-    private func commonPrefix(_ a: String, _ b: String) -> String {
-        var common = ""
-        for (ca, cb) in zip(a, b) where ca == cb {
-            common.append(ca)
-        }
-        // 截到最后一个完整行，避免半行噪声
-        if let lastNewline = common.lastIndex(of: "\n") {
-            return String(common[...lastNewline])
-        }
-        return common
-    }
 }

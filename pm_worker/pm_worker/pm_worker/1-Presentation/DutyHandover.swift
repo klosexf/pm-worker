@@ -46,7 +46,7 @@ struct DutyHandoverBar: View {
     struct Live {
         /// 本轮流起始时刻（nil = 尚未进入生成，显示「正在准备…」）。
         let startedAt: Date?
-        /// 已生成字数（store.streamingText.count）。
+        /// 已生成字数（本会话流态 store.currentStream?.text.count）。
         let charCount: Int
     }
 

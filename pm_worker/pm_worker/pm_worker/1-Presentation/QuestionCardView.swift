@@ -31,7 +31,9 @@ nonisolated enum QuestionCardAssembly {
 
 struct ClarifyQuestionCard: View {
     let request: ArtifactParser.QuestionCardRequest
-    let isStreaming: Bool
+    /// 本会话 busy（阶段 3 口径，宿主传 isSessionBusy(本会话)）：问题卡属于当前
+    /// 会话的澄清流——本会话流式/占位中禁动作，他会话的流不影响。
+    let sessionBusy: Bool
     let onSubmit: (String) -> Void
 
     /// 单题作答状态（本地态，不落盘——提交后答案随对话流留痕）。
@@ -205,7 +207,7 @@ struct ClarifyQuestionCard: View {
             .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
         }
         .buttonStyle(.plain)
-        .disabled(isStreaming)
+        .disabled(sessionBusy)  // 本会话 busy（阶段 3 口径）
         .onHover { hovering in
             withAnimation(DS.Motion.springFast) {
                 hoveredRowKey = hovering ? key : nil
@@ -257,7 +259,7 @@ struct ClarifyQuestionCard: View {
             .contentShape(RoundedRectangle(cornerRadius: DS.Radius.lg))
         }
         .buttonStyle(.plain)
-        .disabled(isStreaming)
+        .disabled(sessionBusy)  // 本会话 busy（阶段 3 口径）
         .onHover { hovering in
             withAnimation(DS.Motion.springFast) {
                 hoveredRowKey = hovering ? key : nil
@@ -353,7 +355,7 @@ struct ClarifyQuestionCard: View {
                     .foregroundStyle(Color.brandAccent)
             }
             .buttonStyle(.plain)
-            .disabled(isStreaming)
+            .disabled(sessionBusy)  // 本会话 busy（阶段 3 口径）
         }
         .padding(.horizontal, DS.Spacing.s10)
         .padding(.vertical, DS.Spacing.s8)
@@ -416,7 +418,7 @@ struct ClarifyQuestionCard: View {
                     Text("上一步")
                 }
                 .buttonStyle(.ds(.secondary, size: .sm))
-                .disabled(isStreaming)
+                .disabled(sessionBusy)
 
                 Button {
                     submit()
@@ -428,7 +430,7 @@ struct ClarifyQuestionCard: View {
                     }
                 }
                 .buttonStyle(.ds(.brand, size: .sm))
-                .disabled(isStreaming)
+                .disabled(sessionBusy)
             } else {
                 Button {
                     skipCurrent()
@@ -436,7 +438,7 @@ struct ClarifyQuestionCard: View {
                     Text("跳过此题")
                 }
                 .buttonStyle(.ds(.ghost, size: .sm))
-                .disabled(isStreaming || answers[step] == .skipped)
+                .disabled(sessionBusy || answers[step] == .skipped)
 
                 Button {
                     goPrev()
@@ -444,7 +446,7 @@ struct ClarifyQuestionCard: View {
                     Text("上一步")
                 }
                 .buttonStyle(.ds(.secondary, size: .sm))
-                .disabled(isStreaming || step == 0)
+                .disabled(sessionBusy || step == 0)
 
                 Button {
                     goNext()
@@ -455,7 +457,7 @@ struct ClarifyQuestionCard: View {
                     }
                 }
                 .buttonStyle(.ds(.brand, size: .sm))
-                .disabled(isStreaming || !canAdvance(step))
+                .disabled(sessionBusy || !canAdvance(step))
             }
         }
         .padding(.horizontal, DS.Spacing.s12)

@@ -76,4 +76,23 @@ final class ThinkingEffortTests: XCTestCase {
         let reloaded = SessionStore()
         XCTAssertEqual(reloaded.thinkingEffort, .max)
     }
+
+    // MARK: - ④ 思考强度路由（complete 的阶段级默认）
+
+    func testResolvedEffortRoutesClassifyToLow() {
+        // classify 是内部辅助调用（抽取/压缩/填表）：默认压 low，不陪跑服务端默认 high
+        XCTAssertEqual(LLMClient.resolvedEffort(stage: .classify), "low")
+        // 对话/产物生成阶段不干预（streamChat 直传用户档位，complete 也不越权）
+        XCTAssertNil(LLMClient.resolvedEffort(stage: .clarify))
+        XCTAssertNil(LLMClient.resolvedEffort(stage: .prd))
+        XCTAssertNil(LLMClient.resolvedEffort(stage: .prototype))
+        XCTAssertNil(LLMClient.resolvedEffort(stage: .analysis))
+    }
+
+    func testResolvedEffortExplicitOverrideAlwaysWins() {
+        XCTAssertEqual(LLMClient.resolvedEffort(stage: .classify, override: "max"), "max")
+        XCTAssertEqual(LLMClient.resolvedEffort(stage: .prd, override: "low"), "low")
+        // override 缺席（nil）= 落阶段路由默认，classify 即 low
+        XCTAssertEqual(LLMClient.resolvedEffort(stage: .classify, override: nil), "low")
+    }
 }

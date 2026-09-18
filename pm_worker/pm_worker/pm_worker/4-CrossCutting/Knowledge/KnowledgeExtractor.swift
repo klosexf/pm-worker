@@ -21,6 +21,8 @@ nonisolated enum KnowledgeExtractor {
         var title: String
         /// 方法论正文（卡片 content）
         var content: String
+        /// 为什么有效：底层原理/因果逻辑（写时富化；nil = 模型未提供，兼容旧输出）
+        var principle: String?
         /// 置信度 0-1
         var confidence: Double
     }
@@ -38,28 +40,36 @@ nonisolated enum KnowledgeExtractor {
     // MARK: - LLM 抽取（schema 约束）
 
     /// 方法论抽取 prompt（「这条记下来」卡片路线：把原文提炼成可复用方法论）。
+    /// 写时富化（2026-09-17 钦定）：content 强制三段多行 + principle 底层原理——
+    /// 单行整段卡会让详情层「标题/是什么/全文」三重重复（实测教训），模板层根治。
     static func extractionPrompt(transcript: String) -> String {
-        """
-        从以下内容中抽取「可跨项目复用的产品方法论」。仅输出一个 JSON 数组，\
+        // transcript 置顶：与要点表/记忆抽取共享底稿前缀（provider 前缀缓存，
+        // 2026-09-18 前缀缓存契约——确认链三连抽同一底稿只付一次全价 prefill）。
+        return """
+        ## 对话记录
+        \(transcript)
+
+        ——以上为材料，以下为任务——
+        从上述内容中抽取「可跨项目复用的产品方法论」。仅输出一个 JSON 数组，\
         不要 markdown 围栏、不要任何多余文字。Schema：
         [{"title": "方法论一句话标题（≤20字）", \
-        "content": "方法论正文：定义 + 步骤/做法 + 适用边界（一两句话）", "confidence": 0.8}]
+        "content": "方法论正文，必须三段、每段独立一行，禁止写成一段：\n定义：一句说清是什么\n做法：怎么用，步骤或要点\n适用边界：什么场景适用、什么场景不适用", \
+        "principle": "为什么有效：这条方法论的底层原理/因果逻辑，一两句话", \
+        "confidence": 0.8}]
         规则：只提炼内容中明确出现的方法论，不得推断补全；没有可抽取项输出 []；\
-        聚焦「怎么做事」的通用做法，剥离项目特定细节；中文输出。
-
-        ## 内容
-        \(transcript)
+        聚焦「怎么做事」的通用做法，剥离项目特定细节；content 必须多行分段（每段独立一行），禁止挤成一段；中文输出。
         """
     }
 
     /// 宽松解析模型回复：容忍围栏与前后废话（LenientJSON）；
-    /// 字段缺失容错（无 title → 取正文前 20 字；无 confidence → 默认 0.8）；
-    /// 非法输入返回 []。
+    /// 字段缺失容错（无 title → 取正文前 20 字；无 confidence → 默认 0.8；
+    /// 无 principle → nil，兼容旧模型输出）；非法输入返回 []。
     static func parse(reply: String) -> [ExtractedKnowledge] {
         // 中间 DTO：字段全部可选，单条缺字段不拖垮整个数组
         struct DTO: Decodable {
             var title: String?
             var content: String?
+            var principle: String?
             var confidence: Double?
         }
         guard let dtos = LenientJSON.decode([DTO].self, from: reply) else { return [] }
@@ -73,9 +83,15 @@ nonisolated enum KnowledgeExtractor {
             let rawTitle = (dto.title ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let title = rawTitle.isEmpty ? String(content.prefix(20)) : rawTitle
+            let principle = dto.principle?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let confidence = min(max(dto.confidence ?? 0.8, 0), 1)
             results.append(
-                ExtractedKnowledge(title: title, content: content, confidence: confidence)
+                ExtractedKnowledge(
+                    title: title, content: content,
+                    principle: principle?.isEmpty == true ? nil : principle,
+                    confidence: confidence
+                )
             )
         }
         return results
@@ -134,12 +150,14 @@ nonisolated enum KnowledgeExtractor {
     /// - Parameters:
     ///   - sourceType: methodology（讨论抽取）| manual（「这条记下来」手动沉淀）
     ///   - sourceRef: 出处（项目/版本或讨论引用）
+    ///   - principle: 为什么有效（写时富化；nil = 旧模板无此字段）
     @MainActor
     static func writeCard(
         content: String,
         confidence: Double,
         sourceType: String,
         sourceRef: String,
+        principle: String? = nil,
         database: AppDatabase?,
         embeddingProvider: EmbeddingProviding
     ) async throws -> MethodologyCard {
@@ -148,7 +166,8 @@ nonisolated enum KnowledgeExtractor {
             sourceRef: sourceRef,
             project: nil,  // 方法论卡全局（跨项目直接用不降级）
             confidence: min(max(confidence, 0), 1),
-            content: content
+            content: content,
+            principle: principle
         )
         let url = PMAgentStore.cardsDir.appendingPathComponent("\(card.id).md")
         try PMAgentStore.writeVerified(cardMarkdown(card), to: url)
@@ -162,8 +181,9 @@ nonisolated enum KnowledgeExtractor {
         return card
     }
 
-    /// 卡片 Markdown 序列化：front-matter + 正文 + 实战注记区
-    /// （与 Resources/cards 模板卡、MethodologyCard.parse 三方同格式）。
+    /// 卡片 Markdown 序列化：front-matter + 正文 + 为什么有效 + 实战注记区
+    /// （与 Resources/cards 模板卡、MethodologyCard.parse 三方同格式；
+    /// principle 节为写时富化 2026-09-17 新增，旧卡无此节照常解析）。
     static func cardMarkdown(_ card: MethodologyCard) -> String {
         var lines: [String] = [
             "---",
@@ -176,9 +196,14 @@ nonisolated enum KnowledgeExtractor {
             "created: \(card.created)",
             "---",
             card.content,
-            "",
-            AnnotationWriter.sectionHeader,
         ]
+        if let principle = card.principle, !principle.isEmpty {
+            lines.append("")
+            lines.append("## 为什么有效")
+            lines.append(principle)
+        }
+        lines.append("")
+        lines.append(AnnotationWriter.sectionHeader)
         for annotation in card.annotations {
             lines.append("- \(annotation.date) · \(annotation.project)：\(annotation.note)")
         }
