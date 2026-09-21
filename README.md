@@ -47,26 +47,14 @@ Every agent output ends with a **gap radar** (✅ covered / ❓ possibly missing
 
 Five layers, all running in one native Mac process — no server, no account, no cold start:
 
-```mermaid
-flowchart TB
-    subgraph P["1 Presentation - SwiftUI three-column window (pm_worker/1-Presentation/)"]
-        UI["ProjectSidebar / NewTaskView / ProjectHomeView<br/>ConversationView + ConfirmDock + ThinkingCard<br/>MermaidView / HTMLPreviewView (WKWebView)<br/>InspectorPanel (4 tabs) + DeveloperInspector (Cmd-D) / SettingsView"]
-    end
-    subgraph O["2 Orchestration - hand-written state machine (pm_worker/2-Orchestration/)"]
-        ORCH["PipelineEngine (Swift actor)<br/>SessionStore / VersionStore / RiskStore<br/>GitSnapshot / AnalysisRunner"]
-    end
-    subgraph A["3 Agents (pm_worker/3-Agents/)"]
-        AG["Clarifier -> Structurer -> Prototyper -> PRD Writer<br/>AgentPrompts / ArtifactParser<br/>branch: CompetitiveAnalysis (web tools)"]
-    end
-    subgraph C["4 CrossCutting (pm_worker/4-CrossCutting/)"]
-        CB["ContextBuilder - single assembly point, token budget<br/>Memory/MemoryStore (supersede semantics)<br/>Retrieval/Retriever + SkillLoader + PitfallsRouter<br/>Knowledge/Extractor + Recommender + AnnotationWriter + Calibration<br/>LLM/LLMClient (hand-written SSE) + EmbeddingClient + KeychainStore<br/>WebTools/WebTool"]
-    end
-    subgraph S["5 Storage & open layer (pm_worker/5-Storage/, Vendor/)"]
-        ST["PMAgentStore - filesystem as source of truth<br/>AppDatabase + IndexRebuilder - GRDB, rebuildable SQLite index<br/>Keychain (BYOK keys)<br/>Vendor/GRDB + Vendor/mcp-swift-sdk (local packages)"]
-    end
-    EXT["Claude Desktop / Cursor"] -- "stdio MCP, 6 tools" --> S
-    P --> O --> A --> C --> S
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+    <img src="docs/architecture-light.png" alt="Five-layer architecture: Presentation → Orchestration → Agents → CrossCutting → Storage; external AI clients attach to the storage layer over stdio MCP" width="720">
+  </picture>
+</p>
+
+<p align="center"><em>Five layers in one native Mac process, one-way dependencies; external AI clients attach over stdio MCP (6 tools). <a href="diagrams/pm-copilot-architecture.html">Interactive version</a> (themes / guided views / export).</em></p>
 
 Layer notes (all paths relative to the repo root):
 

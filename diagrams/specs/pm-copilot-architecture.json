@@ -2,342 +2,50 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "PM Copilot 系统架构",
+    "title": "PM Copilot · 五层架构总览",
     "locale": "zh-CN",
     "output": "pm-copilot-architecture.html",
     "quality_profile": "showcase",
     "views": [
-      {
-        "id": "main-chain",
-        "label": "主调用链",
-        "focus": [
-          "ui",
-          "orch",
-          "agents",
-          "crosscut",
-          "llm"
-        ],
-        "note": "从界面输入到模型流式输出的分层调用链。"
-      },
-      {
-        "id": "truth-source",
-        "label": "事实源与索引",
-        "focus": [
-          "store",
-          "datadir",
-          "index"
-        ],
-        "note": "文件系统是事实源，SQLite 索引可随时删掉重建。"
-      },
-      {
-        "id": "open-capability",
-        "label": "开放能力",
-        "focus": [
-          "claude",
-          "mcp",
-          "orch"
-        ],
-        "note": "外部 AI 客户端经 stdio MCP 复用同一条流水线。"
-      }
+      { "id": "main-path", "label": "主链路", "focus": ["p-ui", "o-engine", "a-chain", "c-context", "s-store"], "note": "一次任务自上而下穿过五层，逐层单向依赖。" },
+      { "id": "mcp-access", "label": "外部接入", "focus": ["mcp-client", "s-store", "s-db"], "note": "MCP 客户端经 stdio 直连存储开放层，读写同一份事实源。" },
+      { "id": "agents-cut", "label": "Agent 与横切", "focus": ["a-chain", "a-branch", "c-context", "c-llm"], "note": "四阶段 Agent 经 ContextBuilder 收口，取用模型与知识能力。" }
     ]
   },
   "components": [
-    {
-      "id": "claude",
-      "type": "external",
-      "label": "Claude Desktop / Cursor",
-      "sublabel": "外部 AI 客户端",
-      "pos": [
-        40,
-        306
-      ],
-      "size": [
-        150,
-        64
-      ]
-    },
-    {
-      "id": "mcp",
-      "type": "messagebus",
-      "label": "MCP Server",
-      "sublabel": "stdio · 6 工具",
-      "pos": [
-        270,
-        300
-      ],
-      "size": [
-        140,
-        64
-      ],
-      "tag": "M5"
-    },
-    {
-      "id": "ui",
-      "type": "frontend",
-      "label": "SwiftUI 三栏界面",
-      "sublabel": "侧栏 · 会话 · 检查器",
-      "pos": [
-        500,
-        56
-      ],
-      "size": [
-        180,
-        76
-      ],
-      "tag": "1-Presentation"
-    },
-    {
-      "id": "keychain",
-      "type": "security",
-      "label": "macOS Keychain",
-      "sublabel": "BYOK 模型密钥",
-      "pos": [
-        1050,
-        56
-      ],
-      "size": [
-        170,
-        64
-      ],
-      "tag": "不落明文"
-    },
-    {
-      "id": "orch",
-      "type": "backend",
-      "label": "PipelineEngine 状态机",
-      "sublabel": "Swift actor · 确认闸口 · 过期传播",
-      "pos": [
-        500,
-        300
-      ],
-      "size": [
-        180,
-        76
-      ],
-      "tag": "2-Orchestration"
-    },
-    {
-      "id": "agents",
-      "type": "backend",
-      "label": "四阶段 Agent",
-      "sublabel": "澄清 → 结构 → 原型 → PRD",
-      "pos": [
-        780,
-        300
-      ],
-      "size": [
-        180,
-        76
-      ],
-      "tag": "3-Agents"
-    },
-    {
-      "id": "crosscut",
-      "type": "backend",
-      "label": "横切层服务",
-      "sublabel": "ContextBuilder · 记忆 · 检索",
-      "pos": [
-        1050,
-        300
-      ],
-      "size": [
-        170,
-        76
-      ],
-      "tag": "4-CrossCutting"
-    },
-    {
-      "id": "store",
-      "type": "database",
-      "label": "PMAgentStore",
-      "sublabel": "文件系统事实源",
-      "pos": [
-        780,
-        470
-      ],
-      "size": [
-        180,
-        72
-      ],
-      "tag": "5-Storage"
-    },
-    {
-      "id": "index",
-      "type": "database",
-      "label": "SQLite 索引",
-      "sublabel": "GRDB · 删库可重建",
-      "pos": [
-        500,
-        476
-      ],
-      "size": [
-        180,
-        60
-      ]
-    },
-    {
-      "id": "datadir",
-      "type": "database",
-      "label": "~/PMAgent/ 数据目录",
-      "sublabel": "Markdown / JSONL 开放格式",
-      "pos": [
-        780,
-        600
-      ],
-      "size": [
-        180,
-        64
-      ],
-      "tag": "Finder 手改合法"
-    },
-    {
-      "id": "llm",
-      "type": "cloud",
-      "label": "OpenAI 兼容端点",
-      "sublabel": "SSE 流式调用",
-      "pos": [
-        1050,
-        600
-      ],
-      "size": [
-        170,
-        64
-      ],
-      "tag": "BYOK"
-    }
+    { "id": "p-ui", "type": "frontend", "label": "对话主界面", "sublabel": "ProjectSidebar · NewTask · Conversation", "tag": "ConfirmDock · ThinkingCard", "pos": [304, 64], "size": [264, 72] },
+    { "id": "p-preview", "type": "frontend", "label": "原型预览", "sublabel": "MermaidView · HTMLPreviewView", "tag": "WKWebView", "pos": [598, 64], "size": [264, 72] },
+    { "id": "p-inspector", "type": "frontend", "label": "Inspector · Settings", "sublabel": "四 Tab · DeveloperInspector ⌘D", "pos": [892, 64], "size": [264, 72] },
+    { "id": "o-engine", "type": "backend", "label": "PipelineEngine", "sublabel": "Swift actor · 手写状态机", "tag": "四阶段门控", "pos": [451, 186], "size": [264, 72] },
+    { "id": "o-stores", "type": "backend", "label": "Session / Version / Risk", "sublabel": "GitSnapshot · AnalysisRunner", "pos": [745, 186], "size": [264, 72] },
+    { "id": "a-chain", "type": "backend", "label": "四阶段 Agent 链", "sublabel": "AgentPrompts · ArtifactParser", "tag": "Clarifier → Structurer → Prototyper → PRD Writer", "pos": [451, 308], "size": [264, 72] },
+    { "id": "a-branch", "type": "backend", "label": "CompetitiveAnalysis", "sublabel": "竞品分析分支 · web 工具", "pos": [745, 308], "size": [264, 72] },
+    { "id": "c-context", "type": "backend", "label": "ContextBuilder", "sublabel": "唯一组装收口 · token 预算", "pos": [304, 430], "size": [264, 72] },
+    { "id": "c-support", "type": "backend", "label": "Memory · Retrieval · Knowledge", "sublabel": "MemoryStore · Retriever · Extractor", "tag": "SkillLoader · Calibration", "pos": [598, 430], "size": [264, 72] },
+    { "id": "c-llm", "type": "backend", "label": "LLM & Web 工具", "sublabel": "LLMClient 手写 SSE · EmbeddingClient", "tag": "KeychainStore · WebTool", "pos": [892, 430], "size": [264, 72] },
+    { "id": "s-store", "type": "database", "label": "PMAgentStore", "sublabel": "文件系统事实源 · ~/PMAgent/", "tag": "Markdown + JSONL", "pos": [304, 552], "size": [264, 72] },
+    { "id": "s-db", "type": "database", "label": "AppDatabase · IndexRebuilder", "sublabel": "GRDB 可重建索引", "tag": "删库可重建", "pos": [598, 552], "size": [264, 72] },
+    { "id": "s-keychain", "type": "security", "label": "Keychain", "sublabel": "BYOK 密钥存储", "pos": [892, 552], "size": [264, 72] },
+    { "id": "mcp-client", "type": "external", "label": "Claude Desktop / Cursor", "sublabel": "外部 MCP 客户端", "tag": "stdio", "pos": [24, 548], "size": [176, 80] }
   ],
   "boundaries": [
-    {
-      "kind": "region",
-      "label": "macOS 原生单进程（无服务器 · 无账号 · 零遥测）",
-      "wraps": [
-        "mcp",
-        "ui",
-        "orch",
-        "agents",
-        "crosscut",
-        "store",
-        "index",
-        "keychain"
-      ]
-    },
-    {
-      "kind": "security-group",
-      "label": "密钥不出本机",
-      "wraps": [
-        "keychain"
-      ]
-    }
+    { "kind": "region", "label": "1 · Presentation — SwiftUI 单窗口三栏", "wraps": ["p-ui", "p-preview", "p-inspector"], "pad": 0 },
+    { "kind": "region", "label": "2 · Orchestration — 手写状态机", "wraps": ["o-engine", "o-stores"], "pad": 0 },
+    { "kind": "region", "label": "3 · Agents — 阶段 Prompt 与产物解析", "wraps": ["a-chain", "a-branch"], "pad": 0 },
+    { "kind": "region", "label": "4 · CrossCutting — 横切能力", "wraps": ["c-context", "c-support", "c-llm"], "pad": 0 },
+    { "kind": "region", "label": "5 · Storage — 存储开放层", "wraps": ["s-store", "s-db", "s-keychain"], "pad": 0 }
   ],
   "connections": [
-    {
-      "id": "claude-to-mcp",
-      "from": "claude",
-      "to": "mcp",
-      "label": "stdio MCP"
-    },
-    {
-      "id": "mcp-to-orch",
-      "from": "mcp",
-      "to": "orch",
-      "label": "复用流水线"
-    },
-    {
-      "id": "ui-to-orch",
-      "from": "ui",
-      "to": "orch",
-      "label": "会话消息 · 确认裁决",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "labelDy": 30
-    },
-    {
-      "id": "orch-to-agents",
-      "from": "orch",
-      "to": "agents",
-      "label": "阶段编排"
-    },
-    {
-      "id": "agents-to-crosscut",
-      "from": "agents",
-      "to": "crosscut",
-      "label": "上下文组装"
-    },
-    {
-      "id": "crosscut-to-keychain",
-      "from": "crosscut",
-      "to": "keychain",
-      "label": "读取密钥",
-      "variant": "security",
-      "fromSide": "top",
-      "toSide": "bottom"
-    },
-    {
-      "id": "crosscut-to-llm",
-      "from": "crosscut",
-      "to": "llm",
-      "label": "SSE 流式",
-      "variant": "emphasis",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "labelDy": 24
-    },
-    {
-      "id": "agents-to-store",
-      "from": "agents",
-      "to": "store",
-      "label": "产物落盘",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "labelDy": 26
-    },
-    {
-      "id": "store-to-datadir",
-      "from": "store",
-      "to": "datadir",
-      "label": "读写开放格式",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "labelDy": 26
-    },
-    {
-      "id": "store-to-index",
-      "from": "store",
-      "to": "index",
-      "label": "同步索引"
-    },
-    {
-      "id": "datadir-to-index",
-      "from": "datadir",
-      "to": "index",
-      "label": "删库可重建",
-      "variant": "dashed"
-    }
+    { "id": "mcp-to-storage", "from": "mcp-client", "to": "s-store", "label": "stdio MCP · 6 工具", "variant": "emphasis", "fromSide": "right", "toSide": "left", "labelDy": -43 },
+    { "id": "p-to-o", "from": "p-ui", "to": "o-engine", "fromSide": "bottom", "toSide": "top" },
+    { "id": "o-to-a", "from": "o-engine", "to": "a-chain", "fromSide": "bottom", "toSide": "top" },
+    { "id": "a-to-c", "from": "a-chain", "to": "c-context", "fromSide": "bottom", "toSide": "top" },
+    { "id": "c-to-s", "from": "c-context", "to": "s-store", "fromSide": "bottom", "toSide": "top" },
+    { "id": "a-branch-edge", "from": "a-chain", "to": "a-branch", "variant": "dashed", "fromSide": "right", "toSide": "left" }
   ],
   "cards": [
-    {
-      "dot": "cyan",
-      "title": "分层调用链",
-      "items": [
-        "五层单向依赖：UI → 编排 → Agent → 横切 → 存储",
-        "单进程运行；Agent 四工具注册在编排层（模型只请求）"
-      ]
-    },
-    {
-      "dot": "emerald",
-      "title": "本地优先不变量",
-      "items": [
-        "文件系统是事实源，SQLite 索引删了可从文件全量重建",
-        "数据落在 ~/PMAgent/ 的 Markdown / JSONL 开放格式"
-      ]
-    },
-    {
-      "dot": "rose",
-      "title": "密钥与开放能力",
-      "items": [
-        "BYOK 密钥只存 macOS Keychain，不入库不入 Git",
-        "stdio MCP 暴露 6 个工具，外部客户端复用同一条流水线"
-      ]
-    }
+    { "dot": "cyan", "title": "单向分层", "items": ["Presentation → Orchestration → Agents → CrossCutting → Storage 自上而下单向依赖", "上层只依赖下一层，职责单一、边界清晰"] },
+    { "dot": "emerald", "title": "事实源与索引", "items": ["PMAgentStore 以 ~/PMAgent/ 纯 Markdown + JSONL 落盘", "GRDB 索引删库可重建；BYOK 密钥只存 Keychain"] },
+    { "dot": "rose", "title": "对外集成", "items": ["Claude Desktop / Cursor 经 stdio MCP 直连存储开放层", "6 个工具读写同一份项目事实源"] }
   ]
 }

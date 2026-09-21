@@ -38,26 +38,14 @@
 
 五层，全部跑在一个原生 Mac 进程里——无服务端、无账号、无冷启动：
 
-```mermaid
-flowchart TB
-    subgraph P["1 Presentation - SwiftUI 单窗口三栏 (pm_worker/1-Presentation/)"]
-        UI["ProjectSidebar / NewTaskView / ProjectHomeView<br/>ConversationView + ConfirmDock + ThinkingCard<br/>MermaidView / HTMLPreviewView (WKWebView)<br/>InspectorPanel (四 Tab) + DeveloperInspector (Cmd-D) / SettingsView"]
-    end
-    subgraph O["2 Orchestration - 手写状态机 (pm_worker/2-Orchestration/)"]
-        ORCH["PipelineEngine (Swift actor)<br/>SessionStore / VersionStore / RiskStore<br/>GitSnapshot / AnalysisRunner"]
-    end
-    subgraph A["3 Agents (pm_worker/3-Agents/)"]
-        AG["Clarifier -> Structurer -> Prototyper -> PRD Writer<br/>AgentPrompts / ArtifactParser<br/>分支: CompetitiveAnalysis (web 工具)"]
-    end
-    subgraph C["4 CrossCutting (pm_worker/4-CrossCutting/)"]
-        CB["ContextBuilder - 唯一组装收口, token 预算<br/>Memory/MemoryStore (覆盖语义)<br/>Retrieval/Retriever + SkillLoader + PitfallsRouter<br/>Knowledge/Extractor + Recommender + AnnotationWriter + Calibration<br/>LLM/LLMClient (手写 SSE) + EmbeddingClient + KeychainStore<br/>WebTools/WebTool"]
-    end
-    subgraph S["5 Storage 存储开放层 (pm_worker/5-Storage/, Vendor/)"]
-        ST["PMAgentStore - 文件系统事实源<br/>AppDatabase + IndexRebuilder - GRDB 可重建索引<br/>Keychain (BYOK 密钥)<br/>Vendor/GRDB + Vendor/mcp-swift-sdk (本地包)"]
-    end
-    EXT["Claude Desktop / Cursor"] -- "stdio MCP, 6 工具" --> S
-    P --> O --> A --> C --> S
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.png">
+    <img src="docs/architecture-light.png" alt="五层架构：Presentation → Orchestration → Agents → CrossCutting → Storage，外部 AI 客户端经 stdio MCP 接入存储开放层" width="720">
+  </picture>
+</p>
+
+<p align="center"><em>五层跑在一个原生 Mac 进程里，单向依赖；外部 AI 客户端经 stdio MCP（6 工具）直连存储开放层。<a href="diagrams/pm-copilot-architecture.html">交互式版本</a>（主题切换 / 视图聚焦 / 导出）。</em></p>
 
 要点（路径相对仓库根）：
 
