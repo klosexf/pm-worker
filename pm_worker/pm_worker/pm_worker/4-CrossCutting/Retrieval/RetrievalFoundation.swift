@@ -17,6 +17,32 @@ import Foundation
 nonisolated protocol EmbeddingProviding: Sendable {
     /// 批量编码；返回与输入等长的向量数组（各实现保证维度一致）。
     func embed(texts: [String]) async throws -> [[Float]]
+    /// 批量编码 + 向量来源戳（P1 嵌入守卫）：写入索引 embedding_source、
+    /// 检索时与行戳比对——来源不一致的向量空间互不可比，禁止混算静默零命中。
+    /// 缺省实现只能给出维度签名（自定义测试假向量走这条）。
+    func embedWithSource(texts: [String]) async throws -> (vectors: [[Float]], source: String)
+}
+
+nonisolated extension EmbeddingProviding {
+    func embedWithSource(texts: [String]) async throws -> (vectors: [[Float]], source: String) {
+        let vectors = try await embed(texts: texts)
+        return (vectors, "dim:\(vectors.first?.count ?? 0)")
+    }
+}
+
+/// 向量来源戳兼容判定（P1 嵌入守卫）：
+/// - 任一为空/缺省（v2 迁移前的旧行、M0 占位路径）→ 放行（维度守卫仍在检索层兜底）；
+/// - 完全相等 → 放行（同模型 / 同为 hash256 空间）；
+/// - 其余（真实模型 A vs 模型 B、真实模型 vs 本地兜底 hash256）→ 不兼容，不参与余弦。
+nonisolated enum EmbeddingSourceStamp {
+    /// 本地确定性哈希空间的统一戳（DeterministicHashEmbedder 与
+    /// SettingsBackedEmbedder 的回退路径同属此空间，互相比价有效）。
+    nonisolated static let hash256 = "hash256"
+
+    static func isCompatible(_ stored: String?, _ current: String) -> Bool {
+        guard let stored, !stored.isEmpty else { return true }
+        return stored == current
+    }
 }
 
 /// 确定性哈希向量器：无网络环境下保证管线不断（语义质量无意义，仅保活），
@@ -30,6 +56,11 @@ nonisolated struct DeterministicHashEmbedder: EmbeddingProviding {
 
     func embed(texts: [String]) async throws -> [[Float]] {
         texts.map { Self.vector(for: $0) }
+    }
+
+    /// 哈希空间统一戳（与 SettingsBackedEmbedder 的回退路径同戳，互相比价有效）。
+    func embedWithSource(texts: [String]) async throws -> (vectors: [[Float]], source: String) {
+        (try await embed(texts: texts), EmbeddingSourceStamp.hash256)
     }
 
     static func vector(for text: String) -> [Float] {
@@ -107,6 +138,48 @@ nonisolated enum VectorMath {
     static let mergeThreshold = 0.92
 }
 
+// MARK: - 词面相似度（P1-5：近义改写不遗漏）
+
+/// 零网络词面相似度：2-gram 集合重叠系数（对调序、加修饰词的近义改写鲁棒）。
+/// 用于标题同主题判定与方法论↔经验主题匹配——向量口径要额外网络调用，
+/// 短文本词面信号已足够（标题 ≤20 字，2-gram 全集很小，噪声可控）。
+nonisolated enum LexicalSimilarity {
+    /// 归一化：去全部空白 + 小写。
+    nonisolated static func normalized(_ text: String) -> String {
+        text.lowercased().replacingOccurrences(
+            of: " ", with: ""
+        ).replacingOccurrences(of: "\u{3000}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 重叠系数：|A∩B| / min(|A|,|B|)，短侧全覆盖时 = 1。0-1。
+    nonisolated static func bigramOverlap(_ a: String, _ b: String) -> Double {
+        let gramsA = bigrams(normalized(a))
+        let gramsB = bigrams(normalized(b))
+        guard !gramsA.isEmpty, !gramsB.isEmpty else {
+            return normalized(a) == normalized(b) && !gramsA.isEmpty ? 1 : 0
+        }
+        let intersection = gramsA.intersection(gramsB).count
+        return Double(intersection) / Double(min(gramsA.count, gramsB.count))
+    }
+
+    /// 同主题判定阈值（卡标题互比）：词序调换 / 加「的」「下」类修饰仍能命中，
+    /// 同域不同主题（共享 1-2 个词）不命中——0.62 经验值，测试钉死边界。
+    nonisolated static let sameTopicThreshold = 0.62
+    /// 主题相关阈值（标题 vs 经验正文：min 侧是标题 bigram，取更松）。
+    nonisolated static let topicRelevanceThreshold = 0.4
+
+    private nonisolated static func bigrams(_ text: String) -> Set<String> {
+        let chars = Array(text)
+        guard chars.count > 1 else { return chars.isEmpty ? [] : Set(chars.map(String.init)) }
+        var set = Set<String>()
+        for i in 0..<(chars.count - 1) {
+            set.insert(String(chars[i..<(i + 2)]))
+        }
+        return set
+    }
+}
+
 // MARK: - 检索结果与 trace
 
 /// 单条命中（卡片库或技能库）。
@@ -148,4 +221,8 @@ nonisolated struct RetrievalTrace: Codable, Equatable {
     /// 语义为准（2026-09-15）：索引可用时零命中即不注入技能，失效态才由阶段锚点保底。
     /// Optional 缺键解码为 nil，旧 trace 数据可继续解码。
     var skillIndexReady: Bool? = nil
+    /// 检索降级人话说明（P1 嵌入守卫）：向量来源戳/维度与当前编码端不一致被排除
+    /// 的行数 > 0 时给出（如「18 行索引来自其他向量来源，重建索引恢复」）；
+    /// nil = 未降级。Optional 缺键解码为 nil，旧 trace 数据可继续解码。
+    var degraded: String? = nil
 }

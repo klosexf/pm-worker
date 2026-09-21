@@ -84,8 +84,8 @@ struct ProjectSidebar: View {
             .onChange(of: model.sidebarReveal) { _, reveal in
                 guard let reveal else { return }
                 withAnimation(DS.Motion.springFast) {
-                    expandedProjects.insert(reveal.project)
-                    expandedVersions.insert("\(reveal.project)/\(reveal.version)")
+                    collapsedProjects.remove(reveal.project)
+                    collapsedVersions.remove("\(reveal.project)/\(reveal.version)")
                 }
                 followModule(project: reveal.project, version: reveal.version)
             }
@@ -513,7 +513,7 @@ struct ProjectSidebar: View {
         VStack(spacing: 0) {
             ArchiveProjectRow(
                 name: project.name,
-                isExpanded: expandedProjects.contains(project.name),
+                isExpanded: !collapsedProjects.contains(project.name),
                 onTap: {
                     model.activeProject = project.name
                     model.reloadTree()
@@ -529,7 +529,7 @@ struct ProjectSidebar: View {
                     deleteProjectTarget = ProjectActionTarget(name: project.name)
                 }
             )
-            if expandedProjects.contains(project.name) {
+            if !collapsedProjects.contains(project.name) {
                 ForEach(project.versions) { version in
                     versionSection(project: project, version: version)
                 }
@@ -552,7 +552,7 @@ struct ProjectSidebar: View {
                 name: version.displayName,
                 isReleased: version.isReleased,
                 isUnversioned: version.name == "unversioned",
-                isExpanded: expandedVersions.contains(key),
+                isExpanded: !collapsedVersions.contains(key),
                 onTap: { toggleVersion(project.name, version.name) },
                 onNewConversation: { newConversation(project: project, version: version) },
                 onRename: {
@@ -569,7 +569,8 @@ struct ProjectSidebar: View {
                 }
             )
             .padding(.top, DS.Spacing.s6)
-            if expandedVersions.contains(key) {
+            // 空版本不渲染会话组：导轨与占位一并隐去，只留版本行本身
+            if !collapsedVersions.contains(key), !version.sessions.isEmpty {
                 HStack(alignment: .top, spacing: 0) {
                     Rectangle()
                         .fill(Color.borderL1)
@@ -577,14 +578,6 @@ struct ProjectSidebar: View {
                     VStack(spacing: 0) {
                         ForEach(version.sessions) { session in
                             sessionRow(project: project, version: version, session: session)
-                        }
-                        if version.sessions.isEmpty {
-                            Text("暂无会话")
-                                .font(DS.Font.bodyXS)
-                                .foregroundStyle(Color.ink300)
-                                .padding(.leading, 26)
-                                .padding(.top, DS.Spacing.s2)
-                                .padding(.bottom, DS.Spacing.s6)
                         }
                     }
                 }
@@ -707,8 +700,8 @@ struct ProjectSidebar: View {
             model.notif = DSNotifMessage(variant: .error, title: "转为项目失败", description: error)
         } else {
             withAnimation(DS.Motion.springFast) {
-                expandedProjects.insert(name)
-                expandedVersions.insert("\(name)/unversioned")
+                collapsedProjects.remove(name)
+                collapsedVersions.remove("\(name)/unversioned")
                 activeModule = .spaces
             }
         }
@@ -747,8 +740,8 @@ struct ProjectSidebar: View {
         if let error = model.createVersion(in: target.name, name: name) {
             model.notif = DSNotifMessage(variant: .error, title: "新建版本文件失败", description: error)
         } else {
-            // 项目折叠时新版本行不可见 → 自动展开
-            withAnimation(DS.Motion.springFast) { expandedProjects.insert(target.name) }
+            // 项目此前被手动收起时新版本行不可见 → 自动展开
+            withAnimation(DS.Motion.springFast) { collapsedProjects.remove(target.name) }
         }
     }
 
@@ -762,9 +755,10 @@ struct ProjectSidebar: View {
         if let error = model.renameProject(target.name, to: newName) {
             model.notif = DSNotifMessage(variant: .error, title: "重命名项目失败", description: error)
         } else {
-            // 展开状态跟随更名，保持原视觉状态
-            if expandedProjects.remove(target.name) != nil {
-                expandedProjects.insert(newName)
+            // 收起状态跟随更名，保持原视觉状态
+            if collapsedProjects.contains(target.name) {
+                collapsedProjects.remove(target.name)
+                collapsedProjects.insert(newName)
             }
         }
     }
@@ -773,7 +767,7 @@ struct ProjectSidebar: View {
         if let error = model.deleteProject(target.name) {
             model.notif = DSNotifMessage(variant: .error, title: "删除项目失败", description: error)
         } else {
-            expandedProjects.remove(target.name)
+            collapsedProjects.remove(target.name)
         }
     }
 
@@ -785,7 +779,7 @@ struct ProjectSidebar: View {
         } else {
             let oldKey = "\(target.project)/\(target.version)"
             let newKey = "\(target.project)/\(newName)"
-            if expandedVersions.remove(oldKey) != nil { expandedVersions.insert(newKey) }
+            if collapsedVersions.remove(oldKey) != nil { collapsedVersions.insert(newKey) }
         }
     }
 
@@ -795,22 +789,22 @@ struct ProjectSidebar: View {
         ) {
             model.notif = DSNotifMessage(variant: .error, title: "删除版本失败", description: error)
         } else {
-            expandedVersions.remove("\(target.project)/\(target.version)")
+            collapsedVersions.remove("\(target.project)/\(target.version)")
         }
     }
 
-    // MARK: - 展开状态
+    // MARK: - 展开状态（默认全展开，集合内 = 用户手动收起的节点）
 
-    @State private var expandedProjects: Set<String> = []
-    /// 版本层展开状态（key = "项目/版本"，支撑整行点击切换展开）。
-    @State private var expandedVersions: Set<String> = []
+    @State private var collapsedProjects: Set<String> = []
+    /// 版本层收起状态（key = "项目/版本"，支撑整行点击切换展开）。
+    @State private var collapsedVersions: Set<String> = []
 
     private func toggleProject(_ project: String) {
         withAnimation(DS.Motion.springFast) {
-            if expandedProjects.contains(project) {
-                expandedProjects.remove(project)
+            if collapsedProjects.contains(project) {
+                collapsedProjects.remove(project)
             } else {
-                expandedProjects.insert(project)
+                collapsedProjects.insert(project)
             }
         }
     }
@@ -818,10 +812,10 @@ struct ProjectSidebar: View {
     private func toggleVersion(_ project: String, _ version: String) {
         let key = "\(project)/\(version)"
         withAnimation(DS.Motion.springFast) {
-            if expandedVersions.contains(key) {
-                expandedVersions.remove(key)
+            if collapsedVersions.contains(key) {
+                collapsedVersions.remove(key)
             } else {
-                expandedVersions.insert(key)
+                collapsedVersions.insert(key)
             }
         }
     }

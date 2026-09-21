@@ -65,7 +65,7 @@ xcodebuild ... test -only-testing:pm_workerTests/ContextBuilderTests
 工程开启了 Xcode 26 默认 **`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`**——模块内所有类型隐式 @MainActor。由此产生三条强制规则：
 
 1. **存储层类型显式 `nonisolated`**：被 GRDB 读写闭包、MCP 无头 Task 等 nonisolated 上下文用到的类（AppDatabase、PMAgentStore）必须显式 `nonisolated`，否则 isolated-deinit 触发 malloc「pointer being freed was not allocated」崩溃。
-2. **必须保持 @MainActor 的 ObservableObject（会在 switchContext 中被替换销毁，如 PipelineEngine、MemoryStore），类体内显式写 `nonisolated deinit {}`**——退出隔离销毁路径，否则局部实例销毁即崩。
+2. **任何 @MainActor 类（含只装 weak 引用/闭包的桥类与通道类，不限 ObservableObject）都显式写 `nonisolated deinit {}`**——退出隔离销毁路径，否则实例在非主线程上下文释放即崩（会在 switchContext 中被替换销毁的如 PipelineEngine、MemoryStore；SwiftUI `@State` 持有的局部实例同样中招，见 bugs.md B002 第二次复发）。
 3. **被 nonisolated 上下文用到的值类型/枚举一律显式 `nonisolated struct/enum`**（MemoryEntry、ProjectDocument、DecisionRecord 等）。注意：**extension 不继承 nonisolated，须单独标 `nonisolated extension Foo`**。泛型传枚举做 DSTabItem 这类 Identifiable/Hashable 合成也有隔离坑，同样显式 nonisolated。
 
 其他 Swift 坑（都真实踩过）：

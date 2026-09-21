@@ -1468,6 +1468,7 @@ final class SessionStore: ObservableObject {
         skills: [String] = [],
         pinnedOrigin: StreamOrigin? = nil,
         prototypeSnapshot: [String: String]? = nil,
+        tools: AgentToolRuntime? = nil,
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)? = nil
     ) async -> SystemTurnOutcome {
         var outcome = SystemTurnOutcome.interrupted
@@ -1479,7 +1480,7 @@ final class SessionStore: ObservableObject {
                 note: note, noteSilent: noteSilent, userPrompt: userPrompt, settings: settings,
                 stage: stage, systemPrompt: systemPrompt, maxTokens: maxTokens, skills: skills,
                 onAssistant: onAssistant, origin: origin,
-                prototypeSnapshot: prototypeSnapshot
+                prototypeSnapshot: prototypeSnapshot, tools: tools
             )
         }
         return outcome
@@ -1496,7 +1497,8 @@ final class SessionStore: ObservableObject {
         skills: [String],
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?,
         origin: StreamOrigin,
-        prototypeSnapshot: [String: String]? = nil
+        prototypeSnapshot: [String: String]? = nil,
+        tools: AgentToolRuntime? = nil
     ) async -> SystemTurnOutcome {
         // 阶段 4 原型快照闸（同 performSend）：仅原型回合生效
         let effectiveSnapshot = stage == .prototype ? prototypeSnapshot : nil
@@ -1523,7 +1525,7 @@ final class SessionStore: ObservableObject {
             history = VolatileTailMaterial.appending(history, tail: injectionTail)
             try await streamReply(
                 origin: origin, history: history, stage: stage, settings: settings,
-                maxTokens: maxTokens, skills: skills,
+                maxTokens: maxTokens, skills: skills, tools: tools,
                 onAssistant: onAssistant.map { fn in
                     { entry in fn(entry, effectiveSnapshot) }
                 }

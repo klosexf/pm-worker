@@ -214,10 +214,13 @@ final class ContextBuilderTests: XCTestCase {
         XCTAssertTrue(assembly.breakdown.trimmed.contains(.skillBodies))
         XCTAssertFalse(assembly.injectionText.contains("BUDGET_SKILL_BODY_SENTINEL"))
         XCTAssertTrue(assembly.injectedSkillBodies.isEmpty)
-        // 记忆预算 5 → 尾部逐行丢至空（段省略）
+        // 记忆预算 5 → 尾部逐行丢尽后只余省略计数注记行
+        //（P0 契约更新：被裁记忆从静默蒸发变为可见让位）
         XCTAssertTrue(assembly.breakdown.trimmed.contains(.memory))
-        XCTAssertFalse(assembly.injectionText.contains("### 记忆"))
-        XCTAssertLessThanOrEqual(assembly.breakdown.segments[.memory] ?? 99, 5)
+        XCTAssertTrue(
+            assembly.injectionText.contains("另有 8 条记忆因预算未注入"),
+            "裁剪应留下省略注记：\(assembly.injectionText)"
+        )
         // rules 常驻不裁
         XCTAssertFalse(assembly.breakdown.trimmed.contains(.rules))
         XCTAssertTrue(assembly.systemPrompt.contains("### 规则层"))

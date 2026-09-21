@@ -354,10 +354,30 @@ final class AppModel: ObservableObject {
                     topic: topic, project: origin.project,
                     version: origin.version, sessionId: origin.sessionId
                 )
+            },
+            memorySave: { [weak self] kind, content in
+                let error = MemoryStore.addToolEntry(
+                    project: origin.project, version: origin.version,
+                    kind: kind == "conclusion" ? .conclusion : .experience,
+                    content: content
+                )
+                if error == nil, let self, self.originIsCurrentContext(origin) {
+                    self.memory.reload()  // 活上下文即时可见（记忆抽屉/下轮注入）
+                }
+                return error
+            },
+            memorySearch: { query in
+                AgentPrompts.formatMemory(
+                    MemoryStore.searchEntries(
+                        project: origin.project, version: origin.version,
+                        query: query, limit: 8
+                    )
+                ).split(separator: "\n").map(String.init)
             }
         )
         let registry = AgentToolRegistry(tools: [
             LoadSkillTool(), WebSearchTool(), ProposeAnalysisTool(), DependencyQueryTool(),
+            SaveMemoryTool(), RecallMemoryTool(),
         ])
         return AgentToolRuntime(registry: registry, context: context)
     }
@@ -393,6 +413,159 @@ final class AppModel: ObservableObject {
             sessionId: sessionId, topic: topic,
             project: project, version: version
         )
+    }
+
+    // MARK: - 计划提案（P0-2：模型计划提案权，LLM 提案 · 用户裁决 · 系统执行）
+
+    /// 计划裁决结果。
+    nonisolated enum PlanDecision: Equatable {
+        case approved(supplement: String?)   // 按批准执行（可带补充要求）
+        case skipped                         // 跳过计划直接生成
+    }
+
+    /// 待裁决的执行计划提案（挂输入区上方停靠卡计划段；绑定发起会话，
+    /// 与分支确认卡同口径）。execute = 已捕获生成轮上下文的续体，裁决后执行。
+    @MainActor
+    struct PendingPlanProposal {
+        var project: String
+        var version: String
+        var sessionId: String
+        var stage: PipelineRun.Stage
+        var plan: ArtifactParser.PlanCard
+        var execute: (PlanDecision) async -> Void
+    }
+
+    @Published var pendingPlanProposal: PendingPlanProposal?
+
+    /// 计划轮回复捕获盒（onAssistant 回调与 sendSystemTurn 返回体之间的传值桥；
+    /// MainActor 串行化下无竞态）。新增 ObservableObject 之外仍是普通类——
+    /// 按并发铁律显式退出隔离销毁路径。
+    @MainActor
+    private final class PlanReplyBox {
+        var plan: ArtifactParser.PlanCard?
+        var answered = false
+        nonisolated deinit {}
+    }
+
+    /// 阶段显示名（计划轮注记与提问行共用）。
+    nonisolated static func planStageName(_ stage: PipelineRun.Stage) -> String {
+        switch stage {
+        case .clarify: return "澄清"
+        case .structure: return "结构产物"
+        case .prototype: return "原型"
+        case .prd: return "PRD"
+        }
+    }
+
+    /// 带计划 hop 的产物生成轮（确认链 ②③④ 首次生成入口）。
+    /// 开关关 / 已有待裁决计划（重入）/ allowPlan=false（快速通道、换档）→ 直接执行；
+    /// 计划轮完成且产出 artifact:plan → 挂裁决卡暂停生成，用户裁决后续跑执行轮；
+    /// 计划轮完成但未产出计划块 → 降级直接执行（不阻塞主干）；
+    /// 计划轮被停止或失败 → 停在原地，用户再说话走常规链路。
+    private func runGenerationWithPlan(
+        stage: PipelineRun.Stage, origin: ReplyOrigin,
+        systemPrompt: String, userPrompt: String,
+        note: String?, noteSilent: Bool,
+        skills: [String], maxTokens: Int,
+        tools: AgentToolRuntime?,
+        prototypeSnapshot: [String: String]? = nil,
+        allowPlan: Bool = true
+    ) async {
+        let runExecutionRound = { [weak self] (extraTail: String) async in
+            guard let self else { return }
+            await self.sessionStore.sendSystemTurn(
+                note: note, noteSilent: noteSilent,
+                userPrompt: userPrompt,
+                settings: self.settings, stage: LLMStage(rawValue: stage.rawValue) ?? .structure,
+                systemPrompt: extraTail.isEmpty
+                    ? systemPrompt
+                    : systemPrompt + "\n\n" + extraTail,
+                maxTokens: maxTokens, skills: skills,
+                pinnedOrigin: origin.storeOrigin,
+                prototypeSnapshot: prototypeSnapshot,
+                tools: tools
+            ) { [weak self] reply, snapshot in
+                self?.handleAssistantReply(
+                    reply, origin: origin.with(stage: stage), prototypeSnapshot: snapshot
+                )
+            }
+        }
+        guard allowPlan, settings.planProposalsEnabled, pendingPlanProposal == nil else {
+            await runExecutionRound("")
+            return
+        }
+        let stageName = Self.planStageName(stage)
+        sessionStore.setStreamPhase("正在拟定执行计划…", for: origin.sessionId)
+        let box = PlanReplyBox()
+        // 计划协议段拼在复合体尾部（ContextTail 动态区之后）——冻结前缀不污染
+        let planOutcome = await sessionStore.sendSystemTurn(
+            note: "🗒️ \(stageName)先不产出——已提交执行计划草案，等你裁决",
+            userPrompt: AgentPrompts.planRequestTask(stageName: stageName),
+            settings: settings, stage: LLMStage(rawValue: stage.rawValue) ?? .structure,
+            systemPrompt: systemPrompt + "\n\n" + AgentPrompts.planModeSection,
+            maxTokens: 8192, skills: skills,
+            pinnedOrigin: origin.storeOrigin,
+            tools: tools
+        ) { [weak self] reply, _ in
+            guard let self else { return }
+            box.answered = true
+            box.plan = ArtifactParser.parsePlanProposal(
+                blocks: ArtifactParser.parseArtifactBlocks(in: reply.content)
+            )
+        }
+        guard case .completed = planOutcome else {
+            // 停止/失败不自动补跑：本轮对话流已留痕，用户再触发走常规生成链路
+            return
+        }
+        guard box.answered, let plan = box.plan else {
+            await runExecutionRound("")
+            return
+        }
+        pendingPlanProposal = PendingPlanProposal(
+            project: origin.project, version: origin.version,
+            sessionId: origin.sessionId, stage: stage, plan: plan
+        ) { [weak self] decision in
+            guard let self else { return }
+            let extra: String
+            switch decision {
+            case .approved(let supplement):
+                extra = AgentPrompts.approvedPlanSection(plan, supplement: supplement)
+            case .skipped:
+                extra = ""
+            }
+            await runExecutionRound(extra)
+        }
+    }
+
+    /// 计划段裁决：按批准执行（supplement = 输入框补充要求，可空）。
+    func approvePlanProposal(supplement: String?) {
+        guard let pending = pendingPlanProposal else { return }
+        pendingPlanProposal = nil
+        let text = supplement?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        appendOriginSystem(
+            text.isEmpty
+                ? "▶️ 计划已批准，开始生成"
+                : "▶️ 计划已批准（含你的补充要求），开始生成",
+            origin: ReplyOrigin(
+                project: pending.project, version: pending.version,
+                sessionId: pending.sessionId, stage: pending.stage
+            )
+        )
+        Task { await pending.execute(.approved(supplement: text.isEmpty ? nil : text)) }
+    }
+
+    /// 计划段裁决：跳过计划直接生成。
+    func skipPlanProposal() {
+        guard let pending = pendingPlanProposal else { return }
+        pendingPlanProposal = nil
+        appendOriginSystem(
+            "⏭️ 已跳过计划，直接生成",
+            origin: ReplyOrigin(
+                project: pending.project, version: pending.version,
+                sessionId: pending.sessionId, stage: pending.stage
+            )
+        )
+        Task { await pending.execute(.skipped) }
     }
 
 
@@ -761,7 +934,11 @@ final class AppModel: ObservableObject {
 
     /// 组装器按当前设置实例化（embedder 随 BYOK 设置走，设置变更即时生效）。
     private func makeContextBuilder() -> ContextBuilder {
-        ContextBuilder(database: database, embedder: SettingsBackedEmbedder(settings: settings))
+        ContextBuilder(
+            database: database,
+            embedder: SettingsBackedEmbedder(settings: settings),
+            budgets: ContextBuilder.budgets(contextWindow: settings.activeProfile?.contextWindow)
+        )
     }
 
     /// 阶段化 system prompt 组装（所有主线 prompt 的唯一入口）：
@@ -802,14 +979,15 @@ final class AppModel: ObservableObject {
                 sessionId: effectiveOrigin.sessionId
             ).filter { $0.role == .user }.suffix(3).map(\.content)
         let calibration = calibrationMatches()
+        let rankQuery = skillQueryText(userMessage: userMessage, history: history)
         let assembly = await makeContextBuilder().assemble(
             stage: stage,
             project: effectiveOrigin.project,
             stageQuery: stageQueryText(
                 stage: PipelineRun.Stage(rawValue: stage.rawValue) ?? effectiveOrigin.stage
             ),
-            skillQuery: skillQueryText(userMessage: userMessage, history: history),
-            memoryContext: memoryStore.injectionContext,
+            skillQuery: rankQuery,
+            memoryContext: memoryStore.injectionContext(rankedFor: rankQuery),
             calibration: calibration.lines,
             skillJudge: { [weak self] query, candidates in
                 await self?.judgeSkills(query: query, candidates: candidates)
@@ -840,7 +1018,20 @@ final class AppModel: ObservableObject {
         default:
             supersedable = ""
         }
-        var tailParts = [volatileTail, assembly.injectionText, supersedable]
+        // 运行校准（跨会话策略学习）：历史运行统计随尾条注入主线四阶段——
+        // 澄清深度倾向 / 机器门失败率 / 风险跨版本复发，假设态不作硬约束。
+        // 学习是旁路：采集失败静默为空注入，冻结段不受影响（走尾条动态消息）。
+        let runPatterns: String
+        switch stage {
+        case .clarify, .structure, .prototype, .prd:
+            runPatterns = Self.runPatternsSection(
+                stage: stage, project: effectiveOrigin.project,
+                version: effectiveOrigin.version, database: database
+            )
+        default:
+            runPatterns = ""
+        }
+        var tailParts = [volatileTail, assembly.injectionText, supersedable, runPatterns]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         // Function Calling 工具说明（toolsSection = runtime 非空）：随尾条下发，
@@ -850,6 +1041,24 @@ final class AppModel: ObservableObject {
             ContextTail.compose(system: assembly.systemPrompt, tail: tailParts.joined(separator: "\n\n")),
             assembly.skillIds
         )
+    }
+
+    /// 运行校准注入段（跨会话策略学习，RunPatternLearner）：历史运行统计 →
+    /// 主线阶段 prompt 尾条。仅四个主线阶段注入；统计无话可说 / 采集失败
+    /// → 空串（尾条组装自动剔除）。nonisolated static 供测试直测。
+    nonisolated static func runPatternsSection(
+        stage: LLMStage, project: String, version: String, database: AppDatabase?
+    ) -> String {
+        guard let database else { return "" }
+        let lines = RunPatternLearner.brief(
+            stage: stage.rawValue, project: project, currentVersion: version,
+            runs: RunPatternLearner.runStats(database: database),
+            gateEvents: RunPatternLearner.gateEvents(project: project),
+            risks: RunPatternLearner.riskHits(project: project, database: database)
+        )
+        guard !lines.isEmpty else { return "" }
+        return "📈 运行校准（历史运行倾向——假设态，未验证前不作硬约束）：\n"
+            + lines.map { "- \($0)" }.joined(separator: "\n")
     }
 
     /// 系统层知识引用（2026-09-17 钦定）：本轮注入的卡命中（id→标题），
@@ -1438,6 +1647,45 @@ final class AppModel: ObservableObject {
         let project = origin.project
         let version = origin.version
 
+        // 越界顺收（2026-09-21 静默丢弃事故）：② 闸口待确认期间用户连说「继续」，模型
+        // 把它读成推进指令，直接在结构阶段的回复里写出完整 ③ 原型。② 分派只认结构三件，
+        // 原型块既无消费者也无留痕——AI 宣称「原型你上手玩一圈」，用户一个文件都拿不到。
+        // 活已经干完，扔掉是最差体验：收束 ② 闸口（confirmed.json 是阶段推导的事实源），
+        // 原型按 ③ 协议照常落盘并过机器门。两道前置：盘上结构三件齐全（无产物可收的闸
+        // 不开）、③ 槽位为空（顺收轮没有冲突快照，覆盖既有原型等于无声吃掉用户手抄件）。
+        // 闸口开不成功就不顺收，宁可走下方留痕也不造「有产物无闸口」。
+        var carryInPrototype = false
+        if origin.stage == .structure,
+           ArtifactParser.hasWritablePrototypeBlock(blocks),
+           Self.structureArtifactsOnDisk(project: project, version: version),
+           !Self.prototypeOnDisk(project: project, version: version) {
+            do {
+                try pipelineEngine(for: origin).confirmStructure(outcome: "carried_by_prototype")
+                appendOriginSystem(
+                    "⚡ 本轮已直接产出 ③ 交互原型，② 结构产物随之确认（跳过逐项点选）"
+                        + "——原型进入机器初审。",
+                    origin: origin
+                )
+                carryInPrototype = true
+            } catch {
+                appendOriginSystem(
+                    "⚠️ 确认记录写入失败：\(error.localizedDescription)", origin: origin
+                )
+            }
+        }
+
+        // stray 原型块兜底（与上方 PRD 兜底同一纪律）：非 ③ 阶段携带原型块却没被顺收
+        //（发起阶段是 ①④、② 三件未齐、块正文无 HTML、围栏截断），分派里没有消费者——
+        // 静默就是「说了没做」，落 ⚠️ 并指向快速通道恢复路径。
+        if !carryInPrototype, origin.stage != .prototype,
+           ArtifactParser.hasStrayPrototypeBlock(blocks: blocks, text: reply.content) {
+            appendOriginSystem(
+                "⚠️ 本轮回复携带原型 HTML，但 ③ 原型阶段尚未就绪——本次未落盘。"
+                    + "可回复「直接出原型」走快速通道。",
+                origin: origin
+            )
+        }
+
         do {
             switch origin.stage {
             case .structure:
@@ -1468,85 +1716,20 @@ final class AppModel: ObservableObject {
                     if ffFinalStructure == nil || ffFinalStructure == origin.stage {
                         scheduleStageGateIfCurrent(.structure, origin: origin)
                     }
-                }
-            case .prototype:
-                // 阶段 4 冲突分槽：expectedSnapshot 失配（原型已被另一对话/外部更新）
-                // → 后写者分槽并立，冲突块改落修订文件，主槽位不被触碰（见
-                // writePrototypeRevision）；其余错误照常走外层通用 ⚠️ 行。
-                let prototype: ArtifactParser.PrototypeArtifacts?
-                do {
-                    prototype = try ArtifactParser.writePrototypeArtifact(
-                        blocks: blocks, project: project, version: version,
-                        expectedSnapshot: prototypeSnapshot
-                    )
-                } catch let conflict as ArtifactParser.ArtifactConflict {
-                    prototype = try writePrototypeRevision(
-                        after: conflict, blocks: blocks,
-                        project: project, version: version, origin: origin
-                    )
-                }
-                if let prototype {
-                    // 端短名（display 去「交互原型 · 」前缀；默认槽位 / 混出兜底用 display 原文）
-                    let shortName: (String) -> String = { display in
-                        display.hasPrefix("交互原型 · ")
-                            ? String(display.dropFirst("交互原型 · ".count))
-                            : display
-                    }
-                    let displays = prototype.slots.map(\.display)
-                    let isMulti = displays.count > 1
-                    let endsText = displays.map(shortName).joined(separator: "、")
-                    PipelineEventLog.append(
-                        kind: .artifactGenerated, stage: origin.stage.rawValue,
-                        detail: isMulti ? "原型落盘（\(endsText)）" : "交互原型落盘（单文件 HTML）",
-                        project: project, version: version
-                    )
-                    let head = isMulti
-                        ? "📦 交互原型已生成（\(displays.map(shortName).joined(separator: " + "))）"
-                        : "📦 交互原型已生成"
+                } else if ArtifactParser.hasStructureBlocks(blocks) {
+                    // 本轮确实出过结构块却没落盘（缺项或正文为空）才留痕——不落痕会让
+                    // 用户以为产物已生成（与 stray PRD 块兜底同一纪律）。一个结构块都没有
+                    // 的回合（如仅计划提案 / 雷达块）本就不产结构物，不误报。
                     appendOriginSystem(
-                        fastForwardVersions.contains(VersionKey(origin))
-                            && fastForwardFinalStages[VersionKey(origin)] != origin.stage
-                            ? "\(head)（快速通道：自动确认，继续撰写 ④ PRD）"
-                            : "\(head)——机器初审中……",
-                        origin: origin,
-                        fileChanges: prototype.changes,
-                        milestones: [MilestoneStamp(
-                            kind: "stage",
-                            label: "原型",
-                            nextAction: "确认后 AI 随即撰写 ④ PRD"
-                        )]
-                    )
-                    // 部分截断兜底：多端输出中某端围栏未闭合 → 该端未落盘（其余端已落盘），单独提示
-                    let written = Set(prototype.slots.map(\.blockName))
-                    if let incomplete = ArtifactParser.parseIncompleteArtifact(in: reply.content),
-                       !incomplete.name.isEmpty,
-                       ArtifactPath.isPrototypeBlock(incomplete.name),
-                       !written.contains(incomplete.name) {
-                        let label = ArtifactPath.prototypeSlot(forBlockName: incomplete.name)?.display ?? "原型"
-                        appendOriginSystem(
-                            "⚠️ \(label) HTML 输出被截断（未闭合）——该端本次未落盘。可回复「继续出原型」重试；反复截断时建议换更轻量的模型或缩小页面范围。",
-                            origin: origin
-                        )
-                    }
-                    // 快速通道中间产物跳过机器门（target=prd 时）；target=prototype 时放行
-                    //（origin 口径：本产物阶段 == 该版本快速通道的最终目标才过门）
-                    let ffFinalPrototype = fastForwardFinalStages[VersionKey(origin)]
-                    if ffFinalPrototype == nil || ffFinalPrototype == origin.stage {
-                        scheduleStageGateIfCurrent(.prototype, origin: origin)
-                    }
-                } else if let incomplete = ArtifactParser.parseIncompleteArtifact(in: reply.content),
-                          !incomplete.name.isEmpty,
-                          ArtifactPath.isPrototypeBlock(incomplete.name) {
-                    // 截断兜底诊断：回复里有未闭合的原型类围栏（续写 2 轮后仍未闭合）
-                    // → 块解析不到、落盘被跳过——静默会让用户以为「没生成」，留一条可行动的提示。
-                    let label = incomplete.name == "prototype"
-                        ? "原型"
-                        : (ArtifactPath.prototypeSlot(forBlockName: incomplete.name)?.display ?? "原型")
-                    appendOriginSystem(
-                        "⚠️ \(label) HTML 输出被截断（未闭合）——本次未落盘。可回复「继续出原型」重试；反复截断时建议换更轻量的模型或缩小页面范围。",
+                        "⚠️ 本轮结构产物不完整（功能架构图 / 核心流程图 / 模块-页面映射表需各有内容）——本次未落盘。可回复「重做结构」重试。",
                         origin: origin
                     )
                 }
+            case .prototype:
+                try writePrototypeArtifacts(
+                    blocks: blocks, reply: reply, project: project, version: version,
+                    artifactOrigin: origin, prototypeSnapshot: prototypeSnapshot
+                )
             case .prd:
                 // 档位读 origin 的 score-card（跨上下文时 currentPRDTier 读的是当前上下文）
                 let tier = Self.readPRDTier(project: project, version: version) ?? "standard"
@@ -1574,9 +1757,26 @@ final class AppModel: ObservableObject {
                             nextAction: "审阅后可在项目页封板版本"
                         )]
                     )
+                    // PRD 机器门（self-refine 对齐 ②③④）：落盘后评审，未过自动修正
+                    //（上限 2 次后交人工裁决）。快速通道中间产物跳过机器门——PRD 只会
+                    // 是链尾（ffFinal == .prd 放行），与 ③ 的判定规则相同。
+                    let ffFinalPRD = fastForwardFinalStages[VersionKey(origin)]
+                    if ffFinalPRD == nil || ffFinalPRD == origin.stage {
+                        scheduleStageGateIfCurrent(.prd, origin: origin)
+                    }
                 }
             default:
                 break
+            }
+            // 越界顺收落盘：② 分派照常处理完结构块之后，本轮携带的原型块再按 ③ 协议补落。
+            // 不改判 switch 而是追加一步——同一回复完全可能既改结构三件又出原型，改判会让
+            // 结构更新静默丢失，正是要修的那类 bug。
+            if carryInPrototype {
+                try writePrototypeArtifacts(
+                    blocks: blocks, reply: reply, project: project, version: version,
+                    artifactOrigin: origin.with(stage: .prototype),
+                    prototypeSnapshot: prototypeSnapshot
+                )
             }
         } catch {
             appendOriginSystem(
@@ -1597,6 +1797,93 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: - 原型冲突分槽与台账选主（阶段 4）
+
+    /// ③ 原型落盘段（③ 阶段正常轮与 ② 越界顺收轮共用）：逐槽位落盘 + 事件留痕 +
+    /// 📦 系统行（带 fileChanges 才出原型结果卡）+ 截断兜底 + 机器门调度。
+    /// `artifactOrigin` 决定事件 stage 与闸口归属——顺收轮传 `.prototype`，留痕才不落在
+    /// 发起时的 ② 上。冲突分槽见 writePrototypeRevision；其余错误上抛走通用 ⚠️ 行。
+    private func writePrototypeArtifacts(
+        blocks: [ArtifactParser.ArtifactBlock], reply: DiscussionEntry,
+        project: String, version: String, artifactOrigin: ReplyOrigin,
+        prototypeSnapshot: [String: String]?
+    ) throws {
+        let prototype: ArtifactParser.PrototypeArtifacts?
+        do {
+            prototype = try ArtifactParser.writePrototypeArtifact(
+                blocks: blocks, project: project, version: version,
+                expectedSnapshot: prototypeSnapshot
+            )
+        } catch let conflict as ArtifactParser.ArtifactConflict {
+            prototype = try writePrototypeRevision(
+                after: conflict, blocks: blocks,
+                project: project, version: version, origin: artifactOrigin
+            )
+        }
+        guard let prototype else {
+            // 截断兜底诊断：回复里有未闭合的原型类围栏（续写 2 轮后仍未闭合）
+            // → 块解析不到、落盘被跳过——静默会让用户以为「没生成」，留一条可行动的提示。
+            if let incomplete = ArtifactParser.parseIncompleteArtifact(in: reply.content),
+               !incomplete.name.isEmpty,
+               ArtifactPath.isPrototypeBlock(incomplete.name) {
+                let label = incomplete.name == "prototype"
+                    ? "原型"
+                    : (ArtifactPath.prototypeSlot(forBlockName: incomplete.name)?.display ?? "原型")
+                appendOriginSystem(
+                    "⚠️ \(label) HTML 输出被截断（未闭合）——本次未落盘。可回复「继续出原型」重试；反复截断时建议换更轻量的模型或缩小页面范围。",
+                    origin: artifactOrigin
+                )
+            }
+            return
+        }
+        // 端短名（display 去「交互原型 · 」前缀；默认槽位 / 混出兜底用 display 原文）
+        let shortName: (String) -> String = { display in
+            display.hasPrefix("交互原型 · ")
+                ? String(display.dropFirst("交互原型 · ".count))
+                : display
+        }
+        let displays = prototype.slots.map(\.display)
+        let isMulti = displays.count > 1
+        let endsText = displays.map(shortName).joined(separator: "、")
+        PipelineEventLog.append(
+            kind: .artifactGenerated, stage: artifactOrigin.stage.rawValue,
+            detail: isMulti ? "原型落盘（\(endsText)）" : "交互原型落盘（单文件 HTML）",
+            project: project, version: version
+        )
+        let head = isMulti
+            ? "📦 交互原型已生成（\(displays.map(shortName).joined(separator: " + "))）"
+            : "📦 交互原型已生成"
+        appendOriginSystem(
+            fastForwardVersions.contains(VersionKey(artifactOrigin))
+                && fastForwardFinalStages[VersionKey(artifactOrigin)] != artifactOrigin.stage
+                ? "\(head)（快速通道：自动确认，继续撰写 ④ PRD）"
+                : "\(head)——机器初审中……",
+            origin: artifactOrigin,
+            fileChanges: prototype.changes,
+            milestones: [MilestoneStamp(
+                kind: "stage",
+                label: "原型",
+                nextAction: "确认后 AI 随即撰写 ④ PRD"
+            )]
+        )
+        // 部分截断兜底：多端输出中某端围栏未闭合 → 该端未落盘（其余端已落盘），单独提示
+        let written = Set(prototype.slots.map(\.blockName))
+        if let incomplete = ArtifactParser.parseIncompleteArtifact(in: reply.content),
+           !incomplete.name.isEmpty,
+           ArtifactPath.isPrototypeBlock(incomplete.name),
+           !written.contains(incomplete.name) {
+            let label = ArtifactPath.prototypeSlot(forBlockName: incomplete.name)?.display ?? "原型"
+            appendOriginSystem(
+                "⚠️ \(label) HTML 输出被截断（未闭合）——该端本次未落盘。可回复「继续出原型」重试；反复截断时建议换更轻量的模型或缩小页面范围。",
+                origin: artifactOrigin
+            )
+        }
+        // 快速通道中间产物跳过机器门（target=prd 时）；target=prototype 时放行
+        //（产物阶段口径：本产物阶段 == 该版本快速通道的最终目标才过门）
+        let ffFinalPrototype = fastForwardFinalStages[VersionKey(artifactOrigin)]
+        if ffFinalPrototype == nil || ffFinalPrototype == artifactOrigin.stage {
+            scheduleStageGateIfCurrent(.prototype, origin: artifactOrigin)
+        }
+    }
 
     /// 原型冲突降级（「后写者分槽并立」）：expectedSnapshot 失配说明原型已被
     /// 另一对话或外部更新——本次生成不覆盖任何现有槽位文件。冲突块改落
@@ -1751,6 +2038,11 @@ final class AppModel: ObservableObject {
     private var fastForwardVersions: Set<VersionKey> = []
     private var fastForwardFinalStages: [VersionKey: PipelineRun.Stage] = [:]
 
+    /// 待消费的路线建议（VersionKey → 最新一条）：澄清轮 route 块落这里，收束点
+    /// 消费转提示行（仅展示不执行——路径仍由用户在确认坞选择）。运行态内存，
+    /// 重启即清（建议随会话新生，无跨启动价值）。
+    private var pendingRouteProposals: [VersionKey: ArtifactParser.RouteProposal] = [:]
+
     /// 澄清质量门（s17）：雷达无缺项且 covered 非空（防懒惰空评），且已问满 2 轮——
     /// 质量收束优先于 5 轮兜底。
     private func clarifyQualityGatePassed(reply: DiscussionEntry) -> Bool {
@@ -1795,6 +2087,11 @@ final class AppModel: ObservableObject {
             Task { await self.runFastForward(to: target, instruction: request.instruction, origin: origin) }
             return
         }
+        // 路线建议块（动态规划提议面）：澄清轮 Agent 主动建议路径，仅存待收束消费
+        // 展示（不执行）；快速通道受理轮不落此（上方已 return，模型不应同轮双出）。
+        if let proposal = ArtifactParser.parseRoute(blocks: blocks) {
+            pendingRouteProposals[VersionKey(origin)] = proposal
+        }
         pipeline.bumpClarifyRound()
         // 最新 assistant 回合落在本会话 → 澄清闸口归属随之迁移（两个收束路径共用）
         refreshGateOwner()
@@ -1805,6 +2102,7 @@ final class AppModel: ObservableObject {
                 "✅ 质量门通过：漏项雷达无缺项、自检覆盖充分——澄清自动收束，生成要点表并进入 ② 结构。",
                 origin: origin
             )
+            announceRouteProposal(origin: origin)
             Task { await confirmCurrentStage() }
             return
         }
@@ -1815,7 +2113,34 @@ final class AppModel: ObservableObject {
                 "⏳ 澄清轮次已达上限——澄清自动收束，缺失项记入要点表 open_questions，进入 ② 结构。",
                 origin: origin
             )
+            announceRouteProposal(origin: origin)
             Task { await confirmCurrentStage() }
+        }
+    }
+
+    /// 路线建议消费（澄清收束点）：把最近一轮 route 建议转成提示行（仅展示——
+    /// 路径仍由用户在收束后的确认坞自行选择，建议不改变任何闸口机制）。
+    /// 无待展示建议 / recommend 白名单外 → 不出行（乱建议不如不建议）。
+    private func announceRouteProposal(origin: ReplyOrigin) {
+        guard let proposal = pendingRouteProposals.removeValue(forKey: VersionKey(origin)),
+              let display = Self.routeDisplay(for: proposal.recommend) else { return }
+        var line = "🧭 路线建议：\(display)"
+        if let reasons = proposal.reasons, !reasons.isEmpty {
+            let quoted = reasons.prefix(2).joined(separator: "；")
+            if !quoted.trimmingCharacters(in: .whitespaces).isEmpty {
+                line += "——\(quoted)"
+            }
+        }
+        appendOriginSystem(line + "。收束后可在确认坞按建议选择，也可走常规流程。", origin: origin)
+    }
+
+    /// recommend → 用户可见路径名（白名单外 → nil 忽略）。nonisolated static 供测试直测。
+    nonisolated static func routeDisplay(for recommend: String) -> String? {
+        switch recommend.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "standard": return "完整流程（② 结构 → ③ 原型 → ④ PRD）"
+        case "skip_structure": return "跳过 ② 结构，直出 ③ 原型（结构可事后补做）"
+        case "direct_prd": return "跳过 ②③，直出 ④ PRD（适合小需求，产物可事后补做）"
+        default: return nil
         }
     }
 
@@ -1887,8 +2212,15 @@ final class AppModel: ObservableObject {
         )
 
         if pass {
+            let nextStep: String
+            switch stage {
+            case .structure: nextStep = "确认后进入 ③ 原型"
+            case .prototype: nextStep = "确认后进入 ④ PRD"
+            case .prd: nextStep = "审阅后可在项目页封板版本"
+            case .clarify: nextStep = "确认后进入 ② 结构"
+            }
             appendOriginSystem(
-                "✅ 机器初审通过——\(verdict?.verdict ?? "确定性检查全部通过")。确认后进入 \(stage == .structure ? "③ 原型" : "④ PRD")。",
+                "✅ 机器初审通过——\(verdict?.verdict ?? "确定性检查全部通过")。\(nextStep)。",
                 origin: origin
             )
             return
@@ -1952,6 +2284,28 @@ final class AppModel: ObservableObject {
                 sections = ["### 原型可见内容（HTML 正文提取）\n（缺失）"]
             }
             artifacts = "### 模块-页面映射表（上游锚点）\n\(map)\n\n\(sections.joined(separator: "\n\n"))"
+        case .prd:
+            // 文字产物给更大预算：上游双锚点（要点表 / 映射表）+ PRD 全文分段截断
+            let clarification = Self.readArtifact(
+                project: project, version: version, rel: ArtifactPath.clarification
+            ) ?? "（缺失）"
+            let map = Self.readArtifact(
+                project: project, version: version, rel: ArtifactPath.modulePageMap
+            ) ?? "（缺失）"
+            let prd = Self.readArtifact(project: project, version: version, rel: ArtifactPath.prd)
+            guard let prd, !prd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return (nil, "PRD 不在盘（Tier 2 评审无输入）")
+            }
+            artifacts = """
+                ### 澄清要点表（上游锚点）
+                \(String(clarification.prefix(4000)))
+
+                ### 模块-页面映射表（上游锚点）
+                \(String(map.prefix(3000)))
+
+                ### 待审 PRD 全文
+                \(String(prd.prefix(12000)))
+                """
         default:
             return (nil, "阶段 \(stage.rawValue) 未配置 Tier 2 评审")
         }
@@ -2033,6 +2387,27 @@ final class AppModel: ObservableObject {
                     }
                 }
             }
+        case .prd:
+            let text = read(ArtifactPath.prd).trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                issues.append("PRD 缺失或为空")
+            } else {
+                // 三档共有骨架章（lean/standard/full 均含）；缺即骨架不完整
+                if !text.contains("需求概述") { issues.append("PRD 缺「需求概述」章节") }
+                if !text.contains("详细设计") { issues.append("PRD 缺「详细设计」章节") }
+                if !text.contains("验收") { issues.append("PRD 无验收相关内容（验收标准 / 验收 eval）") }
+            }
+            // prd-meta.json 模板版本戳（缺失 = 旧模板产物，重写后由 writePRDMeta 补齐）
+            struct GatePRDMeta: Codable { var tier: String }
+            let metaRaw = read(ArtifactPath.prdMeta)
+            if let data = metaRaw.data(using: .utf8),
+               let meta = try? JSONDecoder().decode(GatePRDMeta.self, from: data) {
+                if !["lean", "standard", "full"].contains(meta.tier) {
+                    issues.append("PRD 模板档位非法（\(meta.tier)）")
+                }
+            } else {
+                issues.append("PRD 模板版本戳缺失（prd-meta.json 不存在，疑似旧模板产物）")
+            }
         default:
             break
         }
@@ -2048,13 +2423,17 @@ final class AppModel: ObservableObject {
             .map { "\($0.offset + 1). \($0.element)" }
             .joined(separator: "\n")
         let gateOrigin = origin.with(stage: stage)
+        // 机器门打回重生成同样接入工具循环：修正可查证（技能/依赖/检索）
+        let genTools = agentToolRuntime(origin: origin)
         switch stage {
         case .structure:
             let clarification = Self.readArtifact(
                 project: origin.project, version: origin.version,
                 rel: ArtifactPath.clarification
             ) ?? "（缺失）"
-            let systemPrompt = await assembleSystemPrompt(stage: .structure, origin: origin) { injection in
+            let systemPrompt = await assembleSystemPrompt(
+                stage: .structure, origin: origin, toolsSection: genTools != nil
+            ) { injection in
                 AgentPrompts.structure(clarification: clarification, injection: injection)
             }
             await sessionStore.sendSystemTurn(
@@ -2063,12 +2442,15 @@ final class AppModel: ObservableObject {
                     + gateInviteSuffix(for: .structure, origin: origin),
                 settings: settings, stage: .structure,
                 systemPrompt: systemPrompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
-                skills: systemPrompt.skills, pinnedOrigin: gateOrigin.storeOrigin
+                skills: systemPrompt.skills, pinnedOrigin: gateOrigin.storeOrigin,
+                tools: genTools
             ) { [weak self] reply, _ in
                 self?.handleAssistantReply(reply, origin: gateOrigin)
             }
         case .prototype:
-            let systemPrompt = await prototypePrompt(origin: origin)
+            let systemPrompt = await prototypePrompt(
+                origin: origin, toolsEnabled: genTools != nil
+            )
             await sessionStore.sendSystemTurn(
                 note: nil,
                 userPrompt: "机器初审发现以下问题，请修正后重新输出完整原型产物块（单文件 HTML）：\n\(correction)"
@@ -2076,9 +2458,26 @@ final class AppModel: ObservableObject {
                 settings: settings, stage: .prototype,
                 systemPrompt: systemPrompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
                 skills: systemPrompt.skills, pinnedOrigin: gateOrigin.storeOrigin,
-                prototypeSnapshot: systemPrompt.snapshot
+                prototypeSnapshot: systemPrompt.snapshot,
+                tools: genTools
             ) { [weak self] reply, prototypeSnapshot in
                 self?.handleAssistantReply(reply, origin: gateOrigin, prototypeSnapshot: prototypeSnapshot)
+            }
+        case .prd:
+            let tier = Self.readPRDTier(project: origin.project, version: origin.version) ?? "standard"
+            let systemPrompt = await prdSystemPrompt(
+                tier: tier, origin: origin, toolsEnabled: genTools != nil
+            )
+            await sessionStore.sendSystemTurn(
+                note: nil,
+                userPrompt: "机器初审发现以下问题，请修正后按 \(tier) 档模板重新输出完整 PRD"
+                    + "（完整 artifact:prd 块）：\n\(correction)",
+                settings: settings, stage: .prd,
+                systemPrompt: systemPrompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
+                skills: systemPrompt.skills, pinnedOrigin: gateOrigin.storeOrigin,
+                tools: genTools
+            ) { [weak self] reply, _ in
+                self?.handleAssistantReply(reply, origin: gateOrigin)
             }
         default:
             break
@@ -2789,10 +3188,7 @@ final class AppModel: ObservableObject {
     }
 
     private var structureArtifactsOnDisk: Bool {
-        let dir = PMAgentStore.versionURL(project: pipeline.project, version: pipeline.version)
-        let fm = FileManager.default
-        return [ArtifactPath.architecture, ArtifactPath.coreFlows, ArtifactPath.modulePageMap]
-            .allSatisfy { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+        Self.structureArtifactsOnDisk(project: pipeline.project, version: pipeline.version)
     }
 
     private var prototypeOnDisk: Bool {
@@ -3086,18 +3482,22 @@ final class AppModel: ObservableObject {
             let previousArtifacts = amending
                 ? Self.readStructureArtifactsBundle(project: project, version: version)
                 : nil
+            // 产物生成轮接入工具循环（P0：Agent loop 覆盖确认链系统轮）：
+            // 生成中模型可自主 load_skill / web_search / query_impact 等，
+            // 说明段与 runtime 同真同假。
+            let genTools = agentToolRuntime(origin: origin)
             sessionStore.setStreamPhase("正在生成结构产物…", for: origin.sessionId)
-            let structurePrompt = await assembleSystemPrompt(stage: .structure, origin: origin) { injection in
+            let structurePrompt = await assembleSystemPrompt(
+                stage: .structure, origin: origin, toolsSection: genTools != nil
+            ) { injection in
                 AgentPrompts.structure(
                     clarification: table.markdown,
                     previousArtifacts: previousArtifacts, injection: injection
                 )
             }
-            await sessionStore.sendSystemTurn(
-                note: amending
-                    ? "✅ 要点表已按新功能诉求更新——进入 ② 结构（增量修订）"
-                    : "✅ 澄清要点表已确认——进入 ② 结构设计",
-                noteSilent: true,
+            await runGenerationWithPlan(
+                stage: .structure, origin: origin,
+                systemPrompt: structurePrompt.prompt,
                 userPrompt: amending
                     ? "澄清要点表已按新功能诉求更新。请在上一版结构产物基础上增量修订：新功能落入对应模块/页面，未波及的部分原样保留，重新输出全部结构产物（完整产物块）。"
                         + gateInviteSuffix(for: .structure, origin: origin)
@@ -3111,13 +3511,15 @@ final class AppModel: ObservableObject {
                             directive: directive, injected: injectedOpening,
                             defaultFact: "已确认澄清要点表，本轮开始生成结构产物",
                             risk: riskFact),
-                settings: settings, stage: .structure,
-                systemPrompt: structurePrompt.prompt,
-                maxTokens: LLMClient.artifactMaxTokens, skills: structurePrompt.skills,
-                pinnedOrigin: origin.storeOrigin
-            ) { [weak self] reply, _ in
-                self?.handleAssistantReply(reply, origin: origin.with(stage: .structure))
-            }
+                note: amending
+                    ? "✅ 要点表已按新功能诉求更新——进入 ② 结构（增量修订）"
+                    : "✅ 澄清要点表已确认——进入 ② 结构设计",
+                noteSilent: true,
+                skills: structurePrompt.skills,
+                maxTokens: LLMClient.artifactMaxTokens,
+                tools: genTools,
+                allowPlan: directive == nil
+            )
 
         case .skipToPrototype:
             // ① 跳 ② 直出 ③：结构产物不生成（skipped.json 闭环），原型按要点表直设计
@@ -3128,7 +3530,10 @@ final class AppModel: ObservableObject {
             )
             let riskFact = gateRiskNudge(fromStage: .clarify, nextStageName: "原型")
             sessionStore.setStreamPhase("正在生成原型…", for: origin.sessionId)
-            let prototypeGenerationPrompt = await prototypePrompt(origin: origin)
+            let protoTools = agentToolRuntime(origin: origin)
+            let prototypeGenerationPrompt = await prototypePrompt(
+                origin: origin, toolsEnabled: protoTools != nil
+            )
             await sessionStore.sendSystemTurn(
                 note: "✅ 要点表已确认——跳过 ② 结构，直出 ③ 原型",
                 noteSilent: true,
@@ -3142,7 +3547,8 @@ final class AppModel: ObservableObject {
                 systemPrompt: prototypeGenerationPrompt.prompt,
                 maxTokens: LLMClient.artifactMaxTokens, skills: prototypeGenerationPrompt.skills,
                 pinnedOrigin: origin.storeOrigin,
-                prototypeSnapshot: prototypeGenerationPrompt.snapshot
+                prototypeSnapshot: prototypeGenerationPrompt.snapshot,
+                tools: protoTools
             ) { [weak self] reply, prototypeSnapshot in
                 self?.handleAssistantReply(
                     reply, origin: origin.with(stage: .prototype),
@@ -3219,27 +3625,27 @@ final class AppModel: ObservableObject {
         }
         let riskFact = gateRiskNudge(fromStage: .structure, nextStageName: "原型")
         sessionStore.setStreamPhase("正在生成原型…", for: origin.sessionId)
-        let prototypeGenerationPrompt = await prototypePrompt(origin: origin)
+        let protoTools = agentToolRuntime(origin: origin)
+        let prototypeGenerationPrompt = await prototypePrompt(
+            origin: origin, toolsEnabled: protoTools != nil
+        )
         let fastTrackNote = directive.map { "用户要求快速出稿：缺失项按合理假设补齐并在产物中标注假设。" + $0 }
-        await sessionStore.sendSystemTurn(
-            note: "✅ 结构产物已确认——进入 ③ 原型",
-            noteSilent: true,
+        await runGenerationWithPlan(
+            stage: .prototype, origin: origin,
+            systemPrompt: prototypeGenerationPrompt.prompt,
             userPrompt: "请基于模块-页面映射表生成单文件 HTML 原型（P0 页面 3-5 个，页面跳转按核心流程图连通）。\(fastTrackNote.map { "\n\($0)" } ?? "")"
                 + Self.openingTail(
                     directive: directive, injected: injectedOpening,
                     defaultFact: "已确认结构产物，本轮开始生成可点击的 HTML 原型",
                     risk: riskFact),
-            settings: settings, stage: .prototype,
-            systemPrompt: prototypeGenerationPrompt.prompt,
-            maxTokens: LLMClient.artifactMaxTokens, skills: prototypeGenerationPrompt.skills,
-            pinnedOrigin: origin.storeOrigin,
-            prototypeSnapshot: prototypeGenerationPrompt.snapshot
-        ) { [weak self] reply, prototypeSnapshot in
-            self?.handleAssistantReply(
-                reply, origin: origin.with(stage: .prototype),
-                prototypeSnapshot: prototypeSnapshot
-            )
-        }
+            note: "✅ 结构产物已确认——进入 ③ 原型",
+            noteSilent: true,
+            skills: prototypeGenerationPrompt.skills,
+            maxTokens: LLMClient.artifactMaxTokens,
+            tools: protoTools,
+            prototypeSnapshot: prototypeGenerationPrompt.snapshot,
+            allowPlan: directive == nil
+        )
     }
 
     /// ③→④：确认闸口 + 评分卡选档 + PRD 生成（Task 3.4）。
@@ -3426,7 +3832,10 @@ final class AppModel: ObservableObject {
             }
         }
         sessionStore.setStreamPhase("正在生成 PRD…", for: origin.sessionId)
-        let prdGenerationPrompt = await prdSystemPrompt(tier: tier, origin: origin)
+        let prdTools = agentToolRuntime(origin: origin)
+        let prdGenerationPrompt = await prdSystemPrompt(
+            tier: tier, origin: origin, toolsEnabled: prdTools != nil
+        )
         // 精简路径（②/③ 被路径选择跳过、上游产物不在盘）：PRD 不再双重基准——
         // 基于澄清要点表直接撰写，涉及页面与流程按合理假设设计并标注。
         let leanPath = !Self.structureArtifactsOnDisk(
@@ -3436,9 +3845,9 @@ final class AppModel: ObservableObject {
         // ②③ 的同名 note 不带此提醒——前置确认卡（prd_preflight）已在入口分流。
         let fastTrackBase = "用户要求快速出稿：缺失项按合理假设补齐并在产物中标注假设；出稿后按系统提示中的默认项卡协议，把按默认值处理的项列为可点选题（首选项=保持默认）。"
         let fastTrackNote = directive.map { fastTrackBase + $0 }
-        await sessionStore.sendSystemTurn(
-            note: note ?? "📝 开始撰写 \(tier) 档 PRD",
-            noteSilent: noteSilent,
+        await runGenerationWithPlan(
+            stage: .prd, origin: origin,
+            systemPrompt: prdGenerationPrompt.prompt,
             userPrompt: (leanPath
                 ? "请按 \(tier) 档模板撰写 PRD。本版本走精简路径（结构/原型产物未生成）：相关章节基于澄清要点表直接撰写，不引用不存在的产物；涉及页面与流程时按合理假设设计并标注。"
                 : "请按 \(tier) 档模板撰写 PRD（双重基准：功能需求与模块-页面映射表及原型页面一一对应）。")
@@ -3449,13 +3858,13 @@ final class AppModel: ObservableObject {
                         ? "已确认要点表，本轮直接撰写 PRD 文档（精简路径）"
                         : "已确认原型，本轮开始撰写 PRD 文档",
                     risk: riskNudge),
-            settings: settings, stage: .prd,
-            systemPrompt: prdGenerationPrompt.prompt,
-            maxTokens: LLMClient.artifactMaxTokens, skills: prdGenerationPrompt.skills,
-            pinnedOrigin: origin.storeOrigin
-        ) { [weak self] reply, _ in
-            self?.handleAssistantReply(reply, origin: origin.with(stage: .prd))
-        }
+            note: note ?? "📝 开始撰写 \(tier) 档 PRD",
+            noteSilent: noteSilent,
+            skills: prdGenerationPrompt.skills,
+            maxTokens: LLMClient.artifactMaxTokens,
+            tools: prdTools,
+            allowPlan: directive == nil && tierOverride == nil && !leanPath
+        )
     }
 
     /// 三维度评分选档（oneShot；锚定上游已确认产物的确定性数字）+ 落盘 score-card.json。
@@ -4297,8 +4706,10 @@ final class AppModel: ObservableObject {
             let previousArtifacts = revise
                 ? Self.readStructureArtifactsBundle(project: project, version: version)
                 : nil
+            let genTools = agentToolRuntime(origin: origin)
             let systemPrompt = await assembleSystemPrompt(
-                stage: .structure, userMessage: directive.isEmpty ? nil : directive, origin: origin
+                stage: .structure, userMessage: directive.isEmpty ? nil : directive,
+                origin: origin, toolsSection: genTools != nil
             ) { injection in
                 AgentPrompts.structure(
                     clarification: clarification,
@@ -4325,7 +4736,8 @@ final class AppModel: ObservableObject {
                 }() + gateInviteSuffix(for: .structure, origin: origin),
                 settings: settings, stage: .structure,
                 systemPrompt: systemPrompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
-                skills: systemPrompt.skills, pinnedOrigin: origin.storeOrigin
+                skills: systemPrompt.skills, pinnedOrigin: origin.storeOrigin,
+                tools: genTools
             ) { [weak self] reply, _ in
                 self?.handleAssistantReply(reply, origin: origin)
             }
@@ -4347,8 +4759,10 @@ final class AppModel: ObservableObject {
             let flows = Self.readArtifact(
                 project: project, version: version, rel: ArtifactPath.coreFlows
             ) ?? "（缺失）"
+            let genTools = agentToolRuntime(origin: origin)
             let prompt = await assembleSystemPrompt(
-                stage: .prototype, userMessage: directive.isEmpty ? nil : directive, origin: origin
+                stage: .prototype, userMessage: directive.isEmpty ? nil : directive,
+                origin: origin, toolsSection: genTools != nil
             ) { injection in
                 AgentPrompts.prototype(
                     modulePageMap: map, coreFlows: flows,
@@ -4376,7 +4790,8 @@ final class AppModel: ObservableObject {
                 settings: settings, stage: .prototype,
                 systemPrompt: prompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
                 skills: prompt.skills, pinnedOrigin: origin.storeOrigin,
-                prototypeSnapshot: prototypeSnapshot
+                prototypeSnapshot: prototypeSnapshot,
+                tools: genTools
             ) { [weak self] reply, prototypeSnapshot in
                 self?.handleAssistantReply(reply, origin: origin, prototypeSnapshot: prototypeSnapshot)
             }

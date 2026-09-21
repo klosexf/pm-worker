@@ -216,9 +216,12 @@ docs/
 | M2 | clarify / structure / prototype agents, confirmation dock, thinking card, state machine persistence | done |
 | M3 | PRD agent (tiered templates + scoring card), self-review + gap radar + risk loop, decision log, sealing, competitive branch | done |
 | M4 | dual library, retrieval scope isolation, capture & routing, recommendations & calibration, 4-tab inspector, ⌘D inspector | done — 72/72 unit tests green |
-| M5 | MCP server (6 tools) + status page, bilingual README, demo materials, full E2E regression & north-star runs | **in progress** (this README is an M5 deliverable) |
+| M5 | MCP server (6 tools) + status page, bilingual README, demo materials, full E2E regression & M5 acceptance line | **in progress** (this README is an M5 deliverable) |
+| **M6 · second ring** | **The loop**: evidence intake → outcome reconciliation → project-level demand pool → kickoff dossier | **planned · unscheduled** (six reuse points already provisioned in the architecture, see design.md §14) |
 
-V2 (architecture already reserved, per design.md §14): data-analysis branch (local CSV + Python), iteration management on top of version containers, retrospective stage writing back into the decision log, Feishu/Notion export, skill "learn" mode.
+**The product-level north star is "projects that complete the full loop" — currently 0, because the second ring isn't built yet.** The M5 row above is a *milestone acceptance line*, not the north star; PRD §4.2 now keeps the two in separate tables (they previously shared one column, which made the second ring permanently invisible in the metrics and therefore permanently deprioritized).
+
+Orthogonal extras, pluggable on demand and not part of the loop: local data computation (CSV + Python), third-party prototype export, skill "learn" mode, Feishu / Notion export.
 
 ## License
 

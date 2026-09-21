@@ -47,3 +47,7 @@ diagrams/*.html
 !diagrams/pm-copilot-dataflow.html
 !diagrams/pm-copilot-architecture.html
 diagrams/*.visual-check.*
+
+# 评测实跑产物：逐 case 回复原文与报告，每次 live 调用重新生成，本地保留不入库
+# （评测集本体 evals/cases/*.jsonl 与 README 仍入库）
+evals/results/

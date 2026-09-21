@@ -52,6 +52,8 @@ nonisolated final class Retriever {
         let projectId: String
         let content: String
         let embedding: Data
+        /// 向量来源戳（v2 迁移前旧行 NULL = 未知）
+        let embeddingSource: String?
     }
 
     /// 同上（技能行：命中只带 when_to_use 摘要，正文渐进式披露）。
@@ -59,6 +61,7 @@ nonisolated final class Retriever {
         let id: String
         let whenToUse: String
         let embedding: Data
+        let embeddingSource: String?
     }
 
     // MARK: - 检索
@@ -84,10 +87,17 @@ nonisolated final class Retriever {
 
         // 1. query 向量化（embedder 契约保证等长返回；空兜底 → 全部余弦为 0 的空 trace）。
         //    双查询合并一次 embed 调用（真实端点省一次网络往返）。
+        //    来源戳（P1 嵌入守卫）：与行上 embedding_source 比对，不同向量空间不混算。
         let embedTexts = skillQuery.map { [query, $0] } ?? [query]
-        let vectors = try await embedder.embed(texts: embedTexts)
+        let embedded = try await embedder.embedWithSource(texts: embedTexts)
+        let vectors = embedded.vectors
         let queryVector = vectors.first ?? []
         let skillVector = (skillQuery != nil ? vectors.last : vectors.first) ?? []
+        let currentSource = embedded.source
+
+        // 来源不一致 / 维度不一致被排除的行数（>0 时 trace.degraded 留痕——
+        // 此前这类混算表现为余弦恒 0 的静默零命中）
+        var staleRows = 0
 
         // 2. 读全部行（两条 SELECT：卡片 + 技能；当前 MVP 内存余弦，
         //    SQLiteVec 切换点见 sqliteVecChunkThreshold）
@@ -95,27 +105,29 @@ nonisolated final class Retriever {
         let cardRows = try await database.dbQueue.read { db -> [CardRow] in
             try Row.fetchAll(
                 db,
-                sql: "SELECT id, project_id, content, embedding FROM knowledge_points"
+                sql: "SELECT id, project_id, content, embedding, embedding_source FROM knowledge_points"
             )
             .map { row in
                 CardRow(
                     id: row["id"],
                     projectId: row["project_id"],
                     content: row["content"],
-                    embedding: row["embedding"]
+                    embedding: row["embedding"],
+                    embeddingSource: row["embedding_source"]
                 )
             }
         }
         let skillRows = try await database.dbQueue.read { db -> [SkillRow] in
             try Row.fetchAll(
                 db,
-                sql: "SELECT id, when_to_use, embedding FROM skills WHERE enabled = 1"
+                sql: "SELECT id, when_to_use, embedding, embedding_source FROM skills WHERE enabled = 1"
             )
             .map { row in
                 SkillRow(
                     id: row["id"],
                     whenToUse: row["when_to_use"],
-                    embedding: row["embedding"]
+                    embedding: row["embedding"],
+                    embeddingSource: row["embedding_source"]
                 )
             }
         }
@@ -126,6 +138,13 @@ nonisolated final class Retriever {
         for row in cardRows {
             // M0 旧数据兼容：零长度占位 blob 跳过（不参与检索，也不计入跨项目过滤）
             guard !row.embedding.isEmpty, let vector = VectorMath.decode(row.embedding) else { continue }
+            // 向量守卫（P1）：来源戳不一致或维度不等 → 不混算（混算余弦恒 0），
+            // 计数进 degraded 留痕，替代旧「静默零命中」
+            guard comparable(rowStamps: row.embeddingSource, currentSource: currentSource,
+                             rowVector: vector, queryVector: queryVector) else {
+                staleRows += 1
+                continue
+            }
             // scope 隔离写在检索层：只取全局（""）与当前项目，其余计为 filteredCrossProject
             if !row.projectId.isEmpty && row.projectId != project {
                 filteredCrossProject += 1
@@ -174,6 +193,11 @@ nonisolated final class Retriever {
         for row in skillRows {
             allSkillIds.append(row.id)
             guard !row.embedding.isEmpty, let vector = VectorMath.decode(row.embedding) else { continue }
+            guard comparable(rowStamps: row.embeddingSource, currentSource: currentSource,
+                             rowVector: vector, queryVector: skillVector) else {
+                staleRows += 1
+                continue
+            }
             skillIndexReady = true
             let score = VectorMath.cosine(skillVector, vector)
             guard score > Self.skillThreshold else { continue }
@@ -215,8 +239,20 @@ nonisolated final class Retriever {
             unmatchedSkills: unmatchedSkills,
             durationMs: Self.milliseconds(of: clock.now - start),
             skillQuery: skillQuery,
-            skillIndexReady: skillIndexReady
+            skillIndexReady: skillIndexReady,
+            degraded: staleRows > 0
+                ? "\(staleRows) 条索引来自其他向量编码（当前 \(currentSource.isEmpty ? "未知" : currentSource)），未参与本次检索——在设置中重建索引即可恢复"
+                : nil
         )
+    }
+
+    /// 行向量可否与查询向量混算（P1 嵌入守卫）：来源戳未知（旧行）放行，
+    /// 已知但不同源不放行；维度不等一律不放行。
+    private func comparable(
+        rowStamps: String?, currentSource: String, rowVector: [Float], queryVector: [Float]
+    ) -> Bool {
+        guard rowVector.count == queryVector.count, !queryVector.isEmpty else { return false }
+        return EmbeddingSourceStamp.isCompatible(rowStamps, currentSource)
     }
 
     // MARK: - 渐进式披露

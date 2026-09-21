@@ -424,6 +424,13 @@ private struct TraceDetailView: View {
                     trace.filteredCrossProject > 0
                         ? AnyShapeStyle(Color.statusAlert) : AnyShapeStyle(Color.ink300)
                 )
+            // 向量来源降级留痕（P1 嵌入守卫）：非同源行被排除时显性告警
+            if let degraded = trace.degraded {
+                Text(degraded)
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.statusAlert)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }

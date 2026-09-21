@@ -636,12 +636,50 @@ final class MemoryStore: ObservableObject {
 
     // MARK: - 注入格式
 
+    /// 词面相关度评分（CJK/拉丁 2-gram 重叠，零网络零依赖）：0 = 无交集。
+    /// 记忆注入排序（injectionContext(rankedFor:)）与 recall_memory 工具共用。
+    /// 纯函数，测试直测。
+    nonisolated static func relevanceScore(content: String, query: String) -> Int {
+        let q = query.lowercased()
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        let c = content.lowercased()
+        guard q.count >= 2 else { return 0 }
+        var score = 0
+        // 整串字面命中 = 强信号（短查询才有意义，长串几乎不会整体出现）
+        if q.count <= 16, c.contains(q) { score += 8 }
+        var seen = Set<String>()
+        let chars = Array(q)
+        for i in 0..<(chars.count - 1) {
+            let gram = String(chars[i...(i + 1)])
+            if !seen.insert(gram).inserted { continue }
+            if c.contains(gram) { score += 3 }
+        }
+        return score
+    }
+
+    /// 硬边界条目（⚑ 约束/否决项）——注入排序时恒前置，裁剪时永不丢。
+    nonisolated static func isHardBoundary(_ entry: MemoryEntry) -> Bool {
+        entry.kind == .constraint || entry.kind == .rejection
+    }
+
     /// Agent 注入用上下文（优先级链：项目 > 全局——具体性优先，非时长优先；
     /// 会话上下文天然最优先，不在此列）。项目池内版本标签匹配当前版本的条目
-    /// 再前置；同层新条目在前（降序）——超预算从尾部逐行丢时先丢最旧条目，
-    /// 与「新覆盖旧」语义一致。
-    var injectionContext: String {
+    /// 再前置；同层新条目在前（降序）——超预算从尾部逐行丢。
+    /// rankedFor 非空时启用相关性排序（P0：预算裁行先丢「最不相关」而非「最旧」）：
+    /// 硬边界条目全池最前（保护层不为相关性让位），其余同层按评分降序、新在前。
+    func injectionContext(rankedFor query: String?) -> String {
+        let useRanking = !(query ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        let score: (MemoryEntry) -> Int = { entry in
+            guard useRanking else { return 0 }
+            return Self.relevanceScore(content: entry.content, query: query!)
+        }
         let sorted = effective.sorted { a, b in
+            if useRanking {
+                let hardA = Self.isHardBoundary(a)
+                let hardB = Self.isHardBoundary(b)
+                if hardA != hardB { return hardA }
+            }
             let tierA = a.scope == .global ? 1 : 0
             let tierB = b.scope == .global ? 1 : 0
             if tierA != tierB { return tierA < tierB }          // 项目 > 全局
@@ -651,8 +689,65 @@ final class MemoryStore: ObservableObject {
                 let bm = (b.versions ?? "").isEmpty || b.versions?.contains(version) == true
                 if am != bm { return am }
             }
+            if useRanking {
+                let sa = score(a)
+                let sb = score(b)
+                if sa != sb { return sa > sb }
+            }
             return a.createdAt > b.createdAt
         }
         return AgentPrompts.formatMemory(sorted)
+    }
+
+    /// 无排序注入（碑文序语义：版本 scope 前置 + 新条目在前）。
+    var injectionContext: String { injectionContext(rankedFor: nil) }
+
+    // MARK: - 工具通道（save_memory / recall_memory，P0）
+
+    /// 词面检索（当前项目全版本 + 项目级 + 全局池）：评分降序 top-limit，
+    /// 零分不返。recall_memory 工具数据源。
+    nonisolated static func searchEntries(
+        project: String, version: String, query: String, limit: Int = 8
+    ) -> [MemoryEntry] {
+        let entries = applySupersede(readAllMemoryLines(project: project, version: version))
+        return entries
+            .map { (entry: $0, score: relevanceScore(content: $0.content, query: query)) }
+            .filter { $0.score > 0 }
+            .sorted { $0.score > $1.score }
+            .prefix(limit)
+            .map(\.entry)
+    }
+
+    /// 模型主动记忆写入（save_memory）：kind 只放行 结论/经验——
+    /// ⚑ 硬边界（约束/否决项）必须来自用户裁决事件，模型不能自封约束。
+    /// 经验落假设态（confidence 0.7），进既有校准回路等待用户确认。
+    /// 返回错误文案，nil = 成功。
+    nonisolated static func addToolEntry(
+        project: String, version: String, kind: MemoryEntry.Kind, content: String
+    ) -> String? {
+        guard kind == .conclusion || kind == .experience else {
+            return "save_memory 只支持 kind=conclusion（结论）或 kind=experience（经验）；约束与否决项须由用户确认沉淀。"
+        }
+        let text = content
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return "内容为空" }
+        let entry = MemoryEntry(
+            scope: .project, scopeId: project, kind: kind, content: text,
+            versions: version.isEmpty ? nil : version,
+            sourceRef: "模型主动记录",
+            confidence: kind == .experience ? experienceHypothesisConfidence : nil
+        )
+        let target = projectMemoryURL(project: project)
+        ensureJSONLFile(at: target)
+        let line = DiscussionEntry(
+            id: UUID().uuidString, sessionId: "agent", role: .system,
+            content: "🧠 模型主动记下一笔：[\(kind.rawValue)] \(text)",
+            think: nil, memory: entry, createdAt: ISO8601.timestamp()
+        )
+        guard (try? PMAgentStore.appendLine(line, to: target)) != nil else {
+            return "写入失败（版本可能已封板只读）"
+        }
+        return nil
     }
 }

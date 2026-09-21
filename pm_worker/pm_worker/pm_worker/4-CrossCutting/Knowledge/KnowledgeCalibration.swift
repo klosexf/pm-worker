@@ -47,20 +47,24 @@ nonisolated enum KnowledgeCalibration {
         }
     }
 
-    /// 主题匹配：标题任意 4 字连续片段命中经验正文即视为相关
-    /// （对专名 / 主题词鲁棒——「KANO 需求分类」能命中「上次用 KANO 把数据精度错标…」；
-    /// 短标题不足 4 字时退化为整词包含）。
+    /// 主题匹配：标题任意 4 字连续片段命中经验正文（对专名鲁棒——「KANO 需求分类」
+    /// 能命中「上次用 KANO 把数据精度错标…」），或标题 2-gram 对正文的重叠
+    /// ≥ topicRelevanceThreshold（P1-5：近义改写、词序调换不再漏配）；
+    /// 短标题不足 4 字时退化为整词包含。
     private static func matches(_ content: String, keyword: String) -> Bool {
-        let normalizedContent = content.replacingOccurrences(of: " ", with: "").lowercased()
-        let chars = Array(keyword.replacingOccurrences(of: " ", with: "").lowercased())
+        let normalizedContent = LexicalSimilarity.normalized(content)
+        let chars = Array(LexicalSimilarity.normalized(keyword))
         guard !chars.isEmpty else { return false }
-        guard chars.count >= 4 else {
-            return normalizedContent.contains(String(chars))
+        if chars.count >= 4 {
+            for i in 0...(chars.count - 4) {
+                let window = String(chars[i..<(i + 4)])
+                if normalizedContent.contains(window) { return true }
+            }
+        } else if normalizedContent.contains(String(chars)) {
+            return true
         }
-        for i in 0...(chars.count - 4) {
-            let window = String(chars[i..<(i + 4)])
-            if normalizedContent.contains(window) { return true }
-        }
-        return false
+        // 重叠系数 min 侧 = 标题 bigram 全集：标题词有多少比例出现在正文里
+        return LexicalSimilarity.bigramOverlap(keyword, content)
+            >= LexicalSimilarity.topicRelevanceThreshold
     }
 }

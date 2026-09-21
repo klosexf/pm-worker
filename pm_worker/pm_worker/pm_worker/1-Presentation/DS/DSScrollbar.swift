@@ -318,6 +318,9 @@ extension View {
 
 /// WKWebView 注入用：文档滚动进度回报（rAF 节流），配合 pmScroll
 /// script message handler + `scrollbar-width: none`（隐藏原生条）一起用。
+/// 同时把 `report` 挂成 `window.pmReportScroll`：容器内内容尺寸被外部改动
+/// （如 mermaid 缩放重设 svg 尺寸）不会触发 scroll/resize 事件，胶囊会停在
+/// 旧几何上，需要调用方主动补一次。
 let webViewScrollReporterJS = """
 (function () {
   var pending = false;
@@ -340,6 +343,7 @@ let webViewScrollReporterJS = """
       } catch (e) {}
     });
   }
+  window.pmReportScroll = report;
   window.addEventListener('scroll', report, { passive: true, capture: true });
   window.addEventListener('resize', report);
   report();

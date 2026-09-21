@@ -52,12 +52,14 @@ AI 代理每次会话开始必读本文件；排查任何 bug 前先对照条目
 
 ### B002：新增 @MainActor ObservableObject 漏写 nonisolated deinit → 启动即闪退（B001 修复引入）
 
-- **日期**：2026-09-18（首次记录）
+- **日期**：2026-09-18（首次记录）；2026-09-21（复发，第二次）
 - **状态**：已解决
-- **复发次数**：1（同类坑此前已在 PipelineEngine / MemoryStore 踩过——AGENTS.md 铁律第 2 条就是为它写的）
+- **复发次数**：2（同类坑此前已在 PipelineEngine / MemoryStore 踩过——AGENTS.md 铁律第 2 条就是为它写的；09-21 再次踩中，且这次**不是 ObservableObject**，见下）
 - **症状**：启动/测试即闪退，19:33–19:36 密集产生 24 个 ips。签名：`EXC_CRASH SIGABRT — POINTER_BEING_FREED_WAS_NOT_ALLOCATED`（malloc 释放未分配指针）。堆栈：`StreamBox.__deallocating_deinit` → `swift_task_deinitOnExecutorImpl` → abort。触发点：`mutateStream` 空态剪枝 `streamBoxes[k] = nil` 或流收尾 defer 销毁盒实例。全量测试也救不了——测试进程自身崩（SessionStreamFanoutTests 里销毁盒即崩）。
+  第二次（09-21）签名一字不差，但对象是**普通 @MainActor 类**（MermaidView.swift 新增的 `MermaidZoomBridge`：无 @Published、不是 ObservableObject、只装 weak webView 引用 + 两个闭包），由 SwiftUI `@State` 持有。崩在单元测试局部作用域结束、实例释放那一刻。
 - **排查要点**： DiagnosticReports 的 ips 文件是 JSON Lines（首行 header、余下多行 body），python `json.loads` 要切掉首行解析余文；先看 `exception` + `faultingThread` 帧，Swift 符号（`__deallocating_deinit` / `swift_task_deinitOnExecutorImpl`）直接指认 isolated-deinit 路径。grep 多个 ips 同签名可确认单一根因。
-- **根因**：Xcode 26 默认 `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` 下，@MainActor 类的 deinit 是 isolated 的；实例在流收尾（Task defer 等非典型上下文）被销毁时走隔离销毁路径，触发 malloc 崩溃。B001 修复新增 StreamBox 时漏了这条铁律——**知识在 AGENTS.md 里，但写新类时没有回头对照**。
+  第二次的新教训：**xcodebuild 的崩溃报告极具误导性**——测试进程崩了以后它打的是 `Restarting after unexpected exit, crash, or test timeout`，随后汇总里 `Executed 2 tests, with 0 failures`（崩掉的那个用例根本不计数），末尾却仍给 `** TEST FAILED **`。只 grep "failed" 会看到「0 failures 但 FAILED」的矛盾态；必须 grep `malloc|Restarting after` 才看得见真凶。
+- **根因**：Xcode 26 默认 `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` 下，@MainActor 类的 deinit 是 isolated 的；实例在流收尾（Task defer 等非典型上下文）被销毁时走隔离销毁路径，触发 malloc 崩溃。B001 修复新增 StreamBox 时漏了这条铁律——**知识在 AGENTS.md 里，但写新类时没有回头对照**。第二次同因：**铁律第 2 条被理解成了「ObservableObject 才要管」，实际是「任何模块内隐式/显式 @MainActor 类，只要可能在非主线程上下文释放就要写」**。
 - **解法**：类体内显式退出隔离销毁路径（一行）：
 
 ```swift
@@ -69,7 +71,8 @@ final class StreamBox: ObservableObject {
 }
 ```
 
-- **防复发**：AGENTS.md「Swift 并发铁律」第 2 条已覆盖（新增 @MainActor ObservableObject 类 = 条件反射加 `nonisolated deinit {}`，无论当下是否看起来会在隔离上下文销毁）。补充纪律：**新增 ObservableObject 类型后，冒烟启动 + 查 DiagnosticReports 必做**——单测/编译都兜不住这个坑，只有真实启动销毁路径能暴露。
+  第二次同解：`MermaidZoomBridge` 补 `nonisolated deinit {}`，单元测试即刻转绿。
+- **防复发**：AGENTS.md「Swift 并发铁律」第 2 条已覆盖（新增 @MainActor ObservableObject 类 = 条件反射加 `nonisolated deinit {}`，无论当下是否看起来会在隔离上下文销毁），本条把适用范围明确到**任意 @MainActor 类（含不发布变化的桥/通道类）**。补充纪律：**新增 ObservableObject 类型后，冒烟启动 + 查 DiagnosticReports 必做**——单测/编译都兜不住这个坑，只有真实启动销毁路径能暴露；反之若给一个桥类写了局部实例的单元测试，崩溃会在测试期就暴露（本次即靠 `ScrollWheelForwardingTests` 的局部实例提前抓到，否则会是「关掉放大弹窗偶发闪退」这类难查线上崩）。跑测试见到 `0 failures` + `TEST FAILED` 矛盾态，一律按崩溃处理而非用例失败。
 
 ### B003：点击「采纳方案」等按钮无反应——三重独立原因叠加，单看任何一层都像「按钮坏了」
 
@@ -96,3 +99,22 @@ final class StreamBox: ObservableObject {
 - **根因**：会话流渲染依赖手工维护的前缀白名单，产生方（AppModel.swift 发新系统行）改了，消费方（ConversationView.swift 白名单）没同步——①「⚠️ 自评审新增 N 个风险」未进 turnNote 可并入白名单 → 合并行中断、布局回退；②「🔄 已回到 …」前缀行未纳入链标记 → 回退续段未被并入上一条回答、渲染成独立消息。
 - **解法**：① turnNote 白名单加入「⚠️ 自评审新增」，配防回归测试 `testMergeableNotesAbsorbRiskRegistrationRow`；② 链标记纳入「🔄 已回到」前缀，配防回归测试 `testBacktrackContinuationChainedBefore`。
 - **防复发**：**新增任何系统行前缀 = 必须同步登记 ConversationView.swift 全部前缀白名单 + 配防回归测试**（至少两处：turnNote 可并入白名单、isFastForwardChainedBefore 链标记；日后新增白名单同样适用）。与「UI 双份维护」同性质：产生方与消费方必须一起改。暂未写入 AGENTS.md。
+
+### B005：非本阶段产物块静默丢弃——「AI 宣称原型已生成，用户一个文件都拿不到」（同类第二次）
+
+- **日期**：2026-09-21（首次记录；同类事故 2026-09-17 已发生过一次，当时只修了 PRD）
+- **状态**：已解决
+- **复发次数**：2（① 2026-09-17 非 PRD 阶段携带 `artifact:prd` 块被丢弃；② 2026-09-21 ② 阶段携带 `artifact:prototype` 块被丢弃）
+- **症状**：② 结构闸口待确认期间用户连说「继续」，AI 回复正文写「原型你上手玩一圈」「形态选高保真可交互单文件，共 4 页 + 1 设置弹层」，交付回执卡只有风险行、没有任何文件行，右栏产物台账和 `03-prototypes/` 全空。全程零报错、零 ⚠️、零异常——**最难查的一点：它不是失败，是「什么都没发生」**。
+- **排查要点**（磁盘先行，五步定案，比读代码快一个数量级）：
+  1. `ls ~/PMAgent/Projects/<项目>/<版本>/03-prototypes/` —— 空目录即证明从未落盘，不是「落了没显示」。
+  2. `index.sqlite` 的 `pipeline_runs` 行看 `current_stage` / `structure_confirmed` / `updated_at`，与用户看到的消息时刻对齐 —— 实测 `structure` / `0` / `22:30:17`，即阶段根本没推进。
+  3. `discussions.jsonl` 取最后一条 assistant 全文，逐行找 `^\s*\`\`\`artifact:` 列出块名与行号 —— 本轮真实含 `plan`(L2) / `prototype`(L16-311) / `radar`(L323)，原型块 24,259 字符 `<!DOCTYPE html>` 起 `</html>` 止、围栏闭合，**产物本身完好无损**。
+  4. `events.jsonl` 同一时刻只有 `radarRecorded`、**无 `artifactGenerated`** —— 同轮 radar 被正常消费而 prototype 没有，一步锁定「是分派丢了，不是解析丢了」。
+  5. 反查 `AppModel.handleAssistantReply` 的 `switch origin.stage`：`case .structure` 只有「三件齐全 → 落盘」和「出过结构块 → ⚠️」两条出口，本轮一个结构块都没有 → 两条都不满足 → fall through，**零留痕**。
+- **根因**：落盘分派按发起阶段 `origin.stage` 路由，非本阶段的产物块在该分派里没有消费者；而唯一的 stray 兜底 `hasStrayPRDBlock` 只写了 PRD 一种。上一次的教训被落成「PRD 专属补丁」而不是「产物块通用纪律」，于是换一个产物类型原样复发。触发侧同因：`AgentPrompts` 有「PRD 产物块硬禁令」，对原型没有同等禁令，而 ② prompt 的快速通道目标菜单里就写着 `"prototype"：直接生成 ③ 交互原型` —— 模型被邀请跳步，却没人告诉它只能出 `fast-forward` 请求块。
+- **解法**（顺收为主、留痕为底，两道安全前置）：
+  1. **越界顺收**（`AppModel.handleAssistantReply`）：`origin.stage == .structure` 且 `hasWritablePrototypeBlock` 且盘上结构三件齐且 ③ 槽位为空 → `confirmStructure(outcome: "carried_by_prototype")` 收束 ② 闸口 + 落 ⚡ 说明行 + 按 ③ 协议落盘并过机器门。③ 段落提取为 `writePrototypeArtifacts(artifactOrigin:)` 供两条路径共用，顺收轮传 `origin.with(stage: .prototype)`，事件留痕的 `stage` 才记 `prototype` 而非发起时的 `structure`。
+  2. **收窄版留痕兜底**：`hasStrayPrototypeBlock`（闭合块 / 未闭合围栏任一）+ 一条 ⚠️ 指向「直接出原型」，只在顺收不成立时发。与 `hasStrayPRDBlock` 同处同构。
+  3. **两处刻意取舍**：① 顺收**不改判 switch** 而是「结构照常落 + 原型补落」——同一回复完全可能既改结构三件又出原型，改判会让结构更新静默丢失，等于新造一个同类 bug；② 顺收要求 ③ 槽位为空——顺收轮没有冲突快照（快照只在 ③ 阶段发送链采集），直接覆盖会无声吃掉用户已有的原型文件。两处各有测试锚定。
+- **防复发**：`PrototypeCarryInTests` 5 个用例（顺收端到端 / 无结构三件 / ① 阶段 / 覆盖防护 / 谓词四象限）。**纪律升级：新增一种产物块 = 同时补齐三件事——本阶段落盘分支、非本阶段的 stray 兜底留痕、prompt 侧的越界禁令或顺收策略**，只做第一项必然复发（PRD 那次就是只补了 PRD 自己的一条）。排查此类「说了没做」一律按上面五步走磁盘先行，先看 `events.jsonl` 有没有 `artifactGenerated`，能一步区分「解析丢 / 分派丢 / 落盘失败」。UI 侧 `ConversationView.prototypeBlock` 在文件不存在时「不出占位」是有意设计（防双卡），但它把这类后端静默放大成前端完全无痕——新增产物类型时要一并想清楚「块在回复里、文件不在盘上」这个中间态谁负责说话。

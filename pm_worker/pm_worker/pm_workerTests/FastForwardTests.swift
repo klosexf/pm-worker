@@ -220,4 +220,163 @@ final class FastForwardTests: XCTestCase {
         // 纯文本回复 → false
         XCTAssertFalse(ArtifactParser.hasStrayPRDBlock(blocks: [], text: "普通讨论回复"))
     }
+
+    // MARK: 路线建议（artifact:route 块：Agent 自主提议路径，仅展示不执行）
+
+    func testParseRoute() {
+        // 无块 → nil
+        XCTAssertNil(ArtifactParser.parseRoute(
+            blocks: ArtifactParser.parseArtifactBlocks(in: "普通澄清回复，没有路线建议")
+        ))
+
+        // 合法块 → recommend + reasons + basis
+        let reply = """
+        信息已经比较齐全了，我建议直接出 PRD。
+
+        ```artifact:route
+        {"recommend": "direct_prd", "reasons": ["单一功能点，范围很小", "界面就是一张表单"], "basis": "澄清确认只做打卡一件事"}
+        ```
+        """
+        let proposal = ArtifactParser.parseRoute(
+            blocks: ArtifactParser.parseArtifactBlocks(in: reply)
+        )
+        XCTAssertEqual(proposal?.recommend, "direct_prd")
+        XCTAssertEqual(proposal?.reasons?.count, 2)
+        XCTAssertEqual(proposal?.basis, "澄清确认只做打卡一件事")
+
+        // reasons / basis 缺席（最小块）→ 照常解析
+        let bare = """
+        ```artifact:route
+        {"recommend": "standard"}
+        ```
+        """
+        XCTAssertEqual(
+            ArtifactParser.parseRoute(blocks: ArtifactParser.parseArtifactBlocks(in: bare)),
+            ArtifactParser.RouteProposal(recommend: "standard", reasons: nil, basis: nil)
+        )
+
+        // JSON 不合法 → nil
+        let broken = """
+        ```artifact:route
+        不是 JSON
+        ```
+        """
+        XCTAssertNil(ArtifactParser.parseRoute(
+            blocks: ArtifactParser.parseArtifactBlocks(in: broken)
+        ))
+
+        // 与 fast-forward / backtrack 块互不混淆：同回复多块并存各取各的
+        let mixed = """
+        ```artifact:route
+        {"recommend": "standard"}
+        ```
+
+        ```artifact:fast-forward
+        {"target": "prd"}
+        ```
+        """
+        let blocks = ArtifactParser.parseArtifactBlocks(in: mixed)
+        XCTAssertEqual(ArtifactParser.parseRoute(blocks: blocks)?.recommend, "standard")
+        XCTAssertEqual(ArtifactParser.parseFastForward(blocks: blocks)?.target, "prd")
+    }
+
+    // MARK: 路线建议白名单（recommend 归一化；白名单外忽略）
+
+    func testRouteDisplayWhitelist() {
+        XCTAssertEqual(
+            AppModel.routeDisplay(for: "standard"),
+            "完整流程（② 结构 → ③ 原型 → ④ PRD）"
+        )
+        XCTAssertNotNil(AppModel.routeDisplay(for: " skip_structure "), "前后空白容忍")
+        XCTAssertNotNil(AppModel.routeDisplay(for: "DIRECT_PRD"), "大小写不敏感")
+        XCTAssertNil(AppModel.routeDisplay(for: "stop_here"), "① 收束合法集外忽略")
+        XCTAssertNil(AppModel.routeDisplay(for: "bogus"), "未知值忽略")
+    }
+
+    // MARK: 路线建议 prompt 注入（① 唯一注入面；②③④ 不注入）
+
+    func testRouteSectionOnlyInClarifyPrompt() {
+        let clarifyPrompt = AgentPrompts.clarify(injection: "")
+        XCTAssertTrue(clarifyPrompt.contains("artifact:route"), "① 提示词含路线建议协议")
+        XCTAssertTrue(clarifyPrompt.contains("\"direct_prd\""))
+        XCTAssertTrue(clarifyPrompt.contains("\"skip_structure\""))
+
+        let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
+        XCTAssertFalse(structurePrompt.contains("artifact:route"), "② 不含路线建议协议")
+
+        let prototypePrompt = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "graph TD", injection: ""
+        )
+        XCTAssertFalse(prototypePrompt.contains("artifact:route"), "③ 不含路线建议协议")
+
+        let prdPrompt = AgentPrompts.prd(
+            tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
+            prototypePages: ["首页"], analysisNotes: "", injection: ""
+        )
+        XCTAssertFalse(prdPrompt.contains("artifact:route"), "④ 不含路线建议协议")
+    }
+
+    // MARK: PRD 机器门 Tier 1（self-refine 对齐 ②③④：骨架 / 模板戳确定性检查）
+
+    func testTier1PRDIssues() throws {
+        // 磁盘隔离：rootOverride 指向临时目录，绝不触碰真实 ~/PMAgent/
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pmagent-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        PMAgentStore.rootOverride = tempRoot
+        defer {
+            try? FileManager.default.removeItem(at: tempRoot)
+            PMAgentStore.rootOverride = nil
+        }
+        let project = "PRD门测试项目"
+        let version = "v1.0"
+        try PMAgentStore.bootstrap()
+        try PMAgentStore.createProject(named: project)
+        try PMAgentStore.createVersion(version, in: project)
+        let dir = PMAgentStore.versionURL(project: project, version: version)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("04-prd"), withIntermediateDirectories: true
+        )
+        let prdURL = dir.appendingPathComponent(ArtifactPath.prd)
+        let metaURL = dir.appendingPathComponent(ArtifactPath.prdMeta)
+
+        func writePRD(_ body: String) throws {
+            try body.write(to: prdURL, atomically: true, encoding: .utf8)
+        }
+
+        // ① PRD 不在盘 → 缺失 + 模板戳缺失
+        var issues = AppModel.tier1Issues(stage: .prd, project: project, version: version)
+        XCTAssertTrue(issues.contains { $0.contains("缺失或为空") }, "PRD 不在盘应有 issue")
+        XCTAssertTrue(issues.contains { $0.contains("prd-meta") }, "模板戳缺失应有 issue")
+
+        // ② 完整 PRD + 合法档位戳 → 零 issue
+        try writePRD("""
+        # 小步 · PRD
+        ## 三、需求概述
+        目标收敛句。
+        ## 九、详细设计
+        每页 7 子项。
+        ## 十二、上线效果验证与验收
+        验收 eval。
+        """)
+        try "{\"tier\":\"lean\",\"templateVersion\":\"t1\",\"writtenAt\":\"now\"}"
+            .write(to: metaURL, atomically: true, encoding: .utf8)
+        issues = AppModel.tier1Issues(stage: .prd, project: project, version: version)
+        XCTAssertTrue(issues.isEmpty, "完整 PRD + 合法戳应零 issue，实得：\(issues)")
+
+        // ③ 缺骨架章 + 档位非法 → 逐项 issue（正文不出现骨架关键词，防 contains 误命中）
+        try writePRD("# 只有概述\n\n正文很短，什么章都没有。")
+        try "{\"tier\":\"huge\"}".write(to: metaURL, atomically: true, encoding: .utf8)
+        issues = AppModel.tier1Issues(stage: .prd, project: project, version: version)
+        XCTAssertTrue(issues.contains { $0.contains("需求概述") }, "缺需求概述章应有 issue")
+        XCTAssertTrue(issues.contains { $0.contains("详细设计") }, "缺详细设计章应有 issue")
+        XCTAssertTrue(issues.contains { $0.contains("验收") }, "无验收内容应有 issue")
+        XCTAssertTrue(issues.contains { $0.contains("档位非法") }, "档位非法应有 issue")
+
+        // ④ meta JSON 不合法 → 按戳缺失处置（旧模板产物口径）
+        try "不是 JSON".write(to: metaURL, atomically: true, encoding: .utf8)
+        issues = AppModel.tier1Issues(stage: .prd, project: project, version: version)
+        XCTAssertTrue(issues.contains { $0.contains("prd-meta") }, "meta 不可解析应报戳缺失")
+    }
 }

@@ -54,6 +54,8 @@ struct StageDockCard: View {
     let confirmTarget: AppModel.ConfirmTarget?
     /// 分支确认待决（nil = 无待决，分支确认段不挂载；宿主已按归属会话过滤）。
     let branchPending: AppModel.PendingBranchConfirmation?
+    /// 执行计划提案待裁决（P0-2，nil = 无待裁决，计划段不挂载；宿主已按归属会话过滤）。
+    let planPending: AppModel.PendingPlanProposal?
 
     /// 当前阶段短名（作答段头部 mono 眉标，如「追问 · ③ 原型」；nil 不显示）。
     let stageLabel: String?
@@ -61,15 +63,18 @@ struct StageDockCard: View {
     let onCloseAnswer: () -> Void
     let onSubmitAnswer: (String) -> Void
 
-    /// 卡内激活段：作答段最高优先（待答问题先处理）→ 分支确认段（用户最新意图）→ 确认段。
+    /// 卡内激活段：作答段最高优先（待答问题先处理）→ 计划裁决段（生成链正在等你
+    /// 放行）→ 分支确认段（用户最新意图）→ 确认段。
     private enum Section {
         case answer
+        case plan
         case branch
         case confirm
     }
 
     private var activeSection: Section? {
         if pending != nil, showAnswerSection { return .answer }
+        if planPending != nil { return .plan }
         if branchPending != nil { return .branch }
         if confirmTarget != nil { return .confirm }
         return nil
@@ -92,6 +97,11 @@ struct StageDockCard: View {
                         onSubmit: onSubmitAnswer
                     )
                     .transition(.opacity)
+                }
+            case .plan:
+                if let planPending {
+                    PlanConfirmContent(model: model, pending: planPending)
+                        .transition(.opacity)
                 }
             case .branch:
                 if let branchPending {
@@ -197,6 +207,127 @@ struct BranchConfirmContent: View {
                 }
             }
             .buttonStyle(.ds(.brand, size: .sm))
+        }
+    }
+}
+
+/// 计划裁决段内容件（P0-2 执行计划提案）：②③④ 产物生成前 AI 先交一页计划草案，
+/// 这里呈现「总体思路 + 分步计划」，用户三选一：按批准执行 / 补一句要求后执行 /
+/// 跳过计划直接生成。裁决前生成不启动——LLM 只提案，执行由用户放行。
+struct PlanConfirmContent: View {
+    @ObservedObject private var model: AppModel
+    let pending: AppModel.PendingPlanProposal
+    /// 补充要求输入框开合（默认收起，点「补充要求后执行」展开）。
+    @State private var showSupplement = false
+    @State private var supplement = ""
+
+    init(model: AppModel, pending: AppModel.PendingPlanProposal) {
+        self.model = model
+        self.pending = pending
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerRow
+            DSDivider()
+
+            VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+                if let mission = pending.plan.mission, !mission.isEmpty {
+                    Text(mission)
+                        .font(DS.Font.bodySM)
+                        .foregroundStyle(Color.ink900)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(Array(pending.plan.steps.enumerated()), id: \.offset) { index, step in
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Spacing.s8) {
+                        Text("\(index + 1)")
+                            .font(DS.Font.monoSM)
+                            .foregroundStyle(Color.ink500)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(step.action)
+                                .font(DS.Font.bodySM)
+                                .foregroundStyle(Color.ink900)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let basis = step.basis, !basis.isEmpty {
+                                Text(basis)
+                                    .font(DS.Font.bodyXS)
+                                    .foregroundStyle(Color.ink500)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .padding(.horizontal, DS.Spacing.s12)
+            .padding(.vertical, DS.Spacing.s12)
+            .background(Color.surfaceSecondary)
+
+            if showSupplement {
+                TextField("想调整哪一步？（可选）", text: $supplement)
+                    .textFieldStyle(.plain)
+                    .font(DS.Font.bodySM)
+                    .dsInput()
+                    .padding(.horizontal, DS.Spacing.s12)
+                    .padding(.top, DS.Spacing.s10)
+            }
+
+            footerRow
+                .padding(.horizontal, DS.Spacing.s12)
+                .padding(.vertical, DS.Spacing.s10)
+        }
+    }
+
+    private var headerRow: some View {
+        HStack(spacing: DS.Spacing.s8) {
+            DSIcon(.note, size: 16)
+                .foregroundStyle(Color.brandAccent)
+            Text("执行计划待你裁决 · \(AppModel.planStageName(pending.stage))")
+                .font(DS.Font.headingSM)
+                .foregroundStyle(Color.ink900)
+            Spacer(minLength: DS.Spacing.s12)
+        }
+        .padding(.horizontal, DS.Spacing.s12)
+        .padding(.vertical, DS.Spacing.s10)
+    }
+
+    private var footerRow: some View {
+        HStack(spacing: DS.Spacing.s8) {
+            Button {
+                model.skipPlanProposal()
+            } label: {
+                Text("跳过计划，直接生成")
+            }
+            .buttonStyle(.ds(.ghost, size: .sm))
+
+            Spacer()
+
+            if showSupplement {
+                Button {
+                    model.approvePlanProposal(supplement: supplement)
+                } label: {
+                    Text("按补充执行")
+                }
+                .buttonStyle(.ds(.brand, size: .sm))
+            } else {
+                Button {
+                    showSupplement = true
+                } label: {
+                    Text("补充要求")
+                }
+                .buttonStyle(.ds(.secondary, size: .sm))
+
+                Button {
+                    model.approvePlanProposal(supplement: nil)
+                } label: {
+                    Label {
+                        Text("按计划执行")
+                    } icon: {
+                        DSIcon(.arrowRight, size: 12)
+                    }
+                }
+                .buttonStyle(.ds(.brand, size: .sm))
+            }
         }
     }
 }

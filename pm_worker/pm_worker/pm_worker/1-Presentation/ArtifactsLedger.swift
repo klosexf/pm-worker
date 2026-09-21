@@ -182,6 +182,8 @@ nonisolated enum ArtifactCatalog {
             }
             let ext = item.pathExtension.lowercased()
             guard artifactExtensions.contains(ext) else { continue }
+            let sizeBytes = values?.fileSize ?? 0
+            guard hasSubstantiveContent(at: item, ext: ext, sizeBytes: sizeBytes) else { continue }
             let parentName = dir.lastPathComponent
             let kind: ArtifactKind
             if ext == "html" {
@@ -203,11 +205,34 @@ nonisolated enum ArtifactCatalog {
                 name: item.lastPathComponent,
                 url: item,
                 kind: kind,
-                sizeBytes: values?.fileSize ?? 0,
+                sizeBytes: sizeBytes,
                 relativePath: relative,
                 modifiedAt: values?.contentModificationDate
             ))
         }
+    }
+
+    /// 占位空壳核验的体量上限：更大的文件必含正文，不读盘——扫描在主线程执行，
+    /// 逐文件读内容会放大渲染开销（大 PRD 尤其）。
+    private static let shellCheckCeiling = 512
+
+    /// 实质产物判据：去掉空白后仍有正文（Markdown 另剥标题行与围栏标记）。
+    /// 「只有标题 + 空围栏」的占位文件从未真正生成内容，不入台账；
+    /// 全量磁盘口径仍见「工作空间文件」树。
+    private static func hasSubstantiveContent(
+        at url: URL, ext: String, sizeBytes: Int
+    ) -> Bool {
+        guard sizeBytes <= shellCheckCeiling else { return true }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+        guard ext == "md" else {
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+            .contains { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return !trimmed.isEmpty
+                    && !trimmed.hasPrefix("#") && !trimmed.hasPrefix("```")
+            }
     }
 
     /// 与 ArtifactTreeView.buildTree 同口径的递归树（供工作空间区复用）。

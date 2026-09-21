@@ -123,7 +123,7 @@ case_score = 100 × Σ(passᵢ × weightᵢ) / Σ(weightᵢ)      （硬断言�
 
 ---
 
-## 4. 怎么跑（当前为人工/半自动，runner 后续单独立项）
+## 4. 怎么跑（方式一人工执行；方式二 clarify 已脚本化）
 
 ### 方式一：App 内人工执行（E2E 口径，最真实）
 
@@ -137,6 +137,16 @@ case_score = 100 × Σ(passᵢ × weightᵢ) / Σ(weightᵢ)      （硬断言�
 1. 从 `AgentPrompts.swift` 取对应阶段的 system prompt 拼装函数，按 case 的 `setup` 提供上游产物参数。
 2. 用 OpenAI 兼容端点直调（模型/温度与被测配置一致），user message 用 `input.user_message`。
 3. 结果与判定记录同上。
+
+**runner（已实现，即本方式前三步的脚本化）**：`pm_workerTests/EvalRunnerTests.swift`——读 `evals/cases/clarify.jsonl` → `AgentPrompts.clarify` + `clarifyStateSection` 尾条（与 App 同构）→ `LLMClient.complete` 直调 → 跑硬断言 → 落 `evals/results/` 报告与逐 case 原文。**仅 clarify 单阶段、仅硬断言**，judge 与评分未接。
+
+默认跳过——live 调用产生真实费用，且避免污染「全量测试绿」。须用 `TEST_RUNNER_` 前缀透传环境变量：xcodebuild 不透传普通环境变量，直接 `PM_EVAL_STAGE=clarify xcodebuild test` 会被静默跳过。
+
+```bash
+TEST_RUNNER_PM_EVAL_STAGE=clarify xcodebuild -project pm_worker.xcodeproj \
+  -scheme pm_worker -destination 'platform=macOS' test \
+  -parallel-testing-enabled NO -only-testing:pm_workerTests/EvalRunnerTests
+```
 
 ### 结果归档约定
 
@@ -166,9 +176,9 @@ evals/results/<YYYY-MM-DD>-<model>-<round>.json
 
 ---
 
-## 6. 后续路线（未实现，仅占位）
+## 6. 后续路线
 
-- **runner**：读 case → 拼 AgentPrompts → 调端点 → 跑硬断言 → 调 judge → 出报告（含 `--stage` / `--diff` 参数）。
+- **runner 补全**：现仅覆盖 clarify 单阶段 + 仅硬断言（用法见 §4 方式二）。待接：judge 评分层、`--diff` 改前/改后对照、其余阶段的 setup 现场构造（structure / prototype / prd 需先在盘上摆出上游产物）。
 - **C 路由检索层**：意图分类精确匹配、技能命中/未命中、scope 隔离。
 - **D 记忆萃取层**：五字段归类正确性、supersede 覆盖语义、碑文回链。
 - **E 对话韧性层**：答非所问 / 中途改需求 / 回退重做 / 后台完成钉回原会话。

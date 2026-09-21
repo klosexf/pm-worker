@@ -276,16 +276,25 @@ nonisolated enum ArtifactParser {
     }
 
     /// 从 assistant 回复解析结构三产物并落盘到 02-structure/。
-    /// 返回 nil 表示产物不全（architecture / core-flows / module-page-map 缺一不可）。
+    /// 三项块名缺一或正文为空即整体不落盘（返回空 changes），避免写出只有标题的
+    /// 占位文件——那会让产物台账出现用户从未真正生成的文档。
     @discardableResult
     static func writeStructureArtifacts(
         blocks: [ArtifactBlock], project: String, version: String,
         proposalSessionId: String? = nil
     ) throws -> StructureArtifacts {
-        let byName = Dictionary(uniqueKeysWithValues: blocks.map { ($0.name, $0.content) })
-        guard let arch = byName["architecture"],
-              let flows = byName["core-flows"],
-              let map = byName["module-page-map"] else {
+        // 同名块 first-wins（与原型落盘同口径）：模型重复输出同一块不得 trap
+        let byName = Dictionary(
+            blocks.map { ($0.name, $0.content) }, uniquingKeysWith: { first, _ in first }
+        )
+        func nonBlank(_ name: String) -> String? {
+            guard let raw = byName[name],
+                  !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return raw
+        }
+        guard let arch = nonBlank("architecture"),
+              let flows = nonBlank("core-flows"),
+              let map = nonBlank("module-page-map") else {
             return StructureArtifacts(
                 architecture: byName["architecture"] ?? "",
                 coreFlows: byName["core-flows"] ?? "",
@@ -315,7 +324,7 @@ nonisolated enum ArtifactParser {
             to: dir.appendingPathComponent(ArtifactPath.modulePageMap),
             relativePath: ArtifactPath.modulePageMap
         ))
-        if let business = byName["business-flows"], !business.isEmpty {
+        if let business = nonBlank("business-flows") {
             changes.append(try writeMeasured(
                 "# 业务流程图\n\n```mermaid\n\(business)\n```\n",
                 to: dir.appendingPathComponent(ArtifactPath.businessFlows),
@@ -325,15 +334,30 @@ nonisolated enum ArtifactParser {
 
         return StructureArtifacts(
             architecture: arch, coreFlows: flows, modulePageMap: map,
-            businessFlows: byName["business-flows"],
+            businessFlows: nonBlank("business-flows"),
             changes: changes
         )
     }
 
-    /// 结构产物是否已齐（闸口放行的最低集）。
+    /// 结构阶段必出的三项产物块名（闸口最低集）。
+    static let requiredStructureBlockNames: Set<String> = [
+        "architecture", "core-flows", "module-page-map",
+    ]
+
+    /// 结构产物是否已齐（闸口放行的最低集）：三项块名齐全**且各有正文**。
+    /// 只查块名会让空块过闸，落盘成只有标题的占位文件。
     static func structureArtifactsComplete(_ blocks: [ArtifactBlock]) -> Bool {
-        let names = Set(blocks.map(\.name))
-        return Set(["architecture", "core-flows", "module-page-map"]).isSubset(of: names)
+        let names = Set(blocks.filter {
+            !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }.map(\.name))
+        return requiredStructureBlockNames.isSubset(of: names)
+    }
+
+    /// 本轮回复是否尝试过结构产物（出现任一必出块名）。
+    /// 用于区分「试了但没齐」与「本轮本就不产结构物」（如仅计划提案块）——
+    /// 前者要落 ⚠️ 留痕，后者不该误报。
+    static func hasStructureBlocks(_ blocks: [ArtifactBlock]) -> Bool {
+        blocks.contains { requiredStructureBlockNames.contains($0.name) }
     }
 
     /// 多端原型落盘结果：逐槽位（块名 / 相对路径 / 显示名）+ 全部文件变更摘要。
@@ -418,18 +442,40 @@ nonisolated enum ArtifactParser {
     /// 归一化：步骤 clamp ≤ 8、空步骤丢弃、mission 空白置 nil。
     static func parsePlan(blocks: [ArtifactBlock]) -> PlanCard? {
         guard let content = blocks.first(where: { $0.name == "plan" })?.content,
-              var raw = LenientJSON.decode(PlanCard.self, from: content) else {
+              let raw = LenientJSON.decode(PlanCard.self, from: content) else {
             return nil
         }
-        raw.mission = raw.mission?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if raw.mission?.isEmpty == true { raw.mission = nil }
-        var steps = Array(raw.steps.prefix(8))
+        return normalizedPlan(raw)
+    }
+
+    /// 计划卡归一化（自宣计划与提案计划共用）：步骤 clamp ≤ 8、空步骤丢弃、
+    /// mission 空白置 nil；无有效步骤 → nil。
+    static let planStepLimit = 8
+
+    private static func normalizedPlan(_ raw: PlanCard) -> PlanCard? {
+        var plan = raw
+        plan.mission = plan.mission?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if plan.mission?.isEmpty == true { plan.mission = nil }
+        var steps = Array(plan.steps.prefix(planStepLimit))
         steps.removeAll {
             $0.action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         guard !steps.isEmpty else { return nil }
-        raw.steps = steps
-        return raw
+        plan.steps = steps
+        return plan
+    }
+
+    /// 执行计划提案（artifact:plan-proposal 块，P0-2 计划提案权）：②③④ 产物
+    /// 首次生成前，模型先交一页「打算怎么做」的草案，用户经计划裁决卡批准 /
+    /// 补充 / 跳过后才执行正式生成。LLM 只提案，执行由用户裁决——闸口不变量不破。
+    /// 与 plan 块（轮内自宣计划，plan-act-reflect 的 plan 段）区分块名：
+    /// 自宣计划随产物轮渲染、不需裁决；提案计划独立成轮、必须裁决后才生成。
+    static func parsePlanProposal(blocks: [ArtifactBlock]) -> PlanCard? {
+        guard let content = blocks.first(where: { $0.name == "plan-proposal" })?.content,
+              let raw = LenientJSON.decode(PlanCard.self, from: content) else {
+            return nil
+        }
+        return normalizedPlan(raw)
     }
 
 
@@ -593,6 +639,23 @@ nonisolated enum ArtifactParser {
             return nil
         }
         return LenientJSON.decode(FastForwardRequest.self, from: content)
+    }
+
+    /// 路线建议（artifact:route 块）：① 澄清收束前 Agent 主动建议流转路径，
+    /// 仅展示不执行——路径仍由用户在确认坞选择。与 fast-forward（用户明确要求
+    /// 才输出）互补：这是 Agent 的自主提议面（LLM 提议、App 展示、人裁决）。
+    struct RouteProposal: Codable, Equatable {
+        var recommend: String   // standard | skip_structure | direct_prd
+        var reasons: [String]?  // 1-3 条具体理由
+        var basis: String?      // 判断依据（引用澄清事实）
+    }
+
+    /// 从回复块中解析路线建议（无块或 JSON 不合法 → nil）。
+    static func parseRoute(blocks: [ArtifactBlock]) -> RouteProposal? {
+        guard let content = blocks.first(where: { $0.name == "route" })?.content else {
+            return nil
+        }
+        return LenientJSON.decode(RouteProposal.self, from: content)
     }
 
     /// 澄清问题卡（artifact:question-card 块）：① 阶段 LLM 输出相互独立的事实型问题集，
@@ -885,6 +948,24 @@ nonisolated enum ArtifactParser {
     static func hasStrayPRDBlock(blocks: [ArtifactBlock], text: String) -> Bool {
         if blocks.contains(where: { $0.name == "prd" }) { return true }
         return parseIncompleteArtifact(in: text)?.name == "prd"
+    }
+
+    /// 回复中是否存在可落盘的原型块（块名属原型类 + 正文含 HTML 标记）。
+    /// 收块口径与 writePrototypeArtifact 完全一致——顺收判据不能比落盘判据更宽，
+    /// 否则会「判定可收 → 落盘返回 nil」，回到静默丢弃。
+    static func hasWritablePrototypeBlock(_ blocks: [ArtifactBlock]) -> Bool {
+        blocks.contains {
+            ArtifactPath.isPrototypeBlock($0.name) && $0.content.contains("<")
+        }
+    }
+
+    /// 非原型阶段的 stray 原型块检测（AppModel 落盘分派兜底提示用）：闭合原型块
+    /// （含正文无 HTML 的无效块）或未闭合原型围栏（截断）任一存在即算。与
+    /// hasStrayPRDBlock 同一纪律——两者在别的阶段分派里没有消费者。
+    static func hasStrayPrototypeBlock(blocks: [ArtifactBlock], text: String) -> Bool {
+        if blocks.contains(where: { ArtifactPath.isPrototypeBlock($0.name) }) { return true }
+        guard let incomplete = parseIncompleteArtifact(in: text) else { return false }
+        return ArtifactPath.isPrototypeBlock(incomplete.name)
     }
 
     /// 竞品分析包落盘：05-analysis/竞品分析.md。

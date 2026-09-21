@@ -159,6 +159,9 @@ nonisolated struct ModelProfile: Codable, Equatable, Identifiable {
     /// API Key 的 Keychain 槽位。旧存量迁移来的首档案沿用 `byok.<provider>`
     ///（Key 不丢）；用户新增的档案一律 `byok.model.<id>`（同供应商多 Key 隔离）。
     var keychainKey: String
+    /// 模型上下文窗口（tokens，P1-6 预算自适应）：填了才按比例伸缩五段注入预算；
+    /// nil = 用缺省预算（不感知窗口）。常见值：16000 / 32000 / 64000 / 128000。
+    var contextWindow: Int?
 
     init(
         id: String = UUID().uuidString,
@@ -167,7 +170,8 @@ nonisolated struct ModelProfile: Codable, Equatable, Identifiable {
         baseURL: String? = nil,
         supportsImages: Bool = false,
         enabled: Bool = true,
-        keychainKey: String? = nil
+        keychainKey: String? = nil,
+        contextWindow: Int? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -176,6 +180,7 @@ nonisolated struct ModelProfile: Codable, Equatable, Identifiable {
         self.supportsImages = supportsImages
         self.enabled = enabled
         self.keychainKey = keychainKey ?? "byok.model.\(id)"
+        self.contextWindow = contextWindow
     }
 
     /// 新增档案缺省值（跟随最近一次使用的 provider 带出预设模型，免手填错名）。
@@ -215,6 +220,10 @@ nonisolated struct LLMSettings: Codable, Equatable {
     /// Agent 工具调用总开关（Function Calling v1）：false = 请求不带 tools，
     /// 行为与旧版完全一致（一键回滚点，PRD §11 V2 路线首项的降级闸）。默认开。
     var agentToolsEnabled: Bool
+    /// 计划提案开关（P0-2 模型计划提案权）：②③④ 首次产物生成前先出一轮
+    /// 「执行计划草案」由用户裁决（按批准执行 / 补充后执行 / 跳过直接生成）。
+    /// false = 确认链直接生成（旧行为）。默认开。
+    var planProposalsEnabled: Bool
 
     init(
         stages: [LLMStage: StageModelConfig],
@@ -222,7 +231,8 @@ nonisolated struct LLMSettings: Codable, Equatable {
         activeModelID: String? = nil,
         maxTokensPerRun: Int,
         searchEndpoint: String = "",
-        agentToolsEnabled: Bool = true
+        agentToolsEnabled: Bool = true,
+        planProposalsEnabled: Bool = true
     ) {
         self.stages = stages
         self.models = models
@@ -230,6 +240,7 @@ nonisolated struct LLMSettings: Codable, Equatable {
         self.maxTokensPerRun = maxTokensPerRun
         self.searchEndpoint = searchEndpoint
         self.agentToolsEnabled = agentToolsEnabled
+        self.planProposalsEnabled = planProposalsEnabled
         // 使用中缺省指向首个档案（显式传入优先；不在此处播种——播种只发生在
         // default / load()，构造器保持无副作用，测试手工构造行为可预期）
         if self.activeModelID == nil {
@@ -370,7 +381,8 @@ nonisolated struct LLMSettings: Codable, Equatable {
     // MARK: - Codable 兼容旧存量（多模型字段引入前的 settings.json 无 models / activeModelID）
 
     private enum CodingKeys: String, CodingKey {
-        case stages, models, activeModelID, maxTokensPerRun, searchEndpoint, agentToolsEnabled
+        case stages, models, activeModelID, maxTokensPerRun, searchEndpoint
+        case agentToolsEnabled, planProposalsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -381,6 +393,7 @@ nonisolated struct LLMSettings: Codable, Equatable {
         maxTokensPerRun = try container.decodeIfPresent(Int.self, forKey: .maxTokensPerRun) ?? 500_000
         searchEndpoint = try container.decodeIfPresent(String.self, forKey: .searchEndpoint) ?? ""
         agentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .agentToolsEnabled) ?? true
+        planProposalsEnabled = try container.decodeIfPresent(Bool.self, forKey: .planProposalsEnabled) ?? true
     }
 
     // MARK: - 持久化（Application Support，写后回读校验）

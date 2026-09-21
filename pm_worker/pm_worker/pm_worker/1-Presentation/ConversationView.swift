@@ -111,6 +111,7 @@ struct ConversationView: View {
                     showAnswerSection: showClarifyDrawer,
                     confirmTarget: confirmDockTarget,
                     branchPending: branchPending,
+                    planPending: planPending,
                     stageLabel: stageShortName,
                     onCloseAnswer: closeClarifyDrawer,
                     onSubmitAnswer: submitClarifyAnswer
@@ -309,12 +310,23 @@ struct ConversationView: View {
         return pending
     }
 
-    /// 统一停靠卡可见性：作答段 / 分支确认段 / 确认段任一成立（卡内按优先级切段）；
-    /// 确认链进行中（要点表抽取 / 下游生成）整卡抑制——防推进空窗内确认卡闪现。
-    /// 抑制按会话键控（M2）：只有本会话的确认链在跑才抑制，他会话/他版本不拦。
+    /// 执行计划提案待裁决（P0-2）：归属本会话才可见（同分支确认卡口径），
+    /// 本会话空闲才挂载——计划轮流式回复进行中不与「正在思考」卡抢位。
+    private var planPending: AppModel.PendingPlanProposal? {
+        guard !store.isSessionBusy(store.sessionId) else { return nil }
+        guard let pending = model.pendingPlanProposal,
+              pending.sessionId == store.sessionId else { return nil }
+        return pending
+    }
+
+    /// 统一停靠卡可见性：作答段 / 计划裁决段 / 分支确认段 / 确认段任一成立
+    ///（卡内按优先级切段）；确认链进行中（要点表抽取 / 下游生成）整卡抑制——
+    /// 防推进空窗内确认卡闪现。抑制按会话键控（M2）：只有本会话的确认链在跑才
+    /// 抑制，他会话/他版本不拦。
     private var stageDockVisible: Bool {
         !model.stageConfirmRunningSessions.contains(store.sessionId)
             && ((pendingQuestion != nil && showClarifyDrawer)
+                || planPending != nil
                 || branchPending != nil
                 || confirmDockTarget != nil)
     }

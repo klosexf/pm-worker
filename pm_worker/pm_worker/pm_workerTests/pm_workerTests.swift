@@ -629,6 +629,58 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertTrue(mixedStripped.contains("前文"))
     }
 
+    /// 空块视同未生成：块名齐但某项正文为空时整体不落盘——产物台账里不该出现
+    /// 只有标题的占位文件（用户从未生成过它，却在右栏看到它）。
+    func testBlankStructureBlocksWriteNothing() throws {
+        try makeWorkspace()
+        let blocks = [
+            ArtifactParser.ArtifactBlock(name: "architecture", content: "graph TD\nA-->B"),
+            ArtifactParser.ArtifactBlock(name: "core-flows", content: "   \n"),
+            ArtifactParser.ArtifactBlock(name: "module-page-map", content: "| 模块 |\n|---|"),
+        ]
+        XCTAssertFalse(
+            ArtifactParser.structureArtifactsComplete(blocks), "core-flows 正文为空 → 不算齐"
+        )
+        XCTAssertTrue(ArtifactParser.hasStructureBlocks(blocks), "出过结构块 → 未落盘须留痕")
+        XCTAssertFalse(
+            ArtifactParser.hasStructureBlocks([
+                ArtifactParser.ArtifactBlock(name: "plan", content: "计划草案")
+            ]),
+            "仅计划提案块的回合本就不产结构物，不得误报为结构产物不完整"
+        )
+
+        let artifacts = try ArtifactParser.writeStructureArtifacts(
+            blocks: blocks, project: "M2项目", version: "v1.0"
+        )
+        XCTAssertTrue(artifacts.changes.isEmpty)
+        let dir = PMAgentStore.versionURL(project: "M2项目", version: "v1.0")
+            .appendingPathComponent("02-structure")
+        for file in ["功能架构图.md", "核心流程图.md", "模块-页面映射表.md"] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: dir.appendingPathComponent(file).path),
+                "\(file) 不应被创建"
+            )
+        }
+    }
+
+    /// 模型重复输出同一块时 first-wins 取值（与原型落盘同口径），不得因字典重复键 trap。
+    func testDuplicateStructureBlocksTakeFirst() throws {
+        try makeWorkspace()
+        let blocks = [
+            ArtifactParser.ArtifactBlock(name: "architecture", content: "graph TD\nA-->B"),
+            ArtifactParser.ArtifactBlock(name: "architecture", content: "graph TD\nX-->Y"),
+            ArtifactParser.ArtifactBlock(name: "core-flows", content: "flowchart LR\nC-->D"),
+            ArtifactParser.ArtifactBlock(
+                name: "module-page-map", content: "| 模块 | 页面 |\n|---|---|\n| 首页 | index |"
+            ),
+        ]
+        let artifacts = try ArtifactParser.writeStructureArtifacts(
+            blocks: blocks, project: "M2项目", version: "v1.0"
+        )
+        XCTAssertEqual(artifacts.architecture, "graph TD\nA-->B")
+        XCTAssertEqual(artifacts.changes.count, 3)
+    }
+
     /// mermaid 渲染 HTML 必须把 run() 推迟到 DOM 就绪——<head> 内脚本先于 <body>
     /// 解析，立即 run() 找不到 .mermaid 元素，图卡会显示原始源码（回归绊线）。
     func testMermaidRenderHTMLDefersRunUntilDOMReady() throws {

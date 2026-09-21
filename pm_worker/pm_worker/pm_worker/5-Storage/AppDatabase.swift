@@ -104,6 +104,13 @@ nonisolated final class AppDatabase {
             try db.create(indexOn: "mcp_tasks", columns: ["status"])
         }
 
+        migrator.registerMigration("v2-embedding-source") { db in
+            // 向量来源戳（P1 嵌入守卫）：model:<名> / hash256；
+            // 旧行 NULL = 来源未知，检索放行但受维度守卫兜底。
+            try db.execute(sql: "ALTER TABLE knowledge_points ADD COLUMN embedding_source TEXT")
+            try db.execute(sql: "ALTER TABLE skills ADD COLUMN embedding_source TEXT")
+        }
+
         return migrator
     }
 }

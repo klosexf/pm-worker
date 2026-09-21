@@ -33,8 +33,9 @@ final class ArtifactCatalogTests: XCTestCase {
     // MARK: - 辅助
 
     /// 在版本目录下落一个文件（自动建父目录），返回其 URL。
+    /// 默认内容须带正文行——纯标题文件按占位空壳被台账过滤（见实质内容判据测试）。
     @discardableResult
-    private func put(_ relative: String, content: String = "# demo\n") throws -> URL {
+    private func put(_ relative: String, content: String = "# demo\n\n正文\n") throws -> URL {
         let target = tempRoot.appendingPathComponent(relative)
         try FileManager.default.createDirectory(
             at: target.deletingLastPathComponent(), withIntermediateDirectories: true
@@ -113,6 +114,39 @@ final class ArtifactCatalogTests: XCTestCase {
         XCTAssertEqual(counts[.proto], 1)
         XCTAssertEqual(counts[.chart], 1)
         XCTAssertEqual(counts[.report], 1)
+    }
+
+    // MARK: - 实质内容判据（未真正生成的占位文件不入台账）
+
+    /// 结构产物的占位写法（只有标题 + 空 Mermaid 围栏）、纯标题、全空白、0 字节
+    /// 一律视为未生成——台账是实质产物摘要，全量口径看工作空间文件树。
+    func testPlaceholderFilesAreExcluded() throws {
+        try put("02-structure/功能架构图.md", content: "# 功能架构图\n\n```mermaid\n\n```\n")
+        try put("02-structure/纯标题.md", content: "# 只有标题\n")
+        try put("02-structure/全空白.md", content: "   \n\t\n")
+        try put("03-prototypes/空原型.html", content: "")
+        try put("05-analysis/空图表.mmd", content: "\n\n")
+
+        XCTAssertTrue(ArtifactCatalog.scanArtifacts(in: tempRoot).isEmpty)
+    }
+
+    func testFileWithFenceBodyIsListed() throws {
+        try put(
+            "02-structure/功能架构图.md",
+            content: "# 功能架构图\n\n```mermaid\ngraph TD\nA[首页] --> B[详情]\n```\n"
+        )
+        XCTAssertEqual(
+            ArtifactCatalog.scanArtifacts(in: tempRoot).map(\.name), ["功能架构图.md"]
+        )
+    }
+
+    /// 体量超核验上限的文件不读盘（扫描在主线程，逐文件读内容会放大渲染开销），
+    /// 一律入账——纯标题大文件因此仍可见，是刻意的性能取舍。
+    func testFilesAboveCeilingSkipContentRead() throws {
+        let headings = String(repeating: "# 标题行\n", count: 200)
+        XCTAssertTrue(headings.utf8.count > 512)
+        try put("04-prd/纯标题长文.md", content: headings)
+        XCTAssertEqual(ArtifactCatalog.scanArtifacts(in: tempRoot).count, 1)
     }
 
     // MARK: - 工作空间树（全量口径）

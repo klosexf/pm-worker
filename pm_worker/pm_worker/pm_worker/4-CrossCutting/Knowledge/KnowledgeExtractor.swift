@@ -101,7 +101,8 @@ nonisolated enum KnowledgeExtractor {
 
     /// 去重合并三分支：
     /// ① 与某既有卡 cosine > 0.92（VectorMath.mergeThreshold）→ mergeInto（E10 合并不新建）；
-    /// ② 标题归一化后与既有卡一致但内容非近重复 → conflict（实质改良，旧卡让位）；
+    /// ② 同主题（标题全等，或 2-gram 重叠 ≥ sameTopicThreshold——近义改写、
+    ///    词序调换也算）但内容非近重复 → conflict（实质改良，旧卡让位）；
     /// ③ 其余 → newCard。
     /// - existing：scope 隔离后的候选卡（全局 + 当前项目，调用方负责筛选）。
     static func mergeDecision(
@@ -112,6 +113,7 @@ nonisolated enum KnowledgeExtractor {
         var bestSimilarity: Double = 0
         var bestId: String?
         var conflictId: String?
+        var bestTitleOverlap: Double = 0
 
         for card in existing {
             let similarity = VectorMath.cosine(itemEmbedding, card.embedding)
@@ -119,9 +121,13 @@ nonisolated enum KnowledgeExtractor {
                 bestSimilarity = similarity
                 bestId = card.id
             }
-            // 同主题（标题去空白后一致）且内容非近重复 → 冲突候选
-            if normalizedTitle(card.title) == normalizedTitle(item.title),
-               similarity <= VectorMath.mergeThreshold {
+            // 同主题且内容非近重复 → 冲突候选（多候选取标题最相似者）
+            guard similarity <= VectorMath.mergeThreshold else { continue }
+            let overlap = LexicalSimilarity.bigramOverlap(card.title, item.title)
+            if normalizedTitle(card.title) == normalizedTitle(item.title)
+                || overlap >= LexicalSimilarity.sameTopicThreshold,
+               overlap >= bestTitleOverlap {
+                bestTitleOverlap = overlap
                 conflictId = card.id
             }
         }
@@ -235,10 +241,22 @@ nonisolated struct SettingsBackedEmbedder: EmbeddingProviding {
     let settings: LLMSettings
 
     func embed(texts: [String]) async throws -> [[Float]] {
+        try await embedWithSource(texts: texts).vectors
+    }
+
+    /// 带来源戳编码（P1 嵌入守卫）：真实端点成功 → 「model:<模型名>」；
+    /// 回退本地哈希 → 统一 hash256 戳——索引写哪条路径，行上就盖哪枚戳，
+    /// 检索时不同戳不混算，杜绝「1536 维查询 × 256 维索引」式静默零命中。
+    func embedWithSource(texts: [String]) async throws -> (vectors: [[Float]], source: String) {
+        let modelName = settings.stages[.embedding]?.model
         if let vectors = try? await EmbeddingClient.embed(texts: texts, settings: settings),
            vectors.count == texts.count {
-            return vectors
+            let name = (modelName?.isEmpty == false ? modelName! : "endpoint")
+            return (vectors, "model:\(name)")
         }
-        return texts.map { DeterministicHashEmbedder.vector(for: $0) }
+        return (
+            texts.map { DeterministicHashEmbedder.vector(for: $0) },
+            EmbeddingSourceStamp.hash256
+        )
     }
 }

@@ -14,13 +14,14 @@ import WebKit
 /// 单个 Mermaid 图渲染（WKWebView + 本地 mermaid.min.js）。
 /// 外层 View 读 colorScheme → dark 传入 representable：深色走 mermaid dark 主题。
 /// 高度自适应：mermaid 渲染完成后由 JS 回报内容高度，容器贴合图形。
-/// zoom：显示缩放（按 viewBox 矢量放大，保持清晰），放大弹窗用 1.5。
-/// scrollable：true → webview 填满容器、由 HTML 内部滚动（放大弹窗）；
+/// scrollable：true → webview 填满容器、由 HTML 内部滚动（放大弹窗），并按 viewBox
+/// 矢量重设尺寸（`zoom` 通道，见 MermaidZoomBridge）；
 /// false → webview 贴合内容高度（对话内联，滚动交给外层消息列表）。
 struct MermaidView: View {
     let source: String
-    var zoom: CGFloat = 1
     var scrollable: Bool = false
+    /// 放大弹窗的缩放通道（仅 scrollable 模式传入；nil → 图形保持自然倍率）
+    var zoom: MermaidZoomBridge? = nil
     @Environment(\.colorScheme) private var colorScheme
     @State private var contentHeight: CGFloat = 180
     /// 放大弹窗（内部滚动模式）的滚动进度——原生滚动条已隐藏，外挂 DS 细胶囊
@@ -33,8 +34,8 @@ struct MermaidView: View {
             MermaidWebView(
                 source: source,
                 dark: colorScheme == .dark,
-                zoom: zoom,
                 scrollable: true,
+                zoom: zoom,
                 onHeight: { contentHeight = $0 },
                 onScroll: { vp, vf, hp, hf in
                     vScroll = DSScrollSnapshot(progress: vp, fraction: vf)
@@ -47,7 +48,6 @@ struct MermaidView: View {
             MermaidWebView(
                 source: source,
                 dark: colorScheme == .dark,
-                zoom: zoom,
                 onHeight: { contentHeight = $0 }
             )
             .frame(height: max(120, contentHeight))
@@ -58,16 +58,69 @@ struct MermaidView: View {
 /// WKWebView 子类：内联模式（内部无可滚内容）把滚轮事件沿响应链上抛，
 /// 交给外层 SwiftUI ScrollView——WKWebView 默认在 AppKit 层吞掉 scrollWheel
 /// 且不转发，光标悬停在图卡上时外层（.md 预览弹框 / 消息列表）永远滚不动。
-/// 滚动模式（放大弹窗）仍走 super，由 HTML 内部滚动消费。
+/// 滚动模式（放大弹窗）仍走 super，由 HTML 内部滚动消费；
+/// ⌘ + 滚轮在滚动模式下改走缩放（不消费滚轮滚动语义，只出缩放增量）。
 final class ScrollForwardingWebView: WKWebView {
     var forwardsScrollWheel = false
+    /// 放大弹窗缩放通道：⌘ + 滚轮的增量外送（相对倍率，0.1 = +10%）
+    weak var zoomBridge: MermaidZoomBridge?
 
     override func scrollWheel(with event: NSEvent) {
         if forwardsScrollWheel {
             nextResponder?.scrollWheel(with: event)
-        } else {
-            super.scrollWheel(with: event)
+            return
         }
+        if event.modifierFlags.contains(.command), let zoomBridge {
+            // 触控板双指（hasPreciseScrollingDeltas）逐像素连续，鼠标滚轮按格跳，
+            // 两套增益分别标定；单事件缩放幅度再封顶 25%——不同鼠标每格上报的
+            // delta 差一个数量级（1 或 10），封顶后不会出现「一格翻一倍」
+            let gain: CGFloat = event.hasPreciseScrollingDeltas ? 0.006 : 0.10
+            let delta = min(max(CGFloat(event.scrollingDeltaY) * gain, -0.25), 0.25)
+            if delta != 0 { zoomBridge.onWheelZoom?(delta) }
+            return
+        }
+        super.scrollWheel(with: event)
+    }
+}
+
+/// 放大弹窗的缩放指令通道：SwiftUI 侧 → 已加载的 WKWebView。
+/// 改倍率只按 viewBox 重设 svg 尺寸（矢量，不失真），不整页重渲染——
+/// 已渲染图形与滚动位置原地保留，缩放跟手无白闪。
+/// 页面 window 随每次 loadFileURL 重建，故倍率请求缓存在本对象里，
+/// 由 JS 首帧度量回报（pmMetrics）后补发。
+@MainActor
+final class MermaidZoomBridge {
+    weak var webView: WKWebView?
+    /// 收到过一次 pmMetrics = mermaid 渲染就绪，JS 侧 pmSetScale 可调用
+    private var pageReady = false
+    private var requestedScale: CGFloat = 1
+    /// JS 回报度量：(viewBox 自然尺寸, 视口 CSS 尺寸) → 弹窗侧算「适应窗口」倍率
+    var onMetrics: ((CGSize, CGSize) -> Void)?
+    /// ⌘ + 滚轮 → 缩放增量（相对倍率）
+    var onWheelZoom: ((CGFloat) -> Void)?
+
+    /// 模块默认 MainActor 隔离：不显式退出隔离销毁路径，实例在非隔离上下文
+    /// 释放即 malloc「pointer being freed was not allocated」崩溃
+    /// （AGENTS.md 并发铁律 2 / bugs.md B002 同签名，新增桥类时实测复现过）
+    nonisolated deinit {}
+
+    func requestScale(_ scale: CGFloat) {
+        requestedScale = scale
+        applyScale()
+    }
+
+    func receiveMetrics(viewBox: CGSize, viewport: CGSize) {
+        pageReady = true
+        applyScale()
+        onMetrics?(viewBox, viewport)
+    }
+
+    /// 整页重渲染前调用：新 document 尚未就绪，禁止向旧 window 下发
+    func invalidatePage() { pageReady = false }
+
+    private func applyScale() {
+        guard pageReady, let webView else { return }
+        webView.evaluateJavaScript("window.pmSetScale(\(requestedScale));")
     }
 }
 
@@ -75,16 +128,16 @@ final class ScrollForwardingWebView: WKWebView {
 struct MermaidWebView: NSViewRepresentable {
     let source: String
     var dark: Bool = false
-    /// 渲染后按 viewBox 放大倍率重设 svg 尺寸（矢量缩放不失真）。
-    var zoom: CGFloat = 1
     /// true → HTML body overflow:auto，滚轮在 webview 内部滚动（放大弹窗）。
     var scrollable: Bool = false
+    /// 缩放通道（scrollable 模式）：改倍率走 JS，不触发整页重渲染。
+    var zoom: MermaidZoomBridge? = nil
     /// mermaid 渲染完成后 JS 回报内容高度（px）。
     var onHeight: ((CGFloat) -> Void)? = nil
     /// 内部滚动模式的滚动进度回报（驱动外挂 DS 细胶囊）。
     var onScroll: ((CGFloat, CGFloat, CGFloat, CGFloat) -> Void)? = nil
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> ScrollForwardingWebView {
         let config = WKWebViewConfiguration()
         // mermaid.min.js 渲染需 JS（javaScriptEnabled 已弃用，改用 defaultWebpagePreferences）
         config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -94,6 +147,8 @@ struct MermaidWebView: NSViewRepresentable {
             // 原生滚动条已由 CSS 隐藏（macOS 26 玻璃样式无法 CSS 定制），
             // 文档滚动进度回报驱动外挂 DS 细胶囊
             config.userContentController.add(context.coordinator, name: "pmScroll")
+            // 渲染就绪 + viewBox/视口度量回报（缩放与「适应窗口」换算依赖）
+            config.userContentController.add(context.coordinator, name: "pmMetrics")
             config.userContentController.addUserScript(
                 WKUserScript(
                     source: webViewScrollReporterJS,
@@ -106,25 +161,29 @@ struct MermaidWebView: NSViewRepresentable {
         // 内联模式（scrollable=false）：webview 高度贴合内容、HTML 无可滚区域，
         // 滚轮必须上抛给外层 ScrollView；滚动模式由 HTML 自己滚
         webView.forwardsScrollWheel = !scrollable
+        webView.zoomBridge = zoom
         webView.setValue(false, forKey: "drawsBackground")  // 透明背景随模式
         context.coordinator.webView = webView
         context.coordinator.onHeight = onHeight
         context.coordinator.onScroll = onScroll
-        context.coordinator.render(
-            source: source, dark: dark, zoom: zoom, scrollable: scrollable
-        )
+        context.coordinator.zoom = zoom
+        zoom?.webView = webView
+        context.coordinator.render(source: source, dark: dark, scrollable: scrollable)
         return webView
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    func updateNSView(_ webView: ScrollForwardingWebView, context: Context) {
         context.coordinator.onHeight = onHeight
         context.coordinator.onScroll = onScroll
-        context.coordinator.render(
-            source: source, dark: dark, zoom: zoom, scrollable: scrollable
-        )
+        context.coordinator.zoom = zoom
+        webView.zoomBridge = zoom
+        zoom?.webView = webView
+        context.coordinator.render(source: source, dark: dark, scrollable: scrollable)
     }
 
-    static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+    static func dismantleNSView(
+        _ webView: ScrollForwardingWebView, coordinator: Coordinator
+    ) {
         webView.configuration.userContentController.removeAllScriptMessageHandlers()
     }
 
@@ -134,9 +193,9 @@ struct MermaidWebView: NSViewRepresentable {
         weak var webView: WKWebView?
         var onHeight: ((CGFloat) -> Void)?
         var onScroll: ((CGFloat, CGFloat, CGFloat, CGFloat) -> Void)?
+        var zoom: MermaidZoomBridge?
         private var renderedSource: String = ""
         private var renderedDark: Bool = false
-        private var renderedZoom: CGFloat = 1
         private var renderedScrollable: Bool = false
 
         func userContentController(
@@ -153,26 +212,41 @@ struct MermaidWebView: NSViewRepresentable {
                 )
                 return
             }
+            if message.name == "pmMetrics",
+               let body = message.body as? [String: NSNumber],
+               let vbW = body["vbW"], let vbH = body["vbH"],
+               let viewW = body["viewW"], let viewH = body["viewH"] {
+                zoom?.receiveMetrics(
+                    viewBox: CGSize(
+                        width: CGFloat(vbW.doubleValue), height: CGFloat(vbH.doubleValue)
+                    ),
+                    viewport: CGSize(
+                        width: CGFloat(viewW.doubleValue), height: CGFloat(viewH.doubleValue)
+                    )
+                )
+                return
+            }
             guard message.name == "mermaidHeight",
                   let height = message.body as? NSNumber else { return }
             onHeight?(max(CGFloat(height.doubleValue), 40))
         }
 
         /// 渲染：mermaid.min.js + 图源写入缓存目录，loadFileURL 加载。
-        /// source / dark / zoom / scrollable 任一变化都触发整页重渲染。
-        func render(source: String, dark: Bool, zoom: CGFloat, scrollable: Bool) {
+        /// source / dark / scrollable 任一变化都触发整页重渲染
+        /// （倍率变化不在此列——那条路走 MermaidZoomBridge 的 JS 改尺寸）。
+        func render(source: String, dark: Bool, scrollable: Bool) {
             guard source != renderedSource || dark != renderedDark
-                    || zoom != renderedZoom || scrollable != renderedScrollable,
+                    || scrollable != renderedScrollable,
                   let webView else { return }
             guard let htmlURL = Self.writeRenderHTML(
-                source: source, dark: dark, zoom: zoom, scrollable: scrollable
+                source: source, dark: dark, scrollable: scrollable
             ) else {
                 return
             }
             renderedSource = source
             renderedDark = dark
-            renderedZoom = zoom
             renderedScrollable = scrollable
+            zoom?.invalidatePage()
             webView.loadFileURL(
                 htmlURL,
                 allowingReadAccessTo: htmlURL.deletingLastPathComponent()
@@ -204,7 +278,7 @@ struct MermaidWebView: NSViewRepresentable {
         }
 
         static func writeRenderHTML(
-            source: String, dark: Bool, zoom: CGFloat = 1, scrollable: Bool = false
+            source: String, dark: Bool, scrollable: Bool = false
         ) -> URL? {
             guard ensureMermaidJS() != nil else { return nil }
             let escaped = source
@@ -251,6 +325,54 @@ struct MermaidWebView: NSViewRepresentable {
                   })();
                   """
                 : ""
+            // 缩放与横向滚动（仅放大弹窗）：
+            // · pmSetScale 按 viewBox 矢量重设 svg 尺寸，并把「视口中心落在图形上
+            //   的比例」在缩放后还原——原地缩放不跳视；改完主动回报滚动几何，
+            //   外挂细胶囊随动（内容尺寸变了但 scroll 事件不会触发）。
+            // · pmReportMetrics 回报 viewBox 与视口尺寸，原生侧据此算「适应窗口」。
+            // · Shift+滚轮 → 横向滚动：鼠标用户在拖拽平移之外多一条不碰图的操作路径。
+            let zoomJS = scrollable
+                ? """
+                  (function () {
+                    function scroller() { return document.scrollingElement || document.documentElement; }
+                    var vbW = 0, vbH = 0;
+                    window.pmSetScale = function (s) {
+                      var svg = document.querySelector('.mermaid svg');
+                      if (!svg || vbW <= 0) return;
+                      var d = scroller();
+                      var before = svg.getBoundingClientRect();
+                      var ux = before.width > 0 ? (d.clientWidth / 2 - before.left) / before.width : 0.5;
+                      var uy = before.height > 0 ? (d.clientHeight / 2 - before.top) / before.height : 0.5;
+                      svg.style.maxWidth = 'none';
+                      svg.setAttribute('width', vbW * s);
+                      svg.setAttribute('height', vbH * s);
+                      var after = svg.getBoundingClientRect();
+                      d.scrollLeft = after.left + d.scrollLeft + ux * after.width - d.clientWidth / 2;
+                      d.scrollTop = after.top + d.scrollTop + uy * after.height - d.clientHeight / 2;
+                      if (window.pmReportScroll) window.pmReportScroll();
+                    };
+                    window.pmReportMetrics = function () {
+                      var svg = document.querySelector('.mermaid svg');
+                      if (!svg) return;
+                      var box = svg.viewBox.baseVal;
+                      if (!box || box.width <= 0) return;
+                      vbW = box.width; vbH = box.height;
+                      try {
+                        window.webkit.messageHandlers.pmMetrics.postMessage({
+                          vbW: vbW, vbH: vbH, viewW: window.innerWidth, viewH: window.innerHeight
+                        });
+                      } catch (e) {}
+                    };
+                    window.addEventListener('resize', function () { window.pmReportMetrics(); });
+                    document.addEventListener('wheel', function (e) {
+                      if (!e.shiftKey) return;
+                      e.preventDefault();
+                      var d = scroller();
+                      d.scrollLeft += (Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY);
+                    }, { passive: false });
+                  })();
+                  """
+                : ""
             // margin 0：外边距由 SwiftUI 容器控制；渲染完成（含失败）回报内容高度
             let html = """
             <!DOCTYPE html>
@@ -272,7 +394,6 @@ struct MermaidWebView: NSViewRepresentable {
             </style>
             <script src="mermaid.min.js"></script>
             <script>
-              const ZOOM = \(zoom);
               function postHeight() {
                 try {
                   window.webkit.messageHandlers.mermaidHeight.postMessage(
@@ -280,19 +401,8 @@ struct MermaidWebView: NSViewRepresentable {
                   );
                 } catch (e) {}
               }
-              // 放大查看：按 viewBox 重设 svg 尺寸——矢量缩放，分辨率不失真
-              function scaleSVG() {
-                if (ZOOM === 1) return;
-                var svg = document.querySelector('.mermaid svg');
-                if (!svg) return;
-                var vb = svg.viewBox.baseVal;
-                if (vb && vb.width > 0 && vb.height > 0) {
-                  svg.setAttribute('width', vb.width * ZOOM);
-                  svg.setAttribute('height', vb.height * ZOOM);
-                  svg.style.maxWidth = 'none';
-                }
-              }
               \(panJS)
+              \(zoomJS)
               mermaid.initialize({
                 startOnLoad: false,
                 theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
@@ -300,7 +410,10 @@ struct MermaidWebView: NSViewRepresentable {
               });
               function renderNow() {
                 mermaid.run()
-                  .then(function () { scaleSVG(); postHeight(); })
+                  .then(function () {
+                    postHeight();
+                    if (window.pmReportMetrics) window.pmReportMetrics();
+                  })
                   .catch(postHeight);
               }
               // 本脚本在 <head> 中先于 <body> 解析执行——立即 run() 找不到任何
@@ -943,9 +1056,6 @@ struct MarkdownSourceReader: NSViewRepresentable {
 
 // MARK: - 内联图卡（工具条：源代码切换 / 放大弹窗）
 
-/// 放大倍率（≥150%）：按 viewBox 重设 svg 尺寸，矢量缩放不失真。
-private let mermaidZoomFactor: CGFloat = 1.5
-
 /// 图卡工具条：查看源代码（与图表视图互切）/ 放大图表（弹窗）。
 struct MermaidFigureToolbar: View {
     @Binding var showSource: Bool
@@ -976,7 +1086,7 @@ struct MermaidFigureToolbar: View {
 
 /// 内联 mermaid 图卡（对话页直接渲染，无需点击预览）。
 /// 头部：标题（nil → "mermaid" 语言标签）+ 源码态复制钮 + 工具条；
-/// 图表与源码互切；放大弹窗 1.5× 矢量呈现。
+/// 图表与源码互切；放大弹窗矢量缩放 + 双向滚动（见 MermaidZoomSheet）。
 /// 供两处使用：MessageBubble 内联产物图（带标题）、MarkdownText ```mermaid 围栏块。
 struct MermaidFigureCard: View {
     let source: String
@@ -1078,12 +1188,31 @@ struct MermaidFigureCard: View {
     }
 }
 
-/// 放大查看弹窗：1.5× 矢量放大（横向/纵向可滚动）；
+/// 放大查看弹窗：矢量缩放 + 双向滚动。
+/// 缩放三条路：工具条 ± / ⌘+滚轮 / 键盘 ⌘+ ⌘− ⌘0（1:1 实际大小）；
+/// 滚动三条路：滚轮、Shift+滚轮横向、按住空白处拖动平移。
+/// 打开时按 viewBox 与视口度量自动「适应窗口」（整图入视，放大上限 1.5 倍），
+/// 用户手动缩放后不再跟随视口尺寸变化。
 /// 点空白遮罩 / 关闭按钮 / Esc 均可关闭。
 struct MermaidZoomSheet: View {
     let title: String
     let source: String
     @Environment(\.dismiss) private var dismiss
+    @State private var scale: CGFloat = 1
+    /// 「适应窗口」倍率（JS 度量回报后换算）
+    @State private var fitScale: CGFloat = 1
+    /// 手动缩放过 → 拖窗/换屏等视口变化不再自动回到适应档
+    @State private var userAdjusted = false
+    @State private var zoom = MermaidZoomBridge()
+
+    private static let minScale: CGFloat = 0.2
+    private static let maxScale: CGFloat = 4
+    /// 适应档的放大上限：小图撑满整窗只会让字号虚大，1.5 倍封顶
+    private static let fitMaxScale: CGFloat = 1.5
+    /// 工具条单档倍率
+    private static let step: CGFloat = 1.25
+    /// HTML body 内衬 16px×2（算可视内容区要扣掉）
+    private static let canvasPadding: CGFloat = 32
 
     var body: some View {
         ZStack {
@@ -1094,23 +1223,13 @@ struct MermaidZoomSheet: View {
                 .onTapGesture { dismiss() }
 
             VStack(spacing: 0) {
-                HStack(spacing: DS.Spacing.s12) {
-                    Text(title)
-                        .font(DS.Font.headingSM)
-                        .foregroundStyle(Color.ink900)
-                    Spacer()
-                    Button("关闭") { dismiss() }
-                        .buttonStyle(.ds(.primary, size: .xs))
-                        .keyboardShortcut(.cancelAction)
-                }
-                .padding(.horizontal, DS.Spacing.s16)
-                .padding(.vertical, DS.Spacing.s10)
+                header
 
                 DSDivider()
 
                 // 滚动由 webview 内部 HTML 承担（WKWebView 消费滚轮事件且不转发
                 // 外层 ScrollView，外层永远滚不动）——这里只给有界容器
-                MermaidView(source: source, zoom: mermaidZoomFactor, scrollable: true)
+                MermaidView(source: source, scrollable: true, zoom: zoom)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(
@@ -1129,5 +1248,97 @@ struct MermaidZoomSheet: View {
         }
         .frame(minWidth: 1020, minHeight: 700)
         .presentationBackground(.clear)
+        .onAppear {
+            zoom.onMetrics = { viewBox, viewport in
+                applyMetrics(viewBox: viewBox, viewport: viewport)
+            }
+            zoom.onWheelZoom = { delta in nudgeScale(1 + delta) }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: DS.Spacing.s12) {
+            Text(title)
+                .font(DS.Font.headingSM)
+                .foregroundStyle(Color.ink900)
+                .lineLimit(1)
+            Spacer()
+            zoomControls
+            Button("关闭") { dismiss() }
+                .buttonStyle(.ds(.primary, size: .xs))
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(.horizontal, DS.Spacing.s16)
+        .padding(.vertical, DS.Spacing.s10)
+    }
+
+    /// 缩放工具条：− 百分比 + ／ 1:1 实际大小 ／ 适应窗口
+    private var zoomControls: some View {
+        HStack(spacing: DS.Spacing.s2) {
+            Button { nudgeScale(1 / Self.step) } label: {
+                DSIcon(.zoomOut, size: 12)
+            }
+            .buttonStyle(.ds(.ghost, size: .xs))
+            .disabled(scale <= Self.minScale)
+            .help("缩小（⌘−）")
+            .keyboardShortcut("-", modifiers: .command)
+
+            Text("\(Int((scale * 100).rounded()))%")
+                .font(DS.Font.monoSM)
+                .foregroundStyle(Color.ink500)
+                .frame(width: 46)
+
+            Button { nudgeScale(Self.step) } label: {
+                DSIcon(.zoomIn, size: 12)
+            }
+            .buttonStyle(.ds(.ghost, size: .xs))
+            .disabled(scale >= Self.maxScale)
+            .help("放大（⌘+）")
+            // 绑物理键 "="：⌘+ 要按 Shift 才成立，AppKit 里 ⌘= 与 ⌘+ 同键，
+            // 提示文案按用户熟悉的 ⌘+ 写
+            .keyboardShortcut("=", modifiers: .command)
+
+            Button("1:1") {
+                userAdjusted = true
+                setScale(1)
+            }
+            .buttonStyle(.ds(.ghost, size: .xs))
+            .help("实际大小（100%）")
+            .keyboardShortcut("0", modifiers: .command)
+
+            Button("适应窗口") {
+                userAdjusted = false
+                setScale(fitScale)
+            }
+            .buttonStyle(.ds(.ghost, size: .xs))
+            .help("整张图缩到窗口内可见")
+
+            Rectangle()
+                .fill(Color.borderL1)
+                .frame(width: 1, height: 14)
+                .padding(.horizontal, DS.Spacing.s8)
+        }
+    }
+
+    private func setScale(_ next: CGFloat) {
+        scale = min(max(next, Self.minScale), Self.maxScale)
+        zoom.requestScale(scale)
+    }
+
+    private func nudgeScale(_ factor: CGFloat) {
+        userAdjusted = true
+        setScale(scale * factor)
+    }
+
+    /// JS 度量回报（渲染完成 / 视口尺寸变化）：算适应倍率，未手动缩放时跟随
+    private func applyMetrics(viewBox: CGSize, viewport: CGSize) {
+        guard viewBox.width > 1, viewBox.height > 1,
+              viewport.width > 1, viewport.height > 1 else { return }
+        let availW = max(1, viewport.width - Self.canvasPadding)
+        let availH = max(1, viewport.height - Self.canvasPadding)
+        let fit = min(availW / viewBox.width, availH / viewBox.height)
+        fitScale = min(max(fit, Self.minScale), Self.fitMaxScale)
+        guard !userAdjusted else { return }
+        setScale(fitScale)
     }
 }

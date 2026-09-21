@@ -258,10 +258,19 @@ struct SettingsDialog: View {
 
                 section(
                     "Agent 工具调用",
-                    footer: "允许模型在对话中自主调用内置工具：按需加载方法论技能全文（本地）、联网搜索（用下方配置的搜索源）、发起竞品分析（仍需你确认后才执行）。关闭后模型不再携带工具，行为与旧版一致。"
+                    footer: "允许模型在对话中自主调用内置工具：按需加载方法论技能全文（本地）、联网搜索（用下方配置的搜索源）、检索与记一笔长期记忆（记入的条目进校准回路，由你确认后才升为可靠依据）、查询产物依赖、发起竞品分析（仍需你确认后才执行）。关闭后模型不再携带工具，行为与旧版一致。"
                 ) {
                     settingsRow("允许模型调用工具", detail: "Function Calling（实验）") {
                         DSSwitch(isOn: agentToolsBinding)
+                    }
+                }
+
+                section(
+                    "执行计划提案",
+                    footer: "确认要点表 / 结构 / 原型后，正式生成产物前 AI 先提交一页执行计划草案，你裁决（按计划执行 / 补充要求 / 跳过）后才开始生成——多等一轮，换生成方向先对齐。关闭则确认后直接生成。"
+                ) {
+                    settingsRow("生成前先出计划", detail: "②③④ 首次生成前多一轮计划提案") {
+                        DSSwitch(isOn: planProposalsBinding)
                     }
                 }
 
@@ -932,6 +941,17 @@ struct SettingsDialog: View {
         )
     }
 
+    /// 执行计划提案开关（P0-2 计划提案权，LLMSettings 持久化）。
+    private var planProposalsBinding: Binding<Bool> {
+        Binding(
+            get: { settings.planProposalsEnabled },
+            set: { newValue in
+                settings.planProposalsEnabled = newValue
+                persistSoon()
+            }
+        )
+    }
+
     /// Tavily Key 写 Keychain（与 chat/embedding Key 同款 BYOK 路径，不进 settings.json）。
     private var searchAPIKeyBinding: Binding<String> {
         Binding(
@@ -1275,6 +1295,15 @@ private struct ModelEditorSheet: View {
 
             editorDivider
 
+            editorRow("上下文窗口 · 可选", detail: "标注该模型的上下文窗口（tokens），对话注入预算随窗口比例伸缩——小窗不挤爆、大窗多喂方法论与历史；留空保持缺省预算") {
+                TextField("如 64000", text: contextWindowBinding)
+                    .textFieldStyle(.plain)
+                    .dsInput()
+                    .frame(width: 120)
+            }
+
+            editorDivider
+
             keyRow
         }
     }
@@ -1379,6 +1408,17 @@ private struct ModelEditorSheet: View {
         Binding(
             get: { draft.supportsImages },
             set: { draft.supportsImages = $0 }
+        )
+    }
+
+    /// 上下文窗口标注（P1-6）：只收数字，空 = 不标注（缺省预算不伸缩）。
+    private var contextWindowBinding: Binding<String> {
+        Binding(
+            get: { draft.contextWindow.map(String.init) ?? "" },
+            set: { newValue in
+                let digits = newValue.filter(\.isNumber)
+                draft.contextWindow = digits.isEmpty ? nil : Int(digits)
+            }
         )
     }
 

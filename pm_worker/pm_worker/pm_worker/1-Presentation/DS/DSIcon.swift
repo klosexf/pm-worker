@@ -318,6 +318,9 @@ extension DSIcon.Name {
     static let chevronUp = DSIcon.Name(symbol: "chevron.up")
     static let chevronRight = DSIcon.Name(symbol: "chevron.right")
     static let copy = DSIcon.Name(symbol: "doc.on.doc")
+    /// 图表放大弹窗工具条：缩小 / 放大
+    static let zoomOut = DSIcon.Name(symbol: "minus.magnifyingglass")
+    static let zoomIn = DSIcon.Name(symbol: "plus.magnifyingglass")
 
     // MARK: 自绘兜底（品牌字符）
 

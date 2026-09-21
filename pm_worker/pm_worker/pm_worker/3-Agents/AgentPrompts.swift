@@ -43,6 +43,8 @@ nonisolated enum AgentPrompts {
         - `propose_competitive_analysis`：发起竞品分析（系统会向用户弹确认卡，用户同意才执行）。
         - `query_impact`：查询产物依赖关系（改一个产物会连带影响哪些下游产物、建议重做顺序）；\
         编制变更提案的影响清单（impacts）前先用它核实影响面，不凭印象列。
+        - `save_memory`：记一笔跨回合长期记忆（kind=conclusion 用户已拍板的结论 / experience 通用经验）。只记已确认或已验证的事实，一次性细节不记；约束与否决项不受理（须用户裁决沉淀）。
+        - `recall_memory`：检索项目与全局长期记忆（历史结论、否决原因、被预算裁掉的旧条目）。引用记忆内容前先用它核实，不凭印象编造。
         调用规则：
         - 确实需要才调用（需要技能全文 / 需要外部事实 / 用户表达调研意图）；不需要就直接回答，不为调用而调用。
         - 每轮调用一个工具，等结果回流后再决定下一步；工具失败时阅读错误提示并调整查询，同一查询不原样重试超过一次。
@@ -50,6 +52,52 @@ nonisolated enum AgentPrompts {
         """
     }
     nonisolated static let architectureBudget = 1000
+
+    // MARK: - 计划提案（P0-2 模型计划提案权）
+
+    /// 计划模式段（拼在生成轮 system prompt 尾部，仅计划轮携带）：
+    /// 本轮不出正式产物、只出 artifact:plan-proposal 块交用户裁决。
+    /// 与轮内自宣计划（artifact:plan，plan-act-reflect）区分：提案必须经裁决才执行。
+    nonisolated static var planModeSection: String {
+        """
+        ## 本轮为计划提案轮
+        本轮**不输出该阶段正式产物**（不输出 structure/prototype/prd 等产物块），\
+        只输出一页执行计划草案供用户审阅。如需用工具核实素材（检索记忆、查依赖、搜外部事实），\
+        先调用再落计划。提案块（本轮唯一产物块）格式：
+        ```artifact:plan-proposal
+        {"mission": "一句话总体思路", "steps": [{"do": "第N步做了什么", "basis": "关键处理或依据（可省略）"}]}
+        ```
+        规则：steps 2-6 步，围绕「产物怎么组织、重点落在哪、缺口怎么补」而非流程套话；\
+        与已确认材料存在取舍冲突的点，在 basis 里写明你的倾向与理由；正文两三句话说明思路即可，不复述计划全文。
+        """
+    }
+
+    /// 计划轮的用户侧提问行（sendSystemTurn userPrompt）。
+    nonisolated static func planRequestTask(stageName: String) -> String {
+        "开始「\(stageName)」生成前，先按上方计划提案轮协议提交一页执行计划草案。"
+    }
+
+    /// 已批准计划注入段（拼进执行轮 prompt 尾部；supplement = 用户补充要求）。
+    nonisolated static func approvedPlanSection(
+        _ plan: ArtifactParser.PlanCard, supplement: String?
+    ) -> String {
+        var lines: [String] = ["## 已批准执行计划（用户已裁决，按此组织产物）"]
+        if let mission = plan.mission, !mission.isEmpty { lines.append("总体思路：\(mission)") }
+        for (i, step) in plan.steps.enumerated() {
+            var line = "\(i + 1). \(step.action)"
+            if let basis = step.basis?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !basis.isEmpty {
+                line += "——\(basis)"
+            }
+            lines.append(line)
+        }
+        if let supplement = supplement?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !supplement.isEmpty {
+            lines.append("用户补充要求（优先于计划原文）：\(supplement)")
+        }
+        lines.append("确有必要偏离计划时，在正文一句话说明偏离点，不静默偏离。")
+        return lines.joined(separator: "\n")
+    }
 
     /// 上游产物骨架折叠：超预算时保留标题行、表头与前 8 行表格、各内容块首行，
     /// 其余丢弃并尾注折叠说明（完整内容以磁盘产物为准）；预算内原文返回。
@@ -192,6 +240,7 @@ nonisolated enum AgentPrompts {
             ("prototype", "跳过 ②，直接生成 ③ 交互原型（结构可事后补做）"),
             ("prd", "跳过 ②③，直接生成 ④ 产品需求文档（小需求适用；结构与原型可事后补做）"),
         ]))
+        \(Self.routeSection())
         输出顺序硬规则：先给文字回复与雷达/决策产物块，选项行必须放在整个回复的最末尾。
         \(injectionSection(injection))
         """
@@ -548,6 +597,7 @@ nonisolated enum AgentPrompts {
         switch stage {
         case "structure": stageName = "结构"
         case "prototype": stageName = "原型"
+        case "prd": stageName = "PRD"
         default: stageName = stage
         }
         return """
@@ -764,6 +814,42 @@ nonisolated enum AgentPrompts {
         （前置确认卡提交或 fast-forward 受理后自动生成，才会走模板与评分卡协议）。\
         把 PRD 全文写进回复（含 artifact:prd 块）系统不会落盘，用户拿不到文档。\
         用户要求生成 PRD 时，只走「前置确认卡」或「fast-forward 块」两条路径。
+        """
+    }
+
+    // MARK: - 路线建议协议（① 注入：澄清收束前 Agent 自主建议流转路径，仅展示不执行）
+
+    /// 路线建议块（artifact:route）：澄清信息基本齐全时，Agent 基于需求复杂度自主
+    /// 建议流转路径（完整流程 / 跳结构直出原型 / 跳②③直出 PRD）。与 fast-forward
+    /// 的「用户明确要求才输出」互补——这是动态规划的提议面：LLM 提议、App 展示、
+    /// 人裁决（收束后确认坞选择）。仅建议不执行；信息不足时宁缺毋滥。
+    static func routeSection() -> String {
+        """
+
+        ━━ 路线建议（澄清信息基本齐全时输出，仅建议不执行）━━
+        当你判断澄清已基本齐全、要点表即将可以产出时，在正文中输出路线建议块\
+        （通常与收尾确认问或要点表同轮）：
+
+        ```artifact:route
+        {"recommend": "路径标识", "reasons": ["理由1", "理由2"], "basis": "判断依据：引用澄清中支撑该判断的具体事实"}
+        ```
+
+        合法路径标识：
+        - "standard"：完整流程（② 结构 → ③ 原型 → ④ PRD）——功能有一定复杂度，\
+        页面结构或业务流程需要先设计对齐；
+        - "skip_structure"：跳过 ② 结构直出 ③ 原型——界面形态与页面清单非常明确、\
+        无需架构图对齐的需求；
+        - "direct_prd"：跳过 ②③ 直出 ④ PRD——小需求（单一功能点 / 内部工具 / 改造项），\
+        跳过的产物可事后补做。
+
+        硬规则：
+        1. **仅建议，不执行、不宣布**——App 会把建议转成提示行展示给用户，\
+        路径仍由用户在收束时自行选择；
+        2. reasons 给 1-3 条具体理由（需求复杂度 / 界面确定性 / 范围大小），\
+        basis 引用澄清中的事实，不说空话；
+        3. 信息不足以判断时不输出本块——乱建议比不建议更糟；
+        4. 与快速通道块互斥：用户明确要求跳步时输出 fast-forward 块，不再输出本块；
+        5. 本块不影响要点表产出与收束判断；每轮至多一次，重复轮以最新为准。
         """
     }
 

@@ -30,6 +30,8 @@ final class ContextBuilder: ObservableObject {
 
     /// design.md §6.4 token 预算一档比例（五段配额；超预算按优先级从低到高裁剪）。
     /// rules 永不裁；history 只分配预算值，由 SessionStore 成对丢最旧整轮。
+    /// 这是缺省档（≈64k 窗口参考值）；模型档案标了上下文窗口时按
+    /// budgets(contextWindow:) 比例伸缩（P1-6）。
     nonisolated static let defaultBudgets: [ContextSegment: Int] = [
         .rules: 500,        // 规则层（rules/global.md 常驻）
         .memory: 2000,     // 记忆（含假设态校准文本）
@@ -37,6 +39,25 @@ final class ContextBuilder: ObservableObject {
         .retrieval: 1500,   // 方法论卡片 top-k
         .history: 6000,    // 对话历史
     ]
+
+    /// 缺省预算对应的参考上下文窗口（tokens）——窗口标注等于它时预算不变。
+    nonisolated static let referenceContextWindow = 64_000
+
+    /// 预算按模型上下文窗口比例伸缩（P1-6：小窗不挤爆、大窗不浪费）：
+    /// factor = clamp(window / reference, 0.4, 2.5)，各段等比取整到 50；
+    /// rules 段设 300 下限（规则层永不裁，缩太狠会装不下兜底文本）。
+    /// window nil / ≤0 → 缺省档不伸缩（未标注窗口的档案保持旧行为）。
+    nonisolated static func budgets(contextWindow: Int?) -> [ContextSegment: Int] {
+        guard let contextWindow, contextWindow > 0 else { return defaultBudgets }
+        let factor = min(max(Double(contextWindow) / Double(referenceContextWindow), 0.4), 2.5)
+        var scaled: [ContextSegment: Int] = [:]
+        for (segment, base) in defaultBudgets {
+            var value = Int((Double(base) * factor / 50).rounded()) * 50
+            if segment == .rules { value = max(value, 300) }
+            scaled[segment] = value
+        }
+        return scaled
+    }
 
     /// 规则层兜底文本（Bundle 读不到 rules/global.md 时使用——保活不崩）。
     nonisolated private static let fallbackRules = """
@@ -334,9 +355,10 @@ final class ContextBuilder: ObservableObject {
         return (try? PitfallsRouter.pitfalls(for: stage, database: database)) ?? []
     }
 
-    /// 记忆段裁剪：超预算从尾部逐行丢（版本 scope 前置 + 新条目在前 ≈「截最旧」；
-    /// 假设态校准文本排在段尾最先丢）。约束 / 否决项为保护层永不裁——
-    /// 保护行占满预算时停止裁剪（宁超勿丢），不产生死循环。
+    /// 记忆段裁剪：超预算从尾部逐行丢（注入侧已按「硬边界前置 + 相关性 + 新在前」
+    /// 排序，被丢的即段内最不相关者；约束/否决项为保护行永不裁——
+    /// 保护行占满预算时停止裁剪（宁超勿丢），不产生死循环）。
+    /// 有丢弃时尾注省略条数——静默丢行变为可见让位（P0：记忆不再无告警蒸发）。
     nonisolated private static func trimMemory(
         _ text: String, budget: Int, trimmed: inout [ContextSegment]
     ) -> String {
@@ -349,14 +371,20 @@ final class ContextBuilder: ObservableObject {
         }
 
         var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var dropped = 0
         while TokenBreakdown.estimate(lines.joined(separator: "\n")) > budget {
             // 从尾部找最后一条「可丢」行（跳过保护行）；全是保护行 → 停止
             guard let last = lines.lastIndex(where: {
                 !$0.trimmingCharacters(in: .whitespaces).isEmpty && !isProtected($0)
             }) else { break }
             lines.remove(at: last)
+            dropped += 1
             if !trimmed.contains(.memory) { trimmed.append(.memory) }
         }
-        return lines.joined(separator: "\n")
+        var result = lines.joined(separator: "\n")
+        if dropped > 0 {
+            result += "\n…（另有 \(dropped) 条记忆因预算未注入——完整清单见记忆页）"
+        }
+        return result
     }
 }

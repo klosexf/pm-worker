@@ -42,6 +42,13 @@ struct AgentToolContext {
     var skillSearch: (String) async -> [(id: String, docPath: String)]
     /// 发起竞品分析确认卡（复用既有 pendingBranchConfirmation 通道）。
     var submitAnalysis: (String) -> Void
+    /// 记忆写入（save_memory）：kind + 正文 → 错误文案（nil = 成功）。
+    /// kind 白名单（结论/经验）与假设态落库在 MemoryStore 收口；
+    /// nil = 未接线（无头/测试链路），工具侧回流「暂不可用」。
+    var memorySave: ((String, String) -> String?)? = nil
+    /// 记忆检索（recall_memory）：query → 命中条目注入格式行。
+    /// nil = 未接线，同 memorySave 口径。
+    var memorySearch: ((String) -> [String])? = nil
 }
 
 /// 单个可调用工具。@MainActor：执行可能触碰 UI（确认卡）与 MainActor 状态。

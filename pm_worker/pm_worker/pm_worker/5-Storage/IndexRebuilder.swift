@@ -69,25 +69,29 @@ nonisolated enum IndexRebuilder {
         let cardTexts = scanned.globalCards.map(\.content)
             + scanned.projectCards.map { $0.card.content }
         let skillTexts = scanned.skills.map { SkillLoader.fourFieldText($0.skill) }
-        let cardVectors = try await embedBatch(cardTexts, embeddingProvider: embeddingProvider)
-        let skillVectors = try await embedBatch(skillTexts, embeddingProvider: embeddingProvider)
+        let cards = try await embedBatch(cardTexts, embeddingProvider: embeddingProvider)
+        let skills = try await embedBatch(skillTexts, embeddingProvider: embeddingProvider)
 
         try await database.dbQueue.write { db in
             for (i, card) in scanned.globalCards.enumerated() {
-                try upsertCard(card, projectId: "", db: db, embedding: VectorMath.encode(cardVectors[i]))
+                try upsertCard(
+                    card, projectId: "", db: db,
+                    embedding: VectorMath.encode(cards.vectors[i]), embeddingSource: cards.source
+                )
             }
             for (i, entry) in scanned.projectCards.enumerated() {
                 try upsertCard(
                     entry.card,
                     projectId: entry.projectId,
                     db: db,
-                    embedding: VectorMath.encode(cardVectors[scanned.globalCards.count + i])
+                    embedding: VectorMath.encode(cards.vectors[scanned.globalCards.count + i]),
+                    embeddingSource: cards.source
                 )
             }
             for (i, entry) in scanned.skills.enumerated() {
                 try upsertSkill(
-                    entry.skill, db: db, embedding: VectorMath.encode(skillVectors[i]),
-                    docPath: entry.url.path
+                    entry.skill, db: db, embedding: VectorMath.encode(skills.vectors[i]),
+                    embeddingSource: skills.source, docPath: entry.url.path
                 )
             }
         }
@@ -107,9 +111,12 @@ nonisolated enum IndexRebuilder {
         database: AppDatabase,
         embeddingProvider: EmbeddingProviding
     ) async throws {
-        let vector = try await embedSingle(card.content, embeddingProvider: embeddingProvider)
+        let encoded = try await embedSingle(card.content, embeddingProvider: embeddingProvider)
         try await database.dbQueue.write { db in
-            try upsertCard(card, projectId: projectId, db: db, embedding: VectorMath.encode(vector))
+            try upsertCard(
+                card, projectId: projectId, db: db,
+                embedding: VectorMath.encode(encoded.vector), embeddingSource: encoded.source
+            )
         }
     }
 
@@ -119,11 +126,14 @@ nonisolated enum IndexRebuilder {
         database: AppDatabase,
         embeddingProvider: EmbeddingProviding
     ) async throws {
-        let vector = try await embedSingle(
+        let encoded = try await embedSingle(
             SkillLoader.fourFieldText(skill), embeddingProvider: embeddingProvider
         )
         try await database.dbQueue.write { db in
-            try upsertSkill(skill, db: db, embedding: VectorMath.encode(vector))
+            try upsertSkill(
+                skill, db: db, embedding: VectorMath.encode(encoded.vector),
+                embeddingSource: encoded.source
+            )
         }
     }
 
@@ -179,57 +189,60 @@ nonisolated enum IndexRebuilder {
 
     // MARK: - Embedding
 
-    /// 单条文本编码（增量索引用）：返回一个向量；返回空 / 空向量视为失败。
+    /// 单条文本编码（增量索引用）：返回向量与来源戳；返回空 / 空向量视为失败。
     private static func embedSingle(
         _ text: String, embeddingProvider: EmbeddingProviding
-    ) async throws -> [Float] {
-        let vectors = try await embeddingProvider.embed(texts: [text])
-        guard let vector = vectors.first, !vector.isEmpty else {
+    ) async throws -> (vector: [Float], source: String) {
+        let result = try await embeddingProvider.embedWithSource(texts: [text])
+        guard let vector = result.vectors.first, !vector.isEmpty else {
             throw NSError(
                 domain: "IndexRebuilder", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "向量编码返回为空：\(text.prefix(50))…"]
             )
         }
-        return vector
+        return (vector, result.source)
     }
 
     /// 批量编码（全量重建用）：空输入返回空（不发请求）。
     private static func embedBatch(
         _ texts: [String], embeddingProvider: EmbeddingProviding
-    ) async throws -> [[Float]] {
-        guard !texts.isEmpty else { return [] }
-        let vectors = try await embeddingProvider.embed(texts: texts)
-        guard vectors.count == texts.count else {
+    ) async throws -> (vectors: [[Float]], source: String) {
+        guard !texts.isEmpty else { return ([], "") }
+        let result = try await embeddingProvider.embedWithSource(texts: texts)
+        guard result.vectors.count == texts.count else {
             throw NSError(
                 domain: "IndexRebuilder", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "向量编码返回数量（\(vectors.count)）与输入（\(texts.count)）不符"]
+                userInfo: [NSLocalizedDescriptionKey: "向量编码返回数量（\(result.vectors.count)）与输入（\(texts.count)）不符"]
             )
         }
-        return vectors
+        return (result.vectors, result.source)
     }
 
     // MARK: - Upsert
 
     private static func upsertCard(
-        _ card: MethodologyCard, projectId: String, db: Database, embedding: Data
+        _ card: MethodologyCard, projectId: String, db: Database,
+        embedding: Data, embeddingSource: String? = nil
     ) throws {
         try db.execute(
             sql: """
                 INSERT INTO knowledge_points
                     (id, project_id, content, source_type, source_ref, embedding,
-                     annotation_count, confidence, superseded_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     annotation_count, confidence, superseded_by, created_at, embedding_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     content = excluded.content,
                     embedding = excluded.embedding,
                     annotation_count = excluded.annotation_count,
                     confidence = excluded.confidence,
-                    superseded_by = excluded.superseded_by
+                    superseded_by = excluded.superseded_by,
+                    embedding_source = excluded.embedding_source
                 """,
             arguments: [
                 card.id, projectId, card.content, card.sourceType, card.sourceRef,
                 embedding,  // 真实 blob 或零长度占位（同步 rebuild 的 M0 兼容路径）
                 card.annotations.count, card.confidence, card.supersededBy, card.created,
+                embeddingSource,  // 向量来源戳；M0 占位路径为 NULL（来源未知）
             ]
         )
     }
@@ -237,7 +250,8 @@ nonisolated enum IndexRebuilder {
     /// docPath：技能 .md 实际路径（全量扫描传真实文件；nil 回退 name.md 既有口径，
     /// 供 indexSkill 增量调用——签名不可变）。
     private static func upsertSkill(
-        _ skill: SkillDocument, db: Database, embedding: Data, docPath: String? = nil
+        _ skill: SkillDocument, db: Database, embedding: Data,
+        embeddingSource: String? = nil, docPath: String? = nil
     ) throws {
         let encoder = JSONEncoder()
         let bestFor = try encoder.encode(skill.bestFor)
@@ -249,8 +263,8 @@ nonisolated enum IndexRebuilder {
             sql: """
                 INSERT INTO skills
                     (id, name, type, when_to_use, best_for, tags, pitfalls,
-                     doc_path, embedding, hit_count, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1)
+                     doc_path, embedding, hit_count, enabled, embedding_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     type = excluded.type,
@@ -259,7 +273,8 @@ nonisolated enum IndexRebuilder {
                     tags = excluded.tags,
                     pitfalls = excluded.pitfalls,
                     doc_path = excluded.doc_path,
-                    embedding = excluded.embedding
+                    embedding = excluded.embedding,
+                    embedding_source = excluded.embedding_source
                 """,
             arguments: [
                 id, skill.name, skill.type.rawValue, skill.whenToUse,
@@ -268,6 +283,7 @@ nonisolated enum IndexRebuilder {
                 String(decoding: pitfalls, as: UTF8.self),
                 docPath ?? PMAgentStore.skillsDir.appendingPathComponent("\(skill.name).md").path,
                 embedding,  // 真实 blob 或零长度占位（同步 rebuild 的 M0 兼容路径）
+                embeddingSource,  // 向量来源戳；M0 占位路径为 NULL（来源未知）
             ]
         )
     }
