@@ -21,6 +21,11 @@
 
 每个 Agent 输出末尾附**漏项雷达四档声明**（✅ 已覆盖 / ❓ 可能遗漏 / ⏭️ 刻意不展开 / 💀 致命漏洞假设）；💀 进入**风险登记册**，必带可观测触发信号、由状态机结算。对话中的结论、约束、否决项、决策与方法论心得**自动沉淀**（按项目/版本作用域隔离，后续阶段自动注入）。所有数据都是磁盘上真实文件夹里的 Markdown / JSONL；SQLite 只是可重建的索引。
 
+<p align="center">
+  <img src="docs/pipeline-workflow.png" alt="四阶段门控流水线" width="720">
+</p>
+<p align="center"><em>四阶段门控流水线：三道人工确认坞（不确认不推进）、快速通道、回退双模与变更治理。<a href="diagrams/pm-copilot-pipeline-workflow.html">交互式版本</a>（主题切换 / 视图聚焦 / 导出）。</em></p>
+
 ## 为什么做它
 
 - **文件系统是事实源，不是数据库黑盒**。项目、版本、决策日志（`decisions.jsonl`）、风险登记册（`risks.jsonl`）、原型都是可见目录树里的开放格式文件；Finder 手改是合法行为，索引随时可从文件重建。
@@ -59,6 +64,11 @@ flowchart TB
 - **Context Builder 是唯一收口**（`pm_worker/4-CrossCutting/Context/ContextBuilder.swift`）：规则、记忆、命中技能正文、检索结果、历史全部经它组装并受 token 预算约束。
 - **规范路由与 RAG 并列**：PRD 模板（`pm_worker/Resources/templates/prd/{lean,standard,full}.md`）与技能 `pitfalls`（`PitfallsRouter.swift`）走确定性路由——过期规范比没有规范更危险；知识卡走向量检索 + scope 过滤。
 - **断网可渲染**：`mermaid.min.js` 本地打包于 `pm_worker/Resources/vendor/`，原型为单文件 HTML 装入 WKWebView。
+
+<p align="center">
+  <img src="docs/dataflow.png" alt="数据流：上下文组装与本地沉淀" width="720">
+</p>
+<p align="center"><em>数据流：所有注入经 ContextBuilder 单一组装点；产物写后校验落盘、索引可重建；结论与约束沉淀进记忆池，下一轮自动再注入。<a href="diagrams/pm-copilot-dataflow.html">交互式版本</a>。</em></p>
 
 ## 功能
 

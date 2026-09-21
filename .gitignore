@@ -41,5 +41,8 @@ PM Copilot 产品全景文档（供外部AI评审）.md
 /卡片详情排版设计方案/
 
 # 架构图生成产物：只入库 diagrams/specs 源，HTML 成品与截图验证产物本地保留
+# 例外：README 引用的两张交互式图表随仓库分发
 diagrams/*.html
+!diagrams/pm-copilot-pipeline-workflow.html
+!diagrams/pm-copilot-dataflow.html
 diagrams/*.visual-check.*

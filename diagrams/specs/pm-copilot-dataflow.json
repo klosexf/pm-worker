@@ -228,6 +228,18 @@
       ]
     },
     {
+      "id": "src-agent",
+      "from": "src",
+      "to": "agent",
+      "label": "依赖图查询",
+      "classification": "query_impact · 本地只读",
+      "variant": "dashed",
+      "labelAt": [
+        620,
+        236
+      ]
+    },
+    {
       "id": "agent-src",
       "from": "agent",
       "to": "src",
@@ -237,8 +249,8 @@
       "fromSide": "right",
       "toSide": "left",
       "labelAt": [
-        655,
-        316
+        640,
+        400
       ]
     },
     {
@@ -329,7 +341,8 @@
       "title": "事实源不变量",
       "items": [
         "产物与记录是 ~/PMAgent/ 下的开放格式文件，写后校验",
-        "SQLite 只是加速索引，删掉后从文件全量重建"
+        "SQLite 只是加速索引，删掉后从文件全量重建",
+        "query_impact：模型自主查依赖图，影响分析先核实后编制"
       ]
     },
     {

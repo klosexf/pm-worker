@@ -30,6 +30,11 @@ You type one fuzzy sentence — *"an app for gym check-ins"*. PM Copilot runs a 
 
 Every agent output ends with a **gap radar** (✅ covered / ❓ possibly missing / ⏭️ deliberately skipped / 💀 fatal assumption). Fatal assumptions land in a **risk register** with observable trigger signals, settled by the pipeline state machine — not by the model polling itself. Conclusions, constraints, rejections, decisions and methodology notes are **automatically captured** as you talk, scoped per project/version, and re-injected in later stages. Everything lives in **real folders of Markdown / JSONL** on your disk; SQLite is only a rebuildable index.
 
+<p align="center">
+  <img src="docs/pipeline-workflow.png" alt="The four-stage gated pipeline" width="720">
+</p>
+<p align="center"><em>The gated pipeline: three human confirmation docks (no advance without confirmation), fast-track options, revise/redo rework, and change governance. <a href="diagrams/pm-copilot-pipeline-workflow.html">Interactive version</a> (themes / guided views / export).</em></p>
+
 ## Why
 
 - **The filesystem is the source of truth, not a database black box.** Projects, versions, decisions (`decisions.jsonl`), risks (`risks.jsonl`) and prototypes are open-format files in a visible directory tree. Edit them in Finder — that's a legal operation, and the index rebuilds from files.
@@ -68,6 +73,11 @@ Layer notes (all paths relative to the repo root):
 - **Context Builder is the single assembly point** (`pm_worker/4-CrossCutting/Context/ContextBuilder.swift`): rules, memory, matched skill bodies, retrieval results and history all pass through it under a token budget. Nothing is injected behind its back.
 - **Deterministic routing sits next to RAG, not instead of it.** PRD templates (`pm_worker/Resources/templates/prd/{lean,standard,full}.md`) and skill `pitfalls` front-matter (`PitfallsRouter.swift`) are routed by fixed rules — an expired template is more dangerous than a missing one; knowledge cards go through in-memory cosine retrieval with scope filtering.
 - **Mermaid and prototypes render offline**: `mermaid.min.js` is vendored in `pm_worker/Resources/vendor/`, prototypes are single-file HTML loaded into WKWebView.
+
+<p align="center">
+  <img src="docs/dataflow.png" alt="Data flow: context assembly and local sedimentation" width="720">
+</p>
+<p align="center"><em>Data flow: every injection passes the Context Builder; artifacts land with write-then-verify and the index rebuilds from files; conclusions and constraints sediment into memory and are re-injected next round. <a href="diagrams/pm-copilot-dataflow.html">Interactive version</a>.</em></p>
 
 ## Features
 
