@@ -28,6 +28,9 @@ struct ThinkingCard: View {
     /// 如「正在抽取澄清要点表…」→「正在沉淀记忆…」）。空 = 通用「正在思考…」。
     /// 数据源 StreamState.phaseTrail（AppModel 确认链经 setStreamPhase 逐跳入轨）。
     var phases: [PhaseStep] = []
+    /// 思考中态已执行的工具调用行（Function Calling；SessionStore 执行后经
+    /// mutateStream 实时入轨，完成态由 data.steps 的工具步骤承载）。
+    var toolSteps: [ThinkData.Step] = []
 
     @State private var expanded = false
 
@@ -97,6 +100,27 @@ struct ThinkingCard: View {
                         .font(DS.Font.bodyXS)
                         .dsCaptionType(size: 12)
                         .foregroundStyle(Color.ink500)
+                }
+            }
+            // 工具调用行（Function Calling）：执行即入轨，流式期实时可见
+            ForEach(Array(toolSteps.enumerated()), id: \.offset) { _, step in
+                if let tool = step.tool {
+                    VStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                        HStack(alignment: .top, spacing: DS.Spacing.s6) {
+                            Text("⚙")
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.statusPrimary)
+                            Text(tool)
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.ink700)
+                        }
+                        if let detail = step.detail {
+                            Text(detail)
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.ink500)
+                                .padding(.leading, DS.Spacing.s16)
+                        }
+                    }
                 }
             }
             if expanded && !reasoning.isEmpty {
@@ -172,9 +196,9 @@ struct ThinkingCard: View {
                 }
                 if let full = data.full, !full.isEmpty {
                     // 2026-09-18 全文回看：reasoning 原文已随 think 落盘，展开即全文
-                    // （顶部锚定从开头读，与流式态的底部尾随语义相反）；技能行铺顶，
+                    // （顶部锚定从开头读，与流式态的底部尾随语义相反）；工具/技能行铺顶，
                     // 截断步骤行被全文取代。单 Text 保跨行拖选，限高防长文顶走对话流。
-                    let hasSkills = data.steps.contains { $0.skill != nil }
+                    let hasSkills = data.steps.contains { $0.skill != nil || $0.tool != nil }
                     if hasSkills {
                         Text(Self.stepsAttributedString(data, includeReasoningSteps: false))
                             .dsCaptionType(size: 13)
@@ -206,18 +230,40 @@ struct ThinkingCard: View {
 
     // MARK: - 步骤合并文本（跨行连续选取的关键）
 
-    /// 步骤合并为单段 AttributedString：技能行（✦ + 名称 + 注入说明）与
-    /// 推理行（· + 要点）分 run 控制字号/颜色，视觉对齐原逐条渲染。
-    /// includeReasoningSteps = false 时只渲染技能行（全文回看态用，推理行被全文取代）。
+    /// 步骤合并为单段 AttributedString：工具行（⚙ + 工具名 + 结果摘要）、
+    /// 技能行（✦ + 名称 + 注入说明）与推理行（· + 要点）分 run 控制字号/颜色，
+    /// 视觉对齐原逐条渲染。
+    /// includeReasoningSteps = false 时只渲染工具/技能行（全文回看态用，推理行被全文取代）。
     private static func stepsAttributedString(
         _ data: ThinkData, includeReasoningSteps: Bool = true
     ) -> AttributedString {
         var result = AttributedString()
         let visibleSteps = includeReasoningSteps
             ? data.steps
-            : data.steps.filter { $0.skill != nil }
+            : data.steps.filter { $0.skill != nil || $0.tool != nil }
         for (index, step) in visibleSteps.enumerated() {
-            if let skill = step.skill {
+            if let tool = step.tool {
+                // 工具调用行（Function Calling）：工具名 + 人话结果摘要
+                var gear = AttributedString("⚙ ")
+                gear.font = DS.Font.bodyXS
+                gear.foregroundColor = Color.statusPrimary
+                result += gear
+
+                var name = AttributedString(tool)
+                name.font = DS.Font.bodyXS
+                name.foregroundColor = Color.ink700
+                result += name
+
+                if let detail = step.detail {
+                    var br = AttributedString("\n")
+                    br.font = DS.Font.bodyXS
+                    result += br
+                    var d = AttributedString("  " + detail)
+                    d.font = DS.Font.bodyXS
+                    d.foregroundColor = Color.ink500
+                    result += d
+                }
+            } else if let skill = step.skill {
                 // 技能调用行：命中了哪个技能 / 注入了什么 / 耗时
                 var star = AttributedString("✦ ")
                 star.font = DS.Font.bodyXS

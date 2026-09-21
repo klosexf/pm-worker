@@ -1,0 +1,310 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "PM Copilot 四阶段门控流水线",
+    "locale": "zh-CN",
+    "output": "pm-copilot-pipeline-workflow.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-line",
+        "label": "门控主线",
+        "focus": [
+          "idea",
+          "clarify",
+          "gate1",
+          "structure",
+          "gate2",
+          "prototype",
+          "gate3",
+          "prd",
+          "seal"
+        ],
+        "note": "四个阶段、三道人工闸口，不确认不推进。"
+      },
+      {
+        "id": "rework",
+        "label": "回退链",
+        "focus": [
+          "prd",
+          "prototype",
+          "structure"
+        ],
+        "note": "对上游不满随时回退重做，下游产物自动标记过期。"
+      },
+      {
+        "id": "governance",
+        "label": "分支与治理",
+        "focus": [
+          "research",
+          "prd",
+          "change",
+          "seal"
+        ],
+        "note": "竞品分析是可选分支；候选变更池封板前必须逐条毕业。"
+      }
+    ],
+    "legend": {
+      "mode": "hidden"
+    }
+  },
+  "lanes": [
+    {
+      "id": "pipeline",
+      "label": "流水线主线（盾牌节点 = 人工确认坞）"
+    },
+    {
+      "id": "gov",
+      "label": "分支与治理",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "align",
+      "label": "对齐",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "explicit",
+      "label": "显性化",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "finalize",
+      "label": "成稿与收束",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "idea",
+    "clarify",
+    "gate1",
+    "structure",
+    "gate2",
+    "prototype",
+    "gate3",
+    "prd",
+    "seal"
+  ],
+  "nodes": [
+    {
+      "id": "idea",
+      "lane": "pipeline",
+      "col": 0,
+      "type": "external",
+      "label": "一句话想法",
+      "sublabel": "新建任务页",
+      "yOffset": 42,
+      "width": 150
+    },
+    {
+      "id": "clarify",
+      "lane": "pipeline",
+      "col": 1,
+      "type": "backend",
+      "label": "① 需求澄清",
+      "sublabel": "苏格拉底追问 ≤5 轮",
+      "yOffset": 0,
+      "width": 150
+    },
+    {
+      "id": "gate1",
+      "lane": "pipeline",
+      "col": 1,
+      "type": "security",
+      "label": "确认要点表",
+      "sublabel": "闸口 ① · 可跳步",
+      "yOffset": 84
+    },
+    {
+      "id": "structure",
+      "lane": "pipeline",
+      "col": 2,
+      "type": "backend",
+      "label": "② 结构设计",
+      "sublabel": "Mermaid 三件套",
+      "yOffset": 0,
+      "width": 150
+    },
+    {
+      "id": "gate2",
+      "lane": "pipeline",
+      "col": 2,
+      "type": "security",
+      "label": "确认结构",
+      "sublabel": "闸口 ② · 可跳步",
+      "yOffset": 84
+    },
+    {
+      "id": "prototype",
+      "lane": "pipeline",
+      "col": 3,
+      "type": "backend",
+      "label": "③ 原型生成",
+      "sublabel": "单文件 HTML · 零依赖",
+      "yOffset": 0,
+      "width": 150
+    },
+    {
+      "id": "gate3",
+      "lane": "pipeline",
+      "col": 3,
+      "type": "security",
+      "label": "确认原型",
+      "sublabel": "闸口 ③ · 到此为止",
+      "yOffset": 84
+    },
+    {
+      "id": "prd",
+      "lane": "pipeline",
+      "col": 4,
+      "type": "backend",
+      "label": "④ PRD 生成",
+      "sublabel": "分级模板 · 评分卡",
+      "yOffset": 0,
+      "width": 150
+    },
+    {
+      "id": "seal",
+      "lane": "pipeline",
+      "col": 5,
+      "type": "external",
+      "label": "封板版本",
+      "sublabel": "对账 · release-notes",
+      "yOffset": 42,
+      "width": 150
+    },
+    {
+      "id": "research",
+      "lane": "gov",
+      "col": 1,
+      "type": "cloud",
+      "label": "竞品分析",
+      "sublabel": "技能分支 · 不阻塞主线",
+      "yOffset": 0,
+      "width": 150
+    },
+    {
+      "id": "change",
+      "lane": "gov",
+      "col": 5,
+      "type": "messagebus",
+      "label": "候选变更池",
+      "sublabel": "新想法默认进池",
+      "yOffset": 0,
+      "width": 150
+    }
+  ],
+  "edges": [
+    {
+      "id": "idea-clarify",
+      "from": "idea",
+      "to": "clarify",
+      "variant": "emphasis"
+    },
+    {
+      "id": "clarify-gate1",
+      "from": "clarify",
+      "to": "gate1",
+      "label": "要点表落盘"
+    },
+    {
+      "id": "gate1-structure",
+      "from": "gate1",
+      "to": "structure",
+      "label": "确认推进"
+    },
+    {
+      "id": "structure-gate2",
+      "from": "structure",
+      "to": "gate2",
+      "label": "结构产物落盘"
+    },
+    {
+      "id": "gate2-prototype",
+      "from": "gate2",
+      "to": "prototype",
+      "label": "确认推进"
+    },
+    {
+      "id": "prototype-gate3",
+      "from": "prototype",
+      "to": "gate3",
+      "label": "原型落盘"
+    },
+    {
+      "id": "gate3-prd",
+      "from": "gate3",
+      "to": "prd",
+      "label": "确认推进"
+    },
+    {
+      "id": "prd-seal",
+      "from": "prd",
+      "to": "seal",
+      "label": "变更对账通过"
+    },
+    {
+      "id": "research-prd",
+      "from": "research",
+      "to": "prd",
+      "label": "可选输入 · 带出处",
+      "variant": "dashed",
+      "role": "async"
+    },
+    {
+      "id": "change-seal",
+      "from": "change",
+      "to": "seal",
+      "label": "封板前逐条毕业",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "prd-prototype",
+      "from": "prd",
+      "to": "prototype",
+      "label": "回退重做（revise / redo）",
+      "role": "return"
+    },
+    {
+      "id": "prototype-structure",
+      "from": "prototype",
+      "to": "structure",
+      "label": "结构缺口回退",
+      "role": "return"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "门控主线",
+      "items": [
+        "每阶段产物落盘后由确认坞发起推进，不确认不推进",
+        "确认选项分档：可跳过结构 / 原型直达，也可到原型为止"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "质量内建",
+      "items": [
+        "每个 Agent 每轮内建自评审 + 漏项雷达四档声明",
+        "快速通道省的是逐步确认，不是质量把关"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "回退与治理",
+      "items": [
+        "回退区分修订 / 推翻双模，下游产物自动标记过期",
+        "新想法默认进候选变更池，封板前必须逐条毕业"
+      ]
+    }
+  ]
+}

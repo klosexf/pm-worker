@@ -1,6 +1,6 @@
 # PM Copilot (pm_worker)
 
-> **Local-first AI PM copilot for macOS — clarify → structure → prototype → PRD, with human confirmation gates. BYOK, zero account, zero telemetry.**
+> **Local-first full-process AI PM agent for macOS — clarify → structure → prototype → PRD, with human confirmation gates. BYOK, zero account, zero telemetry.**
 
 <!-- Badges — placeholders, do not fabricate.
 Uncomment and fill in once the corresponding services actually exist:
@@ -33,7 +33,7 @@ Every agent output ends with a **gap radar** (✅ covered / ❓ possibly missing
 ## Why
 
 - **The filesystem is the source of truth, not a database black box.** Projects, versions, decisions (`decisions.jsonl`), risks (`risks.jsonl`) and prototypes are open-format files in a visible directory tree. Edit them in Finder — that's a legal operation, and the index rebuilds from files.
-- **Human confirmation gates, not autopilot.** Nothing advances without you: the clarification table, the structure, and the prototype each gate the next stage. The PRD may only describe the structure and prototype you confirmed — no invented features.
+- **You set the goal; it does the work.** It is an agent: it plans, decomposes tasks, calls the right skills and tools, and self-corrects on feedback. You weigh in at two kinds of moments only — defining the goal, and calibrating direction at irreversible checkpoints (the clarification table, the structure, and the prototype each gate the next stage). Everything between those checkpoints — planning, task breakdown, tool calls, corrections — runs on its own. The PRD may only describe the structure and prototype you confirmed — no invented features.
 - **Self-review is built into every round, and it is honest about what it can't know.** The four-tier radar states what was covered, what still needs input, what was deliberately skipped, and which single assumption would sink the whole output. 💀 can legitimately be empty — filling it for the sake of it is forbidden by design.
 - **Explainable context with progressive disclosure and scope isolation.** Only metadata of the 14 bundled methodology skills (KANO, RICE, JTBD …) is resident; a skill's body loads only when matched. Scope filtering (version > project > global) happens in the retrieval layer, not in a prompt. The ⌘D developer inspector shows the *unmatched* skill list and cross-project filter counts — "what didn't happen" is provable on screen.
 - **Open via MCP.** The same pipeline can be driven from Claude Desktop or Cursor over a local stdio server (6 tools, async tasks).
@@ -228,4 +228,4 @@ MIT — the `LICENSE` file lands with the M5 release.
 
 ---
 
-PM Copilot is a documentation-driven build: [PRD.md](PRD.md) (product requirements, 26 acceptance criteria), [design.md](design.md) (architecture, 27 eval items, decision records) and [skills-inventory.md](skills-inventory.md) (the bundled skill catalog) are all in this repo. 中文文档见 [README.zh-CN.md](README.zh-CN.md)。
+PM Copilot is a documentation-driven build: [PRD.md](PRD.md) (product requirements, 41 acceptance criteria), [design.md](design.md) (architecture, 39 eval items, decision records) and [skills-inventory.md](skills-inventory.md) (the bundled skill catalog) are all in this repo. 中文文档见 [README.zh-CN.md](README.zh-CN.md)。

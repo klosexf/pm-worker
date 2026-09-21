@@ -1,0 +1,344 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "PM Copilot 数据流：上下文组装与本地沉淀",
+    "locale": "zh-CN",
+    "output": "pm-copilot-dataflow.html",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1080,
+      560
+    ],
+    "views": [
+      {
+        "id": "assembly",
+        "label": "上下文组装",
+        "focus": [
+          "umsg",
+          "fref",
+          "kbase",
+          "mem",
+          "ctx"
+        ],
+        "note": "所有注入都经过 ContextBuilder 单一组装点，受 token 预算约束。"
+      },
+      {
+        "id": "landing",
+        "label": "落盘事实源",
+        "focus": [
+          "agent",
+          "src"
+        ],
+        "note": "产物写后校验落盘；决策、风险、事件以 JSONL 追加。"
+      },
+      {
+        "id": "flywheel",
+        "label": "沉淀飞轮",
+        "focus": [
+          "agent",
+          "mem",
+          "ctx"
+        ],
+        "note": "结论与约束随对话沉淀进记忆池，下一轮再注入，读写双向闭环。"
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "输入"
+    },
+    {
+      "label": "组装"
+    },
+    {
+      "label": "生成"
+    },
+    {
+      "label": "事实源落盘"
+    },
+    {
+      "label": "消费"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "umsg",
+      "type": "external",
+      "label": "用户消息",
+      "sublabel": "诉求 · 作答 · 裁决",
+      "stage": 0,
+      "row": 0
+    },
+    {
+      "id": "fref",
+      "type": "database",
+      "label": "本地文件引用",
+      "sublabel": "反幻觉约束",
+      "stage": 0,
+      "row": 2
+    },
+    {
+      "id": "kbase",
+      "type": "database",
+      "label": "技能 / 卡片库",
+      "sublabel": "仅元数据常驻",
+      "stage": 1,
+      "row": 0,
+      "tag": "渐进披露"
+    },
+    {
+      "id": "ctx",
+      "type": "backend",
+      "label": "ContextBuilder",
+      "sublabel": "单一组装点",
+      "stage": 1,
+      "row": 1,
+      "tag": "token 预算"
+    },
+    {
+      "id": "mem",
+      "type": "database",
+      "label": "项目 / 全局记忆池",
+      "sublabel": "覆盖语义 · 碑文回链",
+      "stage": 1,
+      "row": 2,
+      "tag": "memory.jsonl"
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "OpenAI 兼容端点",
+      "sublabel": "SSE 流式",
+      "stage": 2,
+      "row": 0,
+      "tag": "BYOK"
+    },
+    {
+      "id": "agent",
+      "type": "backend",
+      "label": "四阶段 Agent",
+      "sublabel": "内建自评审 · 漏项雷达",
+      "stage": 2,
+      "row": 2
+    },
+    {
+      "id": "src",
+      "type": "database",
+      "label": "~/PMAgent/ 事实源",
+      "sublabel": "产物 + JSONL 追加",
+      "stage": 3,
+      "row": 1,
+      "tag": "开放格式"
+    },
+    {
+      "id": "uiv",
+      "type": "frontend",
+      "label": "三栏界面",
+      "sublabel": "预览 · 检查器",
+      "stage": 4,
+      "row": 0
+    },
+    {
+      "id": "idx",
+      "type": "database",
+      "label": "SQLite 索引",
+      "sublabel": "删库可重建",
+      "stage": 4,
+      "row": 1
+    },
+    {
+      "id": "mcpn",
+      "type": "messagebus",
+      "label": "MCP 六工具",
+      "sublabel": "异步任务轮询",
+      "stage": 4,
+      "row": 2
+    }
+  ],
+  "flows": [
+    {
+      "id": "umsg-ctx",
+      "from": "umsg",
+      "to": "ctx",
+      "label": "诉求与裁决",
+      "classification": "本轮输入",
+      "variant": "emphasis"
+    },
+    {
+      "id": "fref-ctx",
+      "from": "fref",
+      "to": "ctx",
+      "label": "文件内容",
+      "classification": "只依据文件作答"
+    },
+    {
+      "id": "kbase-ctx",
+      "from": "kbase",
+      "to": "ctx",
+      "label": "命中技能正文",
+      "classification": "未命中不注入",
+      "labelDy": 24
+    },
+    {
+      "id": "mem-ctx",
+      "from": "mem",
+      "to": "ctx",
+      "label": "下一轮注入",
+      "classification": "项目 > 全局",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        332,
+        318
+      ]
+    },
+    {
+      "id": "agent-mem",
+      "from": "agent",
+      "to": "mem",
+      "label": "结论沉淀",
+      "classification": "每轮自动",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        422,
+        352
+      ]
+    },
+    {
+      "id": "ctx-llm",
+      "from": "ctx",
+      "to": "llm",
+      "label": "预算内上下文",
+      "classification": "每次请求",
+      "variant": "emphasis"
+    },
+    {
+      "id": "llm-agent",
+      "from": "llm",
+      "to": "agent",
+      "label": "流式输出",
+      "classification": "SSE",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        548,
+        262
+      ]
+    },
+    {
+      "id": "agent-src",
+      "from": "agent",
+      "to": "src",
+      "label": "产物 / 记录落盘",
+      "classification": "写后校验",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        655,
+        316
+      ]
+    },
+    {
+      "id": "src-idx",
+      "from": "src",
+      "to": "idx",
+      "label": "同步索引",
+      "classification": "可全量重建",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        852,
+        300
+      ]
+    },
+    {
+      "id": "src-uiv",
+      "from": "src",
+      "to": "uiv",
+      "label": "预览与档案",
+      "classification": "确定性渲染",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          745,
+          214
+        ],
+        [
+          960,
+          214
+        ]
+      ],
+      "labelAt": [
+        820,
+        206
+      ]
+    },
+    {
+      "id": "idx-uiv",
+      "from": "idx",
+      "to": "uiv",
+      "label": "语义检索",
+      "classification": "< 200ms",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        872,
+        244
+      ]
+    },
+    {
+      "id": "mcpn-agent",
+      "from": "mcpn",
+      "to": "agent",
+      "label": "stdio 触发",
+      "classification": "复用同一流水线",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          960,
+          460
+        ],
+        [
+          530,
+          460
+        ]
+      ],
+      "labelAt": [
+        745,
+        467
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "单一组装点",
+      "items": [
+        "规则、记忆、技能正文、检索与历史都经 ContextBuilder 组装",
+        "渐进披露：未命中的技能正文不进入上下文，可验证"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "事实源不变量",
+      "items": [
+        "产物与记录是 ~/PMAgent/ 下的开放格式文件，写后校验",
+        "SQLite 只是加速索引，删掉后从文件全量重建"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "沉淀飞轮",
+      "items": [
+        "结论、约束随对话沉淀进记忆池，下一轮自动再注入",
+        "记忆新结论覆盖旧结论，失效条目留碑文回链"
+      ]
+    }
+  ]
+}

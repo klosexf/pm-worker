@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "PM Copilot 版本生命周期",
+    "locale": "zh-CN",
+    "output": "pm-copilot-version-lifecycle.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-path",
+        "label": "主线节奏",
+        "focus": [
+          "planning",
+          "running",
+          "gating",
+          "settling",
+          "sealed"
+        ],
+        "note": "从开版本到封板的五个主状态。"
+      },
+      {
+        "id": "recovery",
+        "label": "回退恢复",
+        "focus": [
+          "running",
+          "gating",
+          "rework"
+        ],
+        "note": "回退坞触发重做，重做后重新过闸，不丢状态。"
+      },
+      {
+        "id": "seal-discipline",
+        "label": "封板纪律",
+        "focus": [
+          "settling",
+          "sealed",
+          "running"
+        ],
+        "note": "对账未过回到进行中；封板后目录只读。"
+      }
+    ],
+    "legend": {
+      "mode": "hidden"
+    },
+    "viewBox": [
+      980,
+      566
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "版本阶段"
+    },
+    {
+      "id": "recover",
+      "label": "中断与恢复"
+    }
+  ],
+  "states": [
+    {
+      "id": "planning",
+      "type": "start",
+      "label": "规划中",
+      "sublabel": "定版本号 + 需求清单",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "继承约束",
+      "width": 120
+    },
+    {
+      "id": "running",
+      "type": "active",
+      "label": "进行中",
+      "sublabel": "四阶段流水线",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "多会话并行",
+      "width": 120
+    },
+    {
+      "id": "gating",
+      "type": "decision",
+      "label": "阶段确认门",
+      "sublabel": "不确认不推进",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "确认坞",
+      "width": 120
+    },
+    {
+      "id": "settling",
+      "type": "decision",
+      "label": "封板对账",
+      "sublabel": "变更池毕业 · 风险结算",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "两段式",
+      "width": 120
+    },
+    {
+      "id": "sealed",
+      "type": "success",
+      "label": "已封板",
+      "sublabel": "目录只读 · release-notes",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "逐字一致",
+      "width": 120
+    },
+    {
+      "id": "rework",
+      "type": "failure",
+      "label": "回退重做",
+      "sublabel": "revise / redo 双模",
+      "lane": "recover",
+      "col": 0,
+      "tag": "可恢复",
+      "width": 120
+    }
+  ],
+  "transitions": [
+    {
+      "id": "start-run",
+      "from": "planning",
+      "to": "running",
+      "label": "输入想法",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -45
+    },
+    {
+      "id": "run-gate",
+      "from": "running",
+      "to": "gating",
+      "label": "产物落盘",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -45,
+      "labelDx": -45
+    },
+    {
+      "id": "gate-run",
+      "from": "gating",
+      "to": "running",
+      "label": "确认推进",
+      "route": "bottom-channel",
+      "labelAt": [
+        299,
+        214
+      ],
+      "via": [
+        [
+          402,
+          208
+        ],
+        [
+          248,
+          208
+        ]
+      ],
+      "fromSide": "bottom",
+      "toSide": "bottom"
+    },
+    {
+      "id": "gate-settle",
+      "from": "gating",
+      "to": "settling",
+      "label": "PRD 闭环",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -45
+    },
+    {
+      "id": "settle-sealed",
+      "from": "settling",
+      "to": "sealed",
+      "label": "对账通过",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -45
+    },
+    {
+      "id": "settle-run",
+      "from": "settling",
+      "to": "running",
+      "label": "对账未过",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          556,
+          72
+        ],
+        [
+          248,
+          72
+        ]
+      ],
+      "labelAt": [
+        380,
+        64
+      ]
+    },
+    {
+      "id": "gate-rework",
+      "from": "gating",
+      "to": "rework",
+      "label": "回退坞触发",
+      "labelAt": [
+        424,
+        240
+      ]
+    },
+    {
+      "id": "rework-run",
+      "from": "rework",
+      "to": "running",
+      "label": "重做 + 过期",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          40,
+          307
+        ],
+        [
+          40,
+          345
+        ],
+        [
+          248,
+          345
+        ]
+      ],
+      "labelAt": [
+        110,
+        351
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主线节奏",
+      "items": [
+        "规划中 → 进行中 → 阶段确认门 → 封板对账 → 已封板",
+        "确认坞每版本每阶段只主动弹一次，不确认不推进"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "封板纪律",
+      "items": [
+        "候选变更池未逐条毕业，封板被拦",
+        "封板时风险台账未处置条目统一结算"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "回退与过期",
+      "items": [
+        "回退区分修订 / 推翻双模，下游产物自动标记过期",
+        "快速通道跳过的阶段留痕不产物，可随时补做"
+      ]
+    }
+  ]
+}

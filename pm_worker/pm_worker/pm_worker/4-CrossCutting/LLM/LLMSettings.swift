@@ -212,19 +212,24 @@ nonisolated struct LLMSettings: Codable, Equatable {
     var maxTokensPerRun: Int
     /// 竞品分析搜索源（Task 3.8，SearXNG 兼容 JSON 端点；空 = 不联网）。
     var searchEndpoint: String
+    /// Agent 工具调用总开关（Function Calling v1）：false = 请求不带 tools，
+    /// 行为与旧版完全一致（一键回滚点，PRD §11 V2 路线首项的降级闸）。默认开。
+    var agentToolsEnabled: Bool
 
     init(
         stages: [LLMStage: StageModelConfig],
         models: [ModelProfile] = [],
         activeModelID: String? = nil,
         maxTokensPerRun: Int,
-        searchEndpoint: String = ""
+        searchEndpoint: String = "",
+        agentToolsEnabled: Bool = true
     ) {
         self.stages = stages
         self.models = models
         self.activeModelID = activeModelID
         self.maxTokensPerRun = maxTokensPerRun
         self.searchEndpoint = searchEndpoint
+        self.agentToolsEnabled = agentToolsEnabled
         // 使用中缺省指向首个档案（显式传入优先；不在此处播种——播种只发生在
         // default / load()，构造器保持无副作用，测试手工构造行为可预期）
         if self.activeModelID == nil {
@@ -365,7 +370,7 @@ nonisolated struct LLMSettings: Codable, Equatable {
     // MARK: - Codable 兼容旧存量（多模型字段引入前的 settings.json 无 models / activeModelID）
 
     private enum CodingKeys: String, CodingKey {
-        case stages, models, activeModelID, maxTokensPerRun, searchEndpoint
+        case stages, models, activeModelID, maxTokensPerRun, searchEndpoint, agentToolsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -375,6 +380,7 @@ nonisolated struct LLMSettings: Codable, Equatable {
         activeModelID = try container.decodeIfPresent(String.self, forKey: .activeModelID)
         maxTokensPerRun = try container.decodeIfPresent(Int.self, forKey: .maxTokensPerRun) ?? 500_000
         searchEndpoint = try container.decodeIfPresent(String.self, forKey: .searchEndpoint) ?? ""
+        agentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .agentToolsEnabled) ?? true
     }
 
     // MARK: - 持久化（Application Support，写后回读校验）

@@ -295,7 +295,8 @@ final class ContextBuilder: ObservableObject {
     /// 技能清单（一次读全量启用技能）：id →（doc_path, when_to_use）。
     /// doc_path 供命中 / 判定后加载正文；when_to_use 供判定通道组提示词。
     /// Row 非 Sendable：异步 read 闭包内投影成 Sendable 字典再带出。
-    nonisolated private static func skillCatalog(
+    /// internal：AppModel 工具检索（load_skill）共用同一 catalog 口径。
+    nonisolated static func skillCatalog(
         database: AppDatabase?
     ) async -> [String: (docPath: String, whenToUse: String)] {
         guard let database else { return [:] }
@@ -312,7 +313,8 @@ final class ContextBuilder: ObservableObject {
 
     /// 确定性注入技能的命中计数（技能库 UI 的 hit_count 数据源；口径同 Retriever 语义命中——
     /// 正文实际进了本轮上下文即算命中）。写失败静默：计数是观测数据，不阻塞组装。
-    nonisolated private static func bumpSkillHitCounts(ids: [String], database: AppDatabase?) {
+    /// internal：load_skill 工具把正文拉进对话上下文，同样计数。
+    nonisolated static func bumpSkillHitCounts(ids: [String], database: AppDatabase?) {
         guard let database, !ids.isEmpty else { return }
         try? database.dbQueue.write { db in
             for id in ids {

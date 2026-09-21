@@ -393,6 +393,46 @@ nonisolated enum ArtifactParser {
 
     // MARK: - M3：漏项雷达 / 决策 WHY / 评分卡 / PRD
 
+    /// 本轮任务计划卡（artifact:plan 块，plan-act-reflect 的 plan 段）：
+    /// ②③④ 生成/修订产物的轮次，模型先输出计划再执行——执行顺序、自查锚点
+    /// 对用户可见（思考卡之外的第一个结构化产物）。act = 产物块本体，
+    /// reflect = 既有内建自评审（radar 对照计划逐项自查）。
+    struct PlanCard: Codable, Equatable {
+        struct Step: Codable, Equatable {
+            /// 步骤内容（做什么、产出什么）。
+            var action: String
+            /// 依据（上游产物 / 用户要求，可省略）。
+            var basis: String?
+
+            enum CodingKeys: String, CodingKey {
+                case action = "do"
+                case basis
+            }
+        }
+        /// 本轮任务一句话目标。
+        var mission: String?
+        var steps: [Step]
+    }
+
+    /// 从回复块中解析计划卡（无块或 JSON 不合法 → nil；无有效步骤 → nil）。
+    /// 归一化：步骤 clamp ≤ 8、空步骤丢弃、mission 空白置 nil。
+    static func parsePlan(blocks: [ArtifactBlock]) -> PlanCard? {
+        guard let content = blocks.first(where: { $0.name == "plan" })?.content,
+              var raw = LenientJSON.decode(PlanCard.self, from: content) else {
+            return nil
+        }
+        raw.mission = raw.mission?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.mission?.isEmpty == true { raw.mission = nil }
+        var steps = Array(raw.steps.prefix(8))
+        steps.removeAll {
+            $0.action.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !steps.isEmpty else { return nil }
+        raw.steps = steps
+        return raw
+    }
+
+
     /// 漏项雷达四档声明（artifact:radar 块，design.md §6.2 自评审）。
     struct RadarReport: Codable, Equatable {
         struct Skipped: Codable, Equatable {

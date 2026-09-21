@@ -763,7 +763,10 @@ struct ConversationView: View {
                             .foregroundStyle(Color.ink500)
                     }
                 } else if (stream.think.isEmpty && stream.text.isEmpty) || !stream.think.isEmpty {
-                    ThinkingCard(data: nil, reasoning: stream.think, skills: stream.skills, phases: stream.phaseTrail)
+                    ThinkingCard(
+                        data: nil, reasoning: stream.think, skills: stream.skills,
+                        phases: stream.phaseTrail, toolSteps: stream.toolSteps
+                    )
                 }
                 if !stream.text.isEmpty {
                     // 与最终消息同构的产物渲染；展示正文与产物事实由发布点
@@ -2368,6 +2371,11 @@ struct MessageBubble: View {
                     .frame(height: 1)
                     .padding(.top, DS.Spacing.s4)
             }
+            // 本轮任务计划卡（plan-act-reflect 的 plan 段）：先计划后执行的可见锚点，
+            // 位于正文之前（计划块在回复首部，展示顺序对齐语义）
+            if let plan = ArtifactParser.parsePlan(blocks: blocks) {
+                PlanCardView(plan: plan)
+            }
             // Markdown 渲染：标题/粗斜体/列表/代码块/表格/引用分层排版
             // （散文收在 chatMeasure 阅读栏内，表格/代码/图表留列宽）
             // semanticSections：## 节名渲染成 mono 标签 + hairline（方案 B 语义分节）
@@ -3272,6 +3280,59 @@ private func artifactFileURL(_ name: String, project: String, version: String) -
 /// 不出占位卡——2026-09-15 用户钦定：「XX 已生成」灰胶囊一律不要（雷达 / 决策的
 /// 入账事实由交付回执卡承载，右栏台账亦可查）。**勿恢复胶囊兜底**
 /// （切会话中途完成的回合无回执载荷，旧胶囊正是在这些会话里冒出来）。
+// MARK: - 本轮任务计划卡（plan-act-reflect 的 plan 段）
+
+/// 计划卡：②③④ 生成/修订产物轮次的「先计划后执行」可见锚点。
+/// 零容器降噪基调（与 DutyHandoverBar 同族）：图标行 + 编号步骤列表，
+/// 不与正文抢层级；条目可拖选（不挂 compositing 修饰符）。
+private struct PlanCardView: View {
+    let plan: ArtifactParser.PlanCard
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Spacing.s6) {
+            HStack(spacing: DS.Spacing.s6) {
+                DSIcon(.barList, size: 12)
+                    .foregroundStyle(Color.ink500)
+                Text("本轮计划")
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink500)
+                if let mission = plan.mission, !mission.isEmpty {
+                    Text(mission)
+                        .font(DS.Font.bodyXS)
+                        .foregroundStyle(Color.ink700)
+                        .lineLimit(2)
+                }
+            }
+            VStack(alignment: .leading, spacing: DS.Spacing.s4) {
+                ForEach(Array(plan.steps.enumerated()), id: \.offset) { index, step in
+                    HStack(alignment: .top, spacing: DS.Spacing.s6) {
+                        Text("\(index + 1).")
+                            .font(DS.Font.bodyXS)
+                            .monospacedDigit()
+                            .foregroundStyle(Color.ink300)
+                        VStack(alignment: .leading, spacing: DS.Spacing.s2) {
+                            Text(step.action)
+                                .font(DS.Font.bodyXS)
+                                .foregroundStyle(Color.ink700)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                            if let basis = step.basis,
+                               !basis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text("依据：\(basis)")
+                                    .font(DS.Font.bodyXS)
+                                    .foregroundStyle(Color.ink300)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.leading, DS.Spacing.s16)
+    }
+}
+
 private struct ArtifactBlocksSection: View {
     let blocks: [ArtifactParser.ArtifactBlock]
     var project: String = ""
@@ -3785,6 +3846,10 @@ private struct StreamingContentBody: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Spacing.s8) {
+            // 本轮任务计划卡（流式中与最终消息同位：计划块最先闭合 → 卡先于正文出现）
+            if let plan = ArtifactParser.parsePlan(blocks: blocks) {
+                PlanCardView(plan: plan)
+            }
             if !display.isEmpty {
                 // Markdown 实时渲染（未闭合普通围栏容错到文末）；
                 // liveMermaid = false：流式中的 mermaid 围栏降级为代码块，

@@ -333,6 +333,69 @@ final class AppModel: ObservableObject {
         return doc?.status == .released
     }
 
+    // MARK: - Agent 工具（Function Calling v1，PRD §11 V2 路线首项）
+
+    /// 组装本轮工具运行时。nil = 未启用（总开关关 / anthropic-compat 降级），
+    /// SessionStore 工具循环整体旁路，行为与旧版完全一致。
+    /// 封板判定按 origin 口径（链中途切走不误判当前版本）。
+    private func agentToolRuntime(origin: ReplyOrigin) -> AgentToolRuntime? {
+        guard settings.agentToolsEnabled else { return nil }
+        // anthropic-compat 走 content blocks 协议（非 OpenAI tools 形态），v1 优雅降级
+        guard settings.chatConfig.provider != "anthropic-compat" else { return nil }
+        let context = AgentToolContext(
+            settings: settings,
+            project: origin.project, version: origin.version, sessionId: origin.sessionId,
+            isReleased: isReleased(origin.version, in: origin.project),
+            skillSearch: { [weak self] query in
+                await self?.toolSkillSearch(query) ?? []
+            },
+            submitAnalysis: { [weak self] topic in
+                self?.submitBranchConfirmation(
+                    topic: topic, project: origin.project,
+                    version: origin.version, sessionId: origin.sessionId
+                )
+            }
+        )
+        let registry = AgentToolRegistry(tools: [
+            LoadSkillTool(), WebSearchTool(), ProposeAnalysisTool(), DependencyQueryTool(),
+        ])
+        return AgentToolRuntime(registry: registry, context: context)
+    }
+
+    /// load_skill 工具的技能检索：语义命中（与系统注入同源）→ (id, docPath)。
+    /// scope：skills 表无项目维度（全局技能库），无跨项目泄漏面。
+    private func toolSkillSearch(_ query: String) async -> [(id: String, docPath: String)] {
+        guard let database else { return [] }
+        let catalog = await ContextBuilder.skillCatalog(database: database)
+        guard !catalog.isEmpty else { return [] }
+        let retriever = Retriever(database: database, embedder: SettingsBackedEmbedder(settings: settings))
+        guard let trace = try? await retriever.search(
+            query: query, project: pipeline.project, topK: 3,
+            skillQuery: query, countsSkillHits: true
+        ) else { return [] }
+        let hits = trace.hits.filter { $0.library == .skills }
+        let loaded = hits.compactMap { hit -> (id: String, docPath: String)? in
+            guard let entry = catalog[hit.id] else { return nil }
+            return (id: hit.id, docPath: entry.docPath)
+        }
+        // 命中口径同注入：正文实际进本轮上下文（工具回流）即计数
+        if !loaded.isEmpty {
+            await ContextBuilder.bumpSkillHitCounts(ids: loaded.map(\.id), database: database)
+        }
+        return loaded
+    }
+
+    /// 发起竞品分析确认卡（既有分支通道的唯一提交口）：用户意图命中与模型
+    /// 工具调用（propose_competitive_analysis）共用。设置关闸不影响工具提议——
+    /// 模型提议必须经用户裁决，比用户自发意图更需确认。
+    private func submitBranchConfirmation(topic: String, project: String, version: String, sessionId: String) {
+        pendingBranchConfirmation = PendingBranchConfirmation(
+            sessionId: sessionId, topic: topic,
+            project: project, version: version
+        )
+    }
+
+
     /// 新建任务页发送：首条消息落盘后跳转对话（① 澄清起步）。
     /// version 为 nil 落「默认无版本号」（unversioned）；显式选择版本则
     /// 作为本次对话的迭代基底（新建任务页「关联版本」chip，方案 A）。
@@ -717,6 +780,7 @@ final class AppModel: ObservableObject {
         userMessage: String? = nil,
         origin: ReplyOrigin? = nil,
         volatileTail: String = "",
+        toolsSection: Bool = false,
         promptBuilder: @escaping (String) -> String
     ) async -> (prompt: String, skills: [String]) {
         let effectiveOrigin = origin ?? ReplyOrigin(
@@ -776,9 +840,12 @@ final class AppModel: ObservableObject {
         default:
             supersedable = ""
         }
-        let tailParts = [volatileTail, assembly.injectionText, supersedable]
+        var tailParts = [volatileTail, assembly.injectionText, supersedable]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        // Function Calling 工具说明（toolsSection = runtime 非空）：随尾条下发，
+        // 与实际可调用性同真同假（runtime nil 时说明也不注入，防模型空转）。
+        if toolsSection { tailParts.append(AgentPrompts.agentToolUsageSection) }
         return (
             ContextTail.compose(system: assembly.systemPrompt, tail: tailParts.joined(separator: "\n\n")),
             assembly.skillIds
@@ -905,9 +972,9 @@ final class AppModel: ObservableObject {
             let stagedBranch = sessionStore.stageOutgoingUser(text)
             try? sessionStore.append(stagedBranch)
             if AnalysisRunner.confirmBeforeRunEnabled {
-                pendingBranchConfirmation = PendingBranchConfirmation(
-                    sessionId: sessionStore.sessionId, topic: text,
-                    project: project, version: version
+                submitBranchConfirmation(
+                    topic: text, project: project,
+                    version: version, sessionId: sessionStore.sessionId
                 )
             } else {
                 // 分支入口快照 origin：后台 Task 起跑时用户可能已切走
@@ -973,6 +1040,9 @@ final class AppModel: ObservableObject {
         let stagedUser = sessionStore.stageOutgoingUser(
             text, imageFiles: imageFiles, fileRefs: fileRefs
         )
+        // Agent 工具运行时（Function Calling v1）：总开关 / provider 降级在此收口；
+        // nil = 本轮不带 tools（SessionStore 行为与旧版完全一致）。
+        let agentRuntime = agentToolRuntime(origin: origin)
         sessionStore.beginPreparingReply(sessionID: sessionStore.sessionId, origin: origin.storeOrigin)
 
         switch stage {
@@ -993,7 +1063,8 @@ final class AppModel: ObservableObject {
                 volatileTail: AgentPrompts.clarifyStateSection(
                     rounds: rounds, limit: roundLimit,
                     previousTable: previousTable, amending: amending
-                )
+                ),
+                toolsSection: agentRuntime != nil
             ) { injection in
                 AgentPrompts.clarify(injection: injection)
             }
@@ -1002,7 +1073,8 @@ final class AppModel: ObservableObject {
                 systemPrompt: clarifyPrompt.prompt, imageFiles: imageFiles,
                 fileRefs: fileRefs, skills: clarifyPrompt.skills,
                 knowledgeRefs: knowledgeRefsFromAssembly(),
-                stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin
+                stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin,
+                tools: agentRuntime
             ) { [weak self] reply, _ in
                 self?.handleClarifyTurn(reply, origin: origin)
             }
@@ -1027,7 +1099,10 @@ final class AppModel: ObservableObject {
             // 不断言修改/讨论意图——消息类型判定交给模型）。streamReply 收尾统一清键，
             // 无需手动清理。
             sessionStore.setStreamPhase("正在处理结构产物请求…", for: origin.sessionId)
-            let structurePrompt = await assembleSystemPrompt(stage: .structure, userMessage: text, origin: origin) { injection in
+            let structurePrompt = await assembleSystemPrompt(
+                stage: .structure, userMessage: text, origin: origin,
+                toolsSection: agentRuntime != nil
+            ) { injection in
                 AgentPrompts.structure(
                     clarification: clarification,
                     previousArtifacts: draftStage != nil
@@ -1043,7 +1118,8 @@ final class AppModel: ObservableObject {
                 systemPrompt: structurePrompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
                 imageFiles: imageFiles, fileRefs: fileRefs, skills: structurePrompt.skills,
                 knowledgeRefs: knowledgeRefsFromAssembly(),
-                stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin
+                stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin,
+                tools: agentRuntime
             ) { [weak self] reply, _ in
                 self?.handleAssistantReply(reply, origin: origin)
             }
@@ -1063,14 +1139,17 @@ final class AppModel: ObservableObject {
                 return
             }
             sessionStore.setStreamPhase("正在处理原型请求…", for: origin.sessionId)
-            let prompt = await prototypePrompt(userMessage: text, origin: origin)
+            let prompt = await prototypePrompt(
+                userMessage: text, origin: origin, toolsEnabled: agentRuntime != nil
+            )
             await sessionStore.send(
                 text, settings: settings, stage: .prototype,
                 systemPrompt: prompt.prompt, maxTokens: LLMClient.artifactMaxTokens,
                 imageFiles: imageFiles, fileRefs: fileRefs, skills: prompt.skills,
                 knowledgeRefs: knowledgeRefsFromAssembly(),
                 stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin,
-                prototypeSnapshot: prompt.snapshot
+                prototypeSnapshot: prompt.snapshot,
+                tools: agentRuntime
             ) { [weak self] reply, prototypeSnapshot in
                 self?.handleAssistantReply(reply, origin: origin, prototypeSnapshot: prototypeSnapshot)
             }
@@ -1105,7 +1184,8 @@ final class AppModel: ObservableObject {
                     sessionStore.setStreamPhase("正在处理 PRD 请求…", for: origin.sessionId)
                     let prdIterationPrompt = await prdSystemPrompt(
                         tier: currentPRDTier ?? "standard",
-                        userMessage: text, origin: origin
+                        userMessage: text, origin: origin,
+                        toolsEnabled: agentRuntime != nil
                     )
                     let previousPRD = Self.readArtifact(
                         project: project, version: version, rel: ArtifactPath.prd
@@ -1128,7 +1208,8 @@ final class AppModel: ObservableObject {
                         imageFiles: imageFiles, fileRefs: fileRefs,
                         skills: prdIterationPrompt.skills,
                         knowledgeRefs: knowledgeRefsFromAssembly(),
-                        stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin
+                        stagedUserEntry: stagedUser, pinnedOrigin: origin.storeOrigin,
+                        tools: agentRuntime
                     ) { [weak self] reply, _ in
                         self?.handleAssistantReply(reply, origin: origin)
                     }
@@ -2047,7 +2128,8 @@ final class AppModel: ObservableObject {
                     )
                 )
             }
-            let registered = registerFatalRisks(radar.fatal ?? [], stageKey: stageKey)
+            let freshRisks = registerFatalRisks(radar.fatal ?? [], stageKey: stageKey)
+            let registered = freshRisks.count
 
             // 里程碑：自评审入账行（2026-09-18 合并——💀 风险与 ❓/⏭️ 新增同轮同源、
             // 同落点右栏「风险」，拆两行读感重复）：有新登记走琥珀「风险 +N 条」行，
@@ -2086,6 +2168,14 @@ final class AppModel: ObservableObject {
                     )
                 )
             }
+            // Agent 主动简报（三步走 ③）：新风险登记成功即发起主动回合——
+            // 台账行只呈现事实，简报把「为什么值得关注 / 建议怎么处理」讲给人听。
+            // 发起即忘（不排队不重试——简报是增值不是必需，闸门不满足即放弃防打扰）。
+            if !freshRisks.isEmpty {
+                scheduleProactiveRiskBriefing(
+                    freshRisks, project: project, version: version
+                )
+            }
         }
 
         // 决策 WHY：三判据关键决策 append-only 落盘（E14）
@@ -2122,18 +2212,18 @@ final class AppModel: ObservableObject {
     /// B3 事件驱动（2026-09-16）：与台账全量 hypothesis 归一化去重——模型每轮
     /// 重播的 💀 不再重复登记、不再重复占对话流（字面归一化挡重播；文本有变
     /// 的复发视作新致命假设照常登记）。
-    /// - Returns: 实际新登记条数（重播被去重后可为 0）。
+    /// - Returns: 实际新登记的记录（重播被去重后可为空；主动简报轮的数据源）。
     private func registerFatalRisks(
         _ fatals: [ArtifactParser.RadarReport.Fatal], stageKey: String
-    ) -> Int {
-        guard !fatals.isEmpty else { return 0 }
+    ) -> [RiskRecord] {
+        guard !fatals.isEmpty else { return [] }
         let fresh = ArtifactParser.newFatals(
             current: fatals, existingHypotheses: risks.risks.map(\.hypothesis)
         )
-        guard !fresh.isEmpty else { return 0 }
+        guard !fresh.isEmpty else { return [] }
         let version = pipeline.version
         let stage = RiskRecord.Stage(rawValue: stageKey) ?? .prd
-        var registered = 0
+        var registered: [RiskRecord] = []
         for fatal in fresh {
             let record = RiskRecord(
                 version: version, stage: stage,
@@ -2145,7 +2235,7 @@ final class AppModel: ObservableObject {
             )
             do {
                 try risks.append(record)
-                registered += 1
+                registered.append(record)
             } catch {
                 try? sessionStore.append(
                     sessionStore.makeEntry(
@@ -2154,10 +2244,99 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        guard registered > 0 else { return 0 }
+        guard !registered.isEmpty else { return [] }
         // 广播刷新（右栏风险台账实时跟随自评审登记；对话流行由调用方合并发射）
         NotificationCenter.default.post(name: Notification.Name("pm.worker.risks.changed"), object: nil)
         return registered
+    }
+
+    // MARK: - Agent 主动简报（三步走 ③：风险登记 / 变更池催办）
+
+    /// 已主动催办的变更池签名（project|version|池内提案 id 集）：同池不重复催办，
+    /// 池内容变化（新提案进池 / 处置后再拦）才重新简报。
+    private var poolBriefingSignatures: Set<String> = []
+
+    /// 💀 新登记后的主动风险简报：登记成功即发起一轮 Agent 主动回合
+    ///（sendSystemTurn 合成指令，不落盘为用户消息；不带工具不带原型快照）。
+    /// 闸门：版本未封板、版本无在途流、非快速通道进行中、无采纳落实在途。
+    /// 拦截即放弃——台账与雷达行已承载事实，简报是增值不是必需，不排队不重试防打扰。
+    private func scheduleProactiveRiskBriefing(
+        _ records: [RiskRecord], project: String, version: String
+    ) {
+        guard !records.isEmpty else { return }
+        guard !isReleased(version, in: project) else { return }
+        guard !sessionStore.isVersionBusy(project: project, version: version) else { return }
+        let origin = ReplyOrigin(
+            project: project, version: version, sessionId: sessionStore.sessionId,
+            stage: pipeline.stage
+        )
+        guard !fastForwardVersions.contains(VersionKey(origin)),
+              riskImplementationInFlight[VersionKey(origin)] == nil else { return }
+        let task = AgentPrompts.riskBriefingTask(records: records)
+        let stage = LLMStage(rawValue: origin.stage.rawValue) ?? .clarify
+        Task { [weak self] in
+            guard let self else { return }
+            // 竞态兜底：登记与简报起跑间用户可能已发新消息——发起会话忙即放弃
+            guard !self.sessionStore.isSessionBusy(origin.sessionId) else { return }
+            let prompt = await self.assembleSystemPrompt(
+                stage: stage, userMessage: task, origin: origin
+            ) { injection in
+                AgentPrompts.riskBriefingSystem(injection: injection)
+            }
+            await self.sessionStore.sendSystemTurn(
+                note: nil, userPrompt: task,
+                settings: self.settings, stage: stage,
+                systemPrompt: prompt.prompt, skills: prompt.skills,
+                pinnedOrigin: origin.storeOrigin
+            ) { [weak self] reply, _ in
+                self?.handleAssistantReply(reply, origin: origin)
+            }
+        }
+    }
+
+    /// 封板被池内未处置想法拦截时的主动催办（Agent 主动发起回合）：逐条给
+    /// 处置建议（纳入后续 / 放弃 / 顺延），推动池子清零——封板闸的前置条件。
+    /// 会话锚点 = 版本最近一条 assistant 回合所在会话（gateOwnerSession ① 口径）；
+    /// 同池签名去重；拦截即放弃（不排队不重试）。
+    func schedulePoolGraduationBriefing(project: String, version: String) {
+        let items = ChangeLedger.load(project: project, version: version).filter(\.isPooled)
+        guard !items.isEmpty else { return }
+        let signature = "\(project)|\(version)|\(items.map(\.id).joined(separator: ","))"
+        guard !poolBriefingSignatures.contains(signature) else { return }
+        guard !isReleased(version, in: project) else { return }
+        guard !sessionStore.isVersionBusy(project: project, version: version) else { return }
+        guard let sessionId = Self.gateOwnerSession(
+            project: project, version: version, stage: .clarify
+        ) else { return }
+        let originStage: PipelineRun.Stage
+        if pipeline.project == project, pipeline.version == version {
+            originStage = pipeline.stage
+        } else {
+            originStage = PipelineEngine(project: project, version: version, database: database).stage
+        }
+        let origin = ReplyOrigin(
+            project: project, version: version, sessionId: sessionId, stage: originStage
+        )
+        poolBriefingSignatures.insert(signature)
+        let task = AgentPrompts.poolGraduationTask(items: items)
+        let stage = LLMStage(rawValue: origin.stage.rawValue) ?? .clarify
+        Task { [weak self] in
+            guard let self else { return }
+            guard !self.sessionStore.isSessionBusy(origin.sessionId) else { return }
+            let prompt = await self.assembleSystemPrompt(
+                stage: stage, userMessage: task, origin: origin
+            ) { injection in
+                AgentPrompts.poolGraduationSystem(injection: injection)
+            }
+            await self.sessionStore.sendSystemTurn(
+                note: nil, userPrompt: task,
+                settings: self.settings, stage: stage,
+                systemPrompt: prompt.prompt, skills: prompt.skills,
+                pinnedOrigin: origin.storeOrigin
+            ) { [weak self] reply, _ in
+                self?.handleAssistantReply(reply, origin: origin)
+            }
+        }
     }
 
     // MARK: - 风险采纳落实（台账 → 对话闭环，2026-09-17 消息化模型）
@@ -2391,7 +2570,10 @@ final class AppModel: ObservableObject {
     /// - Parameter userMessage: 本轮用户消息（技能意图路由；系统轮闸口生成传 nil）。
     /// - Returns: snapshot = 槽位相对路径 → 全文 SHA256（阶段 4 冲突检测快照：
     ///   与 prompt 注入同一次读盘取得，保证「模型看到的」与「落盘校验的」同源）。
-    private func prototypePrompt(userMessage: String? = nil, origin: ReplyOrigin? = nil) async -> (
+    private func prototypePrompt(
+        userMessage: String? = nil, origin: ReplyOrigin? = nil,
+        toolsEnabled: Bool = false
+    ) async -> (
         prompt: String, skills: [String], snapshot: [String: String]?
     ) {
         // origin 口径（M4）：产物基底读 origin 版本目录（链中途切走不读错版本）；
@@ -2409,7 +2591,10 @@ final class AppModel: ObservableObject {
         let snapshot = isDraft
             ? nil
             : Dictionary(uniqueKeysWithValues: bases.map { ($0.relPath, $0.sha) })
-        let assembled = await assembleSystemPrompt(stage: .prototype, userMessage: userMessage, origin: origin) { injection in
+        let assembled = await assembleSystemPrompt(
+            stage: .prototype, userMessage: userMessage, origin: origin,
+            toolsSection: toolsEnabled
+        ) { injection in
             AgentPrompts.prototype(
                 modulePageMap: map, coreFlows: flows,
                 previousPrototypes: bases.map { (label: $0.label, html: $0.html) },
@@ -3317,7 +3502,8 @@ final class AppModel: ObservableObject {
     /// ④ system prompt（读已确认上游产物 + 竞品调研注记 + Context Builder 组装）。
     /// - Parameter userMessage: 本轮用户消息（技能意图路由；系统轮闸口生成传 nil）。
     private func prdSystemPrompt(
-        tier: String, userMessage: String? = nil, origin: ReplyOrigin? = nil
+        tier: String, userMessage: String? = nil, origin: ReplyOrigin? = nil,
+        toolsEnabled: Bool = false
     ) async -> (prompt: String, skills: [String]) {
         // origin 口径（M4）：产物与风险台账读 origin 版本（链中途切走不串版本）
         let project = origin?.project ?? pipeline.project
@@ -3338,7 +3524,10 @@ final class AppModel: ObservableObject {
         let analysis = Self.readArtifact(
             project: project, version: version, rel: ArtifactPath.competitiveAnalysis
         ) ?? ""
-        return await assembleSystemPrompt(stage: .prd, userMessage: userMessage, origin: origin) { injection in
+        return await assembleSystemPrompt(
+            stage: .prd, userMessage: userMessage, origin: origin,
+            toolsSection: toolsEnabled
+        ) { injection in
             AgentPrompts.prd(
                 tier: tier,
                 clarification: clarification,
@@ -3876,11 +4065,21 @@ final class AppModel: ObservableObject {
         return error
     }
 
-    private func presentChangeProposal(_ request: ArtifactParser.BacktrackRequest) {
-        let validatedTarget = request.target.flatMap { Self.backtrackStage($0) }
+    /// 提案登记（LLM backtrack 块 → 变更提案卡）。internal 供测试直调（impacts 纪律降级判据）。
+    func presentChangeProposal(_ request: ArtifactParser.BacktrackRequest) {
+        var validatedTarget = request.target.flatMap { Self.backtrackStage($0) }
         let impacts = (request.impacts ?? [])
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        // impacts 纪律（ArtifactParser.BacktrackRequest 契约的 App 侧落地，防轻描淡写）：
+        // ②/③ 回退建议必须至少引用一个可解析的具体产物（依赖图解析，ArtifactDependencyGraph）；
+        // 解析为零 → 不采信 target（提案卡降级为仅登记，想法级纳入走 ① 增补澄清兜底）。
+        // ① 澄清目标豁免（增补澄清是对话式判断，不依赖产物级影响清单）。
+        if let raw = validatedTarget,
+           let graphStage = ArtifactDependencyGraph.Stage(rawValue: raw.rawValue),
+           ArtifactDependencyGraph.verifiedTarget(graphStage, impacts: impacts) == nil {
+            validatedTarget = nil
+        }
         let idea = [request.idea, request.instruction]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty } ?? "（模型未概述）"
@@ -3902,7 +4101,7 @@ final class AppModel: ObservableObject {
         )
     }
 
-    /// 纳入当前版本（提案卡）：回退状态机 + 诉求透传重生成。
+    /// 纳入当前版本（提案卡）：重规划计划可见化 → 回退状态机 + 诉求透传重生成。
     /// 回退目标缺省回①——想法级纳入先过增补澄清判断可行性（与分诊协议 clarify 语义一致）；
     /// clarify 目标忽略 mode（要点表始终保留作增补基底）。
     func adoptChangeProposal(_ record: ChangeProposalRecord) {
@@ -3913,8 +4112,8 @@ final class AppModel: ObservableObject {
         let target = record.target.flatMap(Self.backtrackStage) ?? .clarify
         guard target != pipeline.stage else { return }
         writeChangeResolution(record.id, .adopted, project: pipeline.project, version: pipeline.version)
-        executeBacktrack(to: target)
         let mode = record.mode?.trimmingCharacters(in: .whitespaces) == "redo" ? "redo" : "revise"
+        executeBacktrack(to: target, mode: mode)
         Task { await regenAfterBacktrack(
             to: target, instruction: record.instruction,
             mode: target == .clarify ? "revise" : mode
@@ -3979,12 +4178,18 @@ final class AppModel: ObservableObject {
 
     // MARK: - 回退回路（Task 3.5：E8 / 过期传播 + 💀 事件结算；变更提案卡纳入 + UI 快捷入口共用）
 
-    /// 回退执行（变更提案卡「纳入」/ UI 快捷按钮触发）：状态机回退 + 💀 事件结算 +
-    /// 分级过期传播。接续动作由 regenAfterBacktrack 完成（structure/prototype 自动重做；
+    /// 回退执行（变更提案卡「纳入」/ UI 快捷按钮触发）：重规划计划可见化 + 状态机回退 +
+    /// 💀 事件结算 + 分级过期传播。接续动作由 regenAfterBacktrack 完成（structure/prototype 自动重做；
     /// clarify 转入对话式增补澄清，AI 先判断新功能可行性再提问）。
+    /// 重规划计划（ArtifactDependencyGraph）折叠进「🔄 已回到」行——先给「将依次重做哪些产物」的
+    /// 确定性计划再执行（计划 → 执行 → 重生成 → 过期清除的闭环起点）；不新发独立系统行
+    /// （新前缀会切断快速通道链游走判定，bugs.md B004 同教训）。
     /// backfill（2026-09-17 路径选择补课）：补做先前跳过的阶段——不结算风险
-    /// （不是「发现缺口」，是主动补全路径），系统行换补做文案。
-    private func executeBacktrack(to target: PipelineRun.Stage, backfill: Bool = false) {
+    /// （不是「发现缺口」，是主动补全路径），系统行换补做文案，且无重规划计划
+    /// （被补做的阶段本无产物，无「失效重做」可言）。
+    private func executeBacktrack(
+        to target: PipelineRun.Stage, mode: String = "revise", backfill: Bool = false
+    ) {
         let source = pipeline.stage
         switch target {
         case .clarify:
@@ -4019,10 +4224,17 @@ final class AppModel: ObservableObject {
             targetName = "③ 原型（PRD 标记过期：局部）"
             tail = backfill ? "——补做先前跳过的路径，马上生成。" : "——马上重做。"
         }
+        let replanSuffix: String
+        if !backfill,
+           let graphStage = ArtifactDependencyGraph.Stage(rawValue: target.rawValue) {
+            replanSuffix = ArtifactDependencyGraph.replanSuffix(target: graphStage, mode: mode) ?? ""
+        } else {
+            replanSuffix = ""
+        }
         try? sessionStore.append(
             sessionStore.makeEntry(
                 role: .system,
-                content: "🔄 已回到 \(targetName)\(tail)"
+                content: "🔄 已回到 \(targetName)\(tail)\(replanSuffix)"
             )
         )
         reloadTree()
@@ -4302,7 +4514,7 @@ final class AppModel: ObservableObject {
               !sessionStore.isVersionBusy(project: pipeline.project, version: pipeline.version),
               pipeline.stage == .prd || pipeline.stage == .prototype,
               target != pipeline.stage else { return }
-        executeBacktrack(to: target)
+        executeBacktrack(to: target, mode: "redo")
         Task { await regenAfterBacktrack(to: target, instruction: nil, mode: "redo") }
     }
 

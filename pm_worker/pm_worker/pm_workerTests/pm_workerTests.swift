@@ -1838,6 +1838,119 @@ final class PipelineM3Tests: XCTestCase {
     }
 
 
+    // MARK: 本轮任务计划卡（artifact:plan，plan-act-reflect 的 plan 段）
+
+    func testParsePlan() {
+        // 无块 → nil
+        XCTAssertNil(ArtifactParser.parsePlan(
+            blocks: ArtifactParser.parseArtifactBlocks(in: "普通回复，没有计划块")
+        ))
+
+        // 合法块：mission + steps（`do` 键解码）；basis 省略兼容
+        let reply = """
+        先规划本轮工作，再动手——
+
+        ```artifact:plan
+        {"mission": "按用户反馈补齐支付流程",
+         "steps": [
+           {"do": "修订核心流程图，补支付失败分支", "basis": "用户 3 轮反馈集中在此"},
+           {"do": "同步更新映射表支付页说明"}
+         ]}
+        ```
+        """
+        let plan = ArtifactParser.parsePlan(
+            blocks: ArtifactParser.parseArtifactBlocks(in: reply)
+        )
+        XCTAssertEqual(plan?.mission, "按用户反馈补齐支付流程")
+        XCTAssertEqual(plan?.steps.count, 2)
+        XCTAssertEqual(plan?.steps[0].action, "修订核心流程图，补支付失败分支")
+        XCTAssertEqual(plan?.steps[0].basis, "用户 3 轮反馈集中在此")
+        XCTAssertNil(plan?.steps[1].basis, "basis 省略 → nil")
+    }
+
+    func testParsePlanNormalization() {
+        // 步数 clamp ≤8、空步骤丢弃、mission 空白置 nil
+        let manyJSON = (1...10).map { i in
+            "{\"do\":\"步骤\(i)\"}"
+        }.joined(separator: ",")
+        let clamped = ArtifactParser.parsePlan(blocks: ArtifactParser.parseArtifactBlocks(in: """
+        ```artifact:plan
+        {"mission": "  ", "steps": [\(manyJSON), {"do": "  "}, {"do": "有效步骤"}]}
+        ```
+        """))
+        XCTAssertEqual(clamped?.steps.count, 8, "步骤 clamp ≤ 8（截前 8 项）")
+        XCTAssertNil(clamped?.mission, "mission 空白置 nil")
+
+        // 无有效步骤 → nil
+        XCTAssertNil(ArtifactParser.parsePlan(blocks: ArtifactParser.parseArtifactBlocks(in: """
+        ```artifact:plan
+        {"mission": "目标", "steps": [{"do": ""}, {"do": " "}]}
+        ```
+        """)))
+    }
+
+    func testPlanSectionInjectedIntoProductionStagesOnly() {
+        // ②③④ 必注（plan-act-reflect），① 澄清是对话阶段不注入
+        let structurePrompt = AgentPrompts.structure(clarification: "要点", injection: "")
+        let prototypePrompt = AgentPrompts.prototype(
+            modulePageMap: "| 模块 | 页面 |", coreFlows: "flowchart TD", injection: ""
+        )
+        let prdPrompt = AgentPrompts.prd(
+            tier: "standard", clarification: "要点", modulePageMap: "| 模块 | 页面 |",
+            architecture: "", coreFlows: "",
+            prototypePages: ["首页"], analysisNotes: "", injection: ""
+        )
+        for (name, prompt) in [("②", structurePrompt), ("③", prototypePrompt), ("④", prdPrompt)] {
+            XCTAssertTrue(prompt.contains("artifact:plan"), "\(name) 提示词含计划卡协议")
+            XCTAssertTrue(prompt.contains("先计划后执行"), "\(name) 计划协议含先计划后执行")
+            XCTAssertTrue(prompt.contains("本轮不产出产物时不输出计划块"), "\(name) 含豁免规则（防仪式化）")
+        }
+        let clarifyPrompt = AgentPrompts.clarify(injection: "")
+        XCTAssertFalse(clarifyPrompt.contains("artifact:plan"), "① 澄清不注入计划协议")
+        // 计划块不在 strip 白名单之外的消费路径——radar/decision 自评块照常不受影响
+        XCTAssertTrue(structurePrompt.contains("artifact:radar"), "② 自评审协议不受影响")
+    }
+
+    // MARK: Agent 主动简报（风险登记 / 变更池催办）
+
+    func testProactiveBriefingPromptsContract() {
+        // 两组主动轮 prompt 的共同契约：注入区接入 + artifact 协议块硬禁令
+        // （简报轮刻意不带产物协议——模型违规输出协议块会触发跨切处理）
+        let injection = "记忆注入样例行"
+        let riskSystem = AgentPrompts.riskBriefingSystem(injection: injection)
+        XCTAssertTrue(riskSystem.contains(injection), "风险简报带注入区")
+        XCTAssertTrue(riskSystem.contains("禁止输出任何 ```artifact: 协议块"), "风险简报禁产物块")
+        XCTAssertTrue(riskSystem.contains("右侧「风险」面板"), "引导到风险台账处置")
+
+        let poolSystem = AgentPrompts.poolGraduationSystem(injection: injection)
+        XCTAssertTrue(poolSystem.contains(injection), "变更池催办带注入区")
+        XCTAssertTrue(poolSystem.contains("禁止输出任何 ```artifact: 协议块"), "变更池催办禁产物块")
+        XCTAssertTrue(poolSystem.contains("决策日志"), "引导到决策日志裁决")
+
+        // 合成指令载荷：风险三要素 + 池内想法逐条呈现
+        let risk = RiskRecord(
+            version: "v1.0", stage: .prd,
+            hypothesis: "用户可能不接受订阅制",
+            impact: "商业化口径塌方",
+            plan: "先出买断 + 订阅双轨验证",
+            originRef: "自评审（prd）"
+        )
+        let riskTask = AgentPrompts.riskBriefingTask(records: [risk])
+        XCTAssertTrue(riskTask.contains("用户可能不接受订阅制"))
+        XCTAssertTrue(riskTask.contains("商业化口径塌方"))
+        XCTAssertTrue(riskTask.contains("先出买断 + 订阅双轨验证"))
+
+        let item = ChangeItem(
+            proposal: ChangeProposalRecord(
+                idea: "加一个消息通知", category: "模块核心", checkpointStage: "prd"
+            ),
+            resolution: .pooled, resolutionNote: nil
+        )
+        let poolTask = AgentPrompts.poolGraduationTask(items: [item])
+        XCTAssertTrue(poolTask.contains("加一个消息通知"))
+        XCTAssertTrue(poolTask.contains("纳入后续版本 / 放弃 / 顺延"))
+    }
+
     // MARK: 澄清问题卡（artifact:question-card）
 
     func testParseQuestionCard() {
@@ -2937,6 +3050,7 @@ final class LLMLiveTests: XCTestCase {
             switch delta {
             case .text(let text): full += text
             case .reasoning(let chunk): reasoning += chunk
+            case .toolCalls: break  // 无工具请求时不可达（穷举完备）
             case .truncated: break
             case .retrying: break  // live 测试不校验重试状态
             }

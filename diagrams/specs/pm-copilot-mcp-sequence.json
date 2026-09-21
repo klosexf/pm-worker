@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "PM Copilot MCP 调用时序",
+    "locale": "zh-CN",
+    "output": "pm-copilot-mcp-sequence.html",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1060,
+      640
+    ],
+    "views": [
+      {
+        "id": "accept",
+        "label": "异步受理",
+        "focus": [
+          "claude",
+          "mcp",
+          "store"
+        ],
+        "note": "前置按主线顺序校验，长任务立即返回 task_id。"
+      },
+      {
+        "id": "shared-pipeline",
+        "label": "同一流水线",
+        "focus": [
+          "mcp",
+          "engine",
+          "agent",
+          "user"
+        ],
+        "note": "外部触发与 App 内运行共享状态机，闸口不豁免。"
+      },
+      {
+        "id": "poll",
+        "label": "轮询取回",
+        "focus": [
+          "claude",
+          "mcp",
+          "store"
+        ],
+        "note": "get_task 轮询状态与结果。"
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "外部 AI 客户端",
+      "sublabel": "Claude / Cursor"
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "MCP Server",
+      "sublabel": "stdio · 6 工具"
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "PipelineEngine",
+      "sublabel": "手写状态机"
+    },
+    {
+      "id": "agent",
+      "type": "backend",
+      "label": "四阶段 Agent",
+      "sublabel": "内建自评审"
+    },
+    {
+      "id": "store",
+      "type": "database",
+      "label": "PMAgentStore",
+      "sublabel": "文件事实源"
+    },
+    {
+      "id": "user",
+      "type": "external",
+      "label": "用户",
+      "sublabel": "App 内确认闸口"
+    }
+  ],
+  "segments": [
+    {
+      "from": 146,
+      "to": 262,
+      "label": "受理"
+    },
+    {
+      "from": 278,
+      "to": 478,
+      "label": "后台执行"
+    },
+    {
+      "from": 494,
+      "to": 592,
+      "label": "轮询取回"
+    }
+  ],
+  "messages": [
+    {
+      "id": "call",
+      "from": "claude",
+      "to": "mcp",
+      "y": 166,
+      "label": "generate_prd(project, version)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "precondition",
+      "from": "mcp",
+      "to": "store",
+      "y": 200,
+      "label": "校验前置：已确认原型",
+      "variant": "security",
+      "note": "缺 confirmed.json 即报错并引导先完成原型确认"
+    },
+    {
+      "id": "accept",
+      "from": "mcp",
+      "to": "claude",
+      "y": 234,
+      "label": "task_id（异步受理）",
+      "variant": "return"
+    },
+    {
+      "id": "dispatch",
+      "from": "mcp",
+      "to": "engine",
+      "y": 306,
+      "label": "复用同一条流水线",
+      "variant": "emphasis"
+    },
+    {
+      "id": "orchestrate",
+      "from": "engine",
+      "to": "agent",
+      "y": 338,
+      "label": "编排当前阶段"
+    },
+    {
+      "id": "land",
+      "from": "agent",
+      "to": "store",
+      "y": 370,
+      "label": "产物落盘（写后校验）",
+      "variant": "emphasis"
+    },
+    {
+      "id": "gate",
+      "from": "engine",
+      "to": "user",
+      "y": 402,
+      "label": "确认坞：阶段推进",
+      "variant": "security"
+    },
+    {
+      "id": "confirm",
+      "from": "user",
+      "to": "engine",
+      "y": 434,
+      "label": "确认 / 继续修改"
+    },
+    {
+      "id": "settle",
+      "from": "engine",
+      "to": "store",
+      "y": 466,
+      "label": "状态与事件落盘"
+    },
+    {
+      "id": "poll",
+      "from": "claude",
+      "to": "mcp",
+      "y": 510,
+      "label": "get_task(task_id)"
+    },
+    {
+      "id": "final",
+      "from": "mcp",
+      "to": "claude",
+      "y": 544,
+      "label": "status / result → PRD 路径",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "mcp",
+      "from": 160,
+      "to": 242,
+      "type": "backend"
+    },
+    {
+      "participant": "store",
+      "from": 194,
+      "to": 208,
+      "type": "database"
+    },
+    {
+      "participant": "engine",
+      "from": 300,
+      "to": 474,
+      "type": "backend"
+    },
+    {
+      "participant": "agent",
+      "from": 332,
+      "to": 378,
+      "type": "backend"
+    },
+    {
+      "participant": "store",
+      "from": 364,
+      "to": 474,
+      "type": "database"
+    },
+    {
+      "participant": "user",
+      "from": 396,
+      "to": 442,
+      "type": "external"
+    },
+    {
+      "participant": "mcp",
+      "from": 504,
+      "to": 552,
+      "type": "backend"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "异步受理",
+      "items": [
+        "前置按主线顺序校验：无已确认原型即报错引导",
+        "长任务立即返回 task_id，连接不等待生成完成"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "同一流水线",
+      "items": [
+        "MCP 触发的运行与 App 内运行共享状态机，界面上可见",
+        "人工确认闸口不因外部调用而豁免"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "轮询取回",
+      "items": [
+        "get_task 轮询状态与结果",
+        "App 重启后未完成任务标记失败，由调用方重试"
+      ]
+    }
+  ]
+}

@@ -39,3 +39,7 @@ PM Copilot 产品全景文档（供外部AI评审）.md
 /设计方案-版本选择入口/
 /主动推荐设计方案/
 /卡片详情排版设计方案/
+
+# 架构图生成产物：只入库 diagrams/specs 源，HTML 成品与截图验证产物本地保留
+diagrams/*.html
+diagrams/*.visual-check.*

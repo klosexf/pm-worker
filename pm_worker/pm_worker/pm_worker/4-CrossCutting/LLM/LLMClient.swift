@@ -8,9 +8,76 @@
 
 import Foundation
 
+/// 动态 JSON 值（工具 JSON Schema 参数定义载体）。MCP SDK 的 Value 是 SDK 内部
+/// 类型不外借，这里自建最小实现（编码解码对称，int/double 分流保整型精度）。
+nonisolated enum JSONValue: Codable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int)
+    case double(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
+        else if let i = try? c.decode(Int.self) { self = .int(i) }
+        else if let d = try? c.decode(Double.self) { self = .double(d) }
+        else if let s = try? c.decode(String.self) { self = .string(s) }
+        else if let a = try? c.decode([JSONValue].self) { self = .array(a) }
+        else if let o = try? c.decode([String: JSONValue].self) { self = .object(o) }
+        else {
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "无法识别的 JSON 值")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .null: try c.encodeNil()
+        case .bool(let b): try c.encode(b)
+        case .int(let i): try c.encode(i)
+        case .double(let d): try c.encode(d)
+        case .string(let s): try c.encode(s)
+        case .array(let a): try c.encode(a)
+        case .object(let o): try c.encode(o)
+        }
+    }
+
+    /// 便捷构造：字符串数组（schema 的 type/enum/required 字段常用）。
+    static func strings(_ values: [String]) -> JSONValue {
+        .array(values.map { .string($0) })
+    }
+}
+
+/// OpenAI 兼容 function 工具定义（请求体 tools 数组元素）。
+nonisolated struct ToolDefinition: Codable, Equatable {
+    struct Function: Codable, Equatable {
+        var name: String
+        var description: String
+        var parameters: JSONValue
+    }
+    var type: String = "function"
+    var function: Function
+
+    init(name: String, description: String, parameters: JSONValue) {
+        self.function = .init(name: name, description: description, parameters: parameters)
+    }
+}
+
+/// 模型发起的一次工具调用（流式分片累积后的完整形态）。
+nonisolated struct LLMToolCall: Codable, Equatable {
+    var id: String
+    var name: String
+    /// arguments 原始 JSON 字符串（原样回传给端点，不做二次编码）。
+    var argumentsJSON: String
+}
+
 nonisolated struct ChatMessage: Codable, Equatable {
     enum Role: String, Codable {
-        case system, user, assistant
+        case system, user, assistant, tool
     }
 
     var role: Role
@@ -21,20 +88,27 @@ nonisolated struct ChatMessage: Codable, Equatable {
     /// 回发，模型免于每轮重新推敲上轮已想清的结论（2026-09-18，opencode /
     /// OpenHands 双印证的做法，DeepSeek 端点收益直接）。nil = 不携带。
     var reasoningContent: String?
+    /// 发起工具调用的 assistant 消息携带（Function Calling 工具轮）。
+    var toolCalls: [LLMToolCall]?
+    /// 工具结果消息（role == .tool）引用的调用 id。
+    var toolCallID: String?
 
     init(
         role: Role, content: String, images: [ChatImage]? = nil,
-        reasoningContent: String? = nil
+        reasoningContent: String? = nil, toolCalls: [LLMToolCall]? = nil,
+        toolCallID: String? = nil
     ) {
         self.role = role
         self.content = content
         self.images = images
         self.reasoningContent = reasoningContent
+        self.toolCalls = toolCalls
+        self.toolCallID = toolCallID
     }
 
-    // Codable 兼容旧存量（无 images / reasoningContent 字段的 JSON）
+    // Codable 兼容旧存量（无 images / reasoningContent / toolCalls 字段的 JSON）
     private enum CodingKeys: String, CodingKey {
-        case role, content, images, reasoningContent
+        case role, content, images, reasoningContent, toolCalls, toolCallID
     }
 
     init(from decoder: Decoder) throws {
@@ -43,6 +117,8 @@ nonisolated struct ChatMessage: Codable, Equatable {
         content = try c.decode(String.self, forKey: .content)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
         reasoningContent = try c.decodeIfPresent(String.self, forKey: .reasoningContent)
+        toolCalls = try c.decodeIfPresent([LLMToolCall].self, forKey: .toolCalls)
+        toolCallID = try c.decodeIfPresent(String.self, forKey: .toolCallID)
     }
 }
 
@@ -61,11 +137,25 @@ nonisolated struct ChatImage: Codable, Equatable {
 nonisolated enum LLMDelta: Equatable {
     case text(String)
     case reasoning(String)
+    /// 模型本轮不产正文、改为发起工具调用（Function Calling）：累积完后的完整调用组。
+    case toolCalls([LLMToolCall])
     /// 流末 finish_reason == "length"：输出撞上 max_tokens 被截断（产物围栏可能未闭合）。
     case truncated
     /// 瞬时故障（429/5xx）自动重试中：响应头阶段已判失败、正文未流出。
     /// 消费方据此在 UI 显示重试状态（重试本身在 LLMClient 内部完成，无需干预）。
     case retrying(code: Int, attempt: Int)
+}
+
+/// 流式 tool_calls 增量分片（OpenAI 兼容格式：index 定位，id/name/arguments 可分片下发）。
+nonisolated struct ToolCallFragment: Codable, Equatable {
+    struct Function: Codable, Equatable {
+        var name: String?
+        var arguments: String?
+    }
+    var index: Int?
+    var id: String?
+    var type: String?
+    var function: Function?
 }
 
 /// 流式末 chunk 携带的 usage（OpenAI 兼容；M5 Task 5.4 成本统计）。
@@ -191,6 +281,21 @@ nonisolated enum LLMClient {
             /// 思考原文回传（DeepSeek reasoning_content）：nil 时字段整体缺席
             ///（synthesized Codable 对 Optional 走 encodeIfPresent），端点零风险。
             var reasoning_content: String? = nil
+            /// 发起工具调用的 assistant 消息携带（Function Calling 工具轮）。
+            var tool_calls: [ToolCall]? = nil
+            /// 工具结果消息（role "tool"）引用的调用 id。
+            var tool_call_id: String? = nil
+        }
+        /// 请求体 tool_calls 元素（assistant 消息回传形态，全字段必填）。
+        struct ToolCall: Codable {
+            var id: String
+            var type: String
+            var function: Function
+
+            struct Function: Codable {
+                var name: String
+                var arguments: String
+            }
         }
         struct StreamOptions: Codable {
             var include_usage: Bool
@@ -205,29 +310,41 @@ nonisolated enum LLMClient {
         /// 思考强度（DeepSeek 思考模式）：nil = 不发送（synthesized Codable
         /// 对 Optional 走 encodeIfPresent，字段整体缺席，走服务端默认档）。
         var reasoning_effort: String? = nil
+        /// 可调用工具集（Function Calling）：nil = 不发送，行为与旧版完全一致。
+        var tools: [ToolDefinition]? = nil
 
         /// ChatMessage → 请求消息：无图保持纯字符串（兼容全部端点）；
-        /// 有图按 [text, image_url…] 顺序展开。
+        /// 有图按 [text, image_url…] 顺序展开；工具轮字段按需携带。
         static func message(from m: ChatMessage) -> Message {
-            guard let images = m.images, !images.isEmpty else {
-                return Message(
+            var msg: Message
+            if let images = m.images, !images.isEmpty {
+                var parts: [MessageContent.ContentPart] = [
+                    .init(type: "text", text: m.content, image_url: nil)
+                ]
+                for image in images {
+                    parts.append(.init(
+                        type: "image_url", text: nil,
+                        image_url: .init(url: image.dataURL)
+                    ))
+                }
+                msg = Message(
+                    role: m.role.rawValue, content: .parts(parts),
+                    reasoning_content: m.reasoningContent
+                )
+            } else {
+                msg = Message(
                     role: m.role.rawValue, content: .text(m.content),
                     reasoning_content: m.reasoningContent
                 )
             }
-            var parts: [MessageContent.ContentPart] = [
-                .init(type: "text", text: m.content, image_url: nil)
-            ]
-            for image in images {
-                parts.append(.init(
-                    type: "image_url", text: nil,
-                    image_url: .init(url: image.dataURL)
-                ))
+            msg.tool_calls = m.toolCalls?.map {
+                ToolCall(
+                    id: $0.id, type: "function",
+                    function: .init(name: $0.name, arguments: $0.argumentsJSON)
+                )
             }
-            return Message(
-                role: m.role.rawValue, content: .parts(parts),
-                reasoning_content: m.reasoningContent
-            )
+            msg.tool_call_id = m.toolCallID
+            return msg
         }
     }
 
@@ -311,7 +428,29 @@ nonisolated enum LLMClient {
         }
     }
 
-    /// 流式对话：逐 token 吐出增量（正文 delta / 思考 reasoning）。
+    /// 纯函数：把流式 tool_calls 分片按 index 合并进累积数组。兼容两种端点形态：
+    /// 增量下发（arguments 分多次 fragment 追加）与单分片全量下发（一次带全）。
+    /// index 缺失按「新调用」处理；name/id 空串不覆盖已有值。测试直测。
+    static func accumulateToolFragments(
+        _ fragments: [ToolCallFragment], into calls: [LLMToolCall]
+    ) -> [LLMToolCall] {
+        var result = calls
+        for f in fragments {
+            let idx = f.index ?? result.count
+            let name = f.function?.name ?? ""
+            let args = f.function?.arguments ?? ""
+            if idx < result.count {
+                if let id = f.id, !id.isEmpty { result[idx].id = id }
+                if !name.isEmpty { result[idx].name = name }
+                result[idx].argumentsJSON += args
+            } else {
+                result.append(LLMToolCall(id: f.id ?? "", name: name, argumentsJSON: args))
+            }
+        }
+        return result
+    }
+
+    /// 流式对话：逐 token 吐出增量（正文 delta / 思考 reasoning / 工具调用组）。
     /// - Parameters:
     ///   - stage: 阶段（取该阶段配置与 API Key）
     ///   - settings: BYOK 设置
@@ -319,13 +458,15 @@ nonisolated enum LLMClient {
     ///   - maxTokens: 单次回复上限
     ///   - reasoningEffort: 思考强度（nil = 不发送，走服务端默认）
     ///   - roundId: 轮次关联 id（usage/probe 归因对齐用；nil = 辅助调用无轮次）
+    ///   - tools: 可调用工具集（Function Calling；nil/空 = 不发送，行为同旧版）
     static func streamChat(
         stage: LLMStage,
         settings: LLMSettings,
         messages: [ChatMessage],
         maxTokens: Int = 4096,
         reasoningEffort: String? = nil,
-        roundId: String? = nil
+        roundId: String? = nil,
+        tools: [ToolDefinition]? = nil
     ) throws -> AsyncThrowingStream<LLMDelta, Error> {
         guard let config = settings.stages[stage] else {
             throw LLMError.missingBaseURL
@@ -351,7 +492,7 @@ nonisolated enum LLMClient {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 120
 
-        let body = RequestBody(
+        var body = RequestBody(
             model: config.model,
             messages: messages.map { RequestBody.message(from: $0) },
             stream: true,
@@ -359,6 +500,7 @@ nonisolated enum LLMClient {
             stream_options: .init(include_usage: true),
             reasoning_effort: reasoningEffort
         )
+        body.tools = (tools?.isEmpty == false) ? tools : nil
         request.httpBody = try JSONEncoder().encode(body)
 
         return AsyncThrowingStream { continuation in
@@ -383,6 +525,7 @@ nonisolated enum LLMClient {
                     var truncated = false   // finish_reason == "length"（撞 max_tokens 截断）
                     var fullText = ""      // 累计正文+思考（usage 缺失时估算 completion 用）
                     var usage: StreamUsage?  // 末 chunk usage（M5 Task 5.4）
+                    var toolFragments: [ToolCallFragment] = []  // tool_calls 分片累积
                     // SSE 解析：每行 "data: {json}"，"[DONE]" 结束
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
@@ -396,10 +539,12 @@ nonisolated enum LLMClient {
                                 struct Delta: Codable {
                                     var content: String?
                                     var reasoningContent: String?
+                                    var toolCalls: [ToolCallFragment]?
 
                                     enum CodingKeys: String, CodingKey {
                                         case content
                                         case reasoningContent = "reasoning_content"
+                                        case toolCalls = "tool_calls"
                                     }
                                 }
                                 var delta: Delta?
@@ -431,13 +576,19 @@ nonisolated enum LLMClient {
                                     fullText += reasoning
                                     continuation.yield(.reasoning(reasoning))
                                 }
+                                if let fragments = delta.toolCalls, !fragments.isEmpty {
+                                    toolFragments += fragments
+                                }
                             }
                         }
                     }
-                    guard received else {
+                    // 工具调用组：分片累积非空 = 模型发起 Function Calling（可零正文）
+                    let toolCalls = accumulateToolFragments(toolFragments, into: [])
+                    guard received || !toolCalls.isEmpty else {
                         // 正文为零时按成因分流：思考分片有 → 思考烧满预算；零分片 → 字面空流
                         throw receivedReasoning ? LLMError.emptyAfterThinking : LLMError.emptyStream
                     }
+                    if !toolCalls.isEmpty { continuation.yield(.toolCalls(toolCalls)) }
                     // 截断信号在用量记录前透出（消费方据此决定是否续写）
                     if truncated { continuation.yield(.truncated) }
                     // 成功路径记一笔用量（失败/空流不记；M5 Task 5.4）；
@@ -535,6 +686,7 @@ nonisolated enum LLMClient {
                     case .text(let text): result += text
                     case .truncated: truncated = true
                     case .reasoning: break
+                    case .toolCalls: break  // 辅助调用不挂工具，此分支不会到达（穷举完备）
                     case .retrying: break  // 无头路径无实时气泡，重试静默进行
                     }
                 }

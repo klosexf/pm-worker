@@ -344,9 +344,13 @@ struct ProjectHomeView: View {
             .buttonStyle(.ds(.ghost, size: .sm))
             if !isUnversioned && !isReleased {
                 Button {
-                    // 毕业仪式闸：池内有未处置条目 → 拦截指引先去处置（不许默认沉淀）
+                    // 毕业仪式闸：池内有未处置条目 → 拦截指引先去处置（不许默认沉淀）；
+                    // 同时 Agent 主动发起催办回合（逐条给处置建议，推动池子清零）
                     if (pooledCounts[version] ?? 0) > 0 {
                         poolBlockVersion = version
+                        model.schedulePoolGraduationBriefing(
+                            project: projectName, version: version
+                        )
                     } else {
                         // 对账前置：一行复盘（变更处置 / 回退 / 闸口 outcome）随第一段确认展示
                         retroLine = ReleaseRetro.load(

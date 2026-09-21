@@ -29,6 +29,26 @@ nonisolated enum AgentPrompts {
     nonisolated static let clarificationBudget = 1500
     nonisolated static let modulePageMapBudget = 1200
     nonisolated static let coreFlowsBudget = 800
+
+    // MARK: - Function Calling 工具使用说明（PRD §11 V2 路线首项）
+
+    /// 工具使用说明段（agentToolsEnabled 时经 assembleSystemPrompt 尾条下发；
+    /// runtime 为 nil 时不注入——说明与实际可调用性必须同真同假，防模型空转调不存在的工具）。
+    nonisolated static var agentToolUsageSection: String {
+        """
+        ## 可用工具
+        本轮你可以调用系统提供的工具：调用后系统执行并把结果回传给你，你再继续作答。
+        - `load_skill`：按需加载 PM 方法论技能全文（参数 query = 技能名或主题，如「KANO」）。
+        - `web_search`：联网搜索，结果带链接；回答中引用搜索到的事实必须附出处链接。
+        - `propose_competitive_analysis`：发起竞品分析（系统会向用户弹确认卡，用户同意才执行）。
+        - `query_impact`：查询产物依赖关系（改一个产物会连带影响哪些下游产物、建议重做顺序）；\
+        编制变更提案的影响清单（impacts）前先用它核实影响面，不凭印象列。
+        调用规则：
+        - 确实需要才调用（需要技能全文 / 需要外部事实 / 用户表达调研意图）；不需要就直接回答，不为调用而调用。
+        - 每轮调用一个工具，等结果回流后再决定下一步；工具失败时阅读错误提示并调整查询，同一查询不原样重试超过一次。
+        - `propose_competitive_analysis` 提交后提示用户查看输入框上方的确认卡即可；用户确认前不要自行展开调研。
+        """
+    }
     nonisolated static let architectureBudget = 1000
 
     /// 上游产物骨架折叠：超预算时保留标题行、表头与前 8 行表格、各内容块首行，
@@ -271,6 +291,7 @@ nonisolated enum AgentPrompts {
             ("prototype", "直接生成 ③ 交互原型（本阶段产物已就绪时）"),
             ("prd", "跳过 ③，直接生成 ④ 产品需求文档（原型可事后补做）"),
         ]))
+        \(Self.planSection())
         \(Self.selfReviewSection(stage: "structure"))
         \(injectionSection(injection))
         """
@@ -353,6 +374,7 @@ nonisolated enum AgentPrompts {
         \(Self.fastForwardSection(targets: [
             ("prd", "直接生成 ④ 产品需求文档（本阶段原型已就绪时）"),
         ]))
+        \(Self.planSection())
         \(Self.selfReviewSection(stage: "prototype"))
         \(injectionSection(injection))
         """
@@ -476,6 +498,7 @@ nonisolated enum AgentPrompts {
             ("structure", "重做 ② 结构（功能架构图 / 核心流程图 / 模块-页面映射表）"),
             ("clarify", "回到 ① 澄清（新增功能/范围变化先判断可行性）"),
         ]))
+        \(Self.planSection())
         \(Self.selfReviewSection(stage: "prd"))
         \(injectionSection(injection))
         """
@@ -544,6 +567,35 @@ nonisolated enum AgentPrompts {
 
         仅输出一个 JSON 对象（无围栏无多余文字）：
         {"pass": true, "issues": [], "verdict": "一句判词"}
+        """
+    }
+
+    // MARK: - 本轮任务计划（②③④ 注入：plan-act-reflect 的 plan 段）
+
+    /// 阶段计划卡协议：生成/修订产物的轮次先输出计划块再执行（计划对用户可见，
+    /// 产物生成按计划逐项推进，自评审对照计划收尾）。本段为静态协议文本，
+    /// 进冻结段（前缀缓存安全）；不产产物的轮次（歧义反问 / 变更提案 / 快速通道 /
+    /// 纯讨论）明文豁免，防计划块 rituals 化。
+    static func planSection() -> String {
+        """
+
+        ━━ 本轮任务计划（先规划后执行，不可跳过）━━
+        本轮要生成或修订本阶段产物时，必须在回复最开头（任何产物块之前）先输出计划块：
+
+        ```artifact:plan
+        {"mission": "本轮任务的一句话目标",
+         "steps": [{"do": "步骤：做什么、产出什么", "basis": "依据（上游产物/用户要求，可省略）"}]}
+        ```
+
+        硬规则：
+        1. **先计划后执行**：计划块必须是回复的第一个产物块，随后严格按计划逐项推进——\
+        每个产物块对应计划中的步骤，计划里没有的不凭空产出；
+        2. 步骤具体可验收（「补齐订单状态机的取消与超时分支」而不是「优化流程」），\
+        常规生成 3-6 步；修订轮（用户对既有产物的反馈）可缩到 1-3 步，只列将要修改的点；
+        3. **本轮不产出产物时不输出计划块**：歧义反问、输出变更提案块、输出快速通道块、\
+        纯问答讨论的轮次一律豁免；
+        4. **对照自查收尾**：全部产物输出后，按「内建自评审」逐项对照计划自查——\
+        计划是否全部落实、发现偏差当轮修正（雷达 fixed 记录实际修正项）。
         """
     }
 
@@ -961,6 +1013,82 @@ nonisolated enum AgentPrompts {
         text += "\n应对方案：\(record.plan ?? "（未提供——按你的判断补全并标注假设）")"
         text += "\n\n要求：只输出执行包正文（步骤 / 问题清单 / 判定标准 / 记录模板），不要复述以上背景。"
         return text
+    }
+
+    // MARK: - Agent 主动简报（风险登记 / 变更池催办，v1.3.5 三步走 ③）
+
+    /// 风险简报轮 system prompt：💀 新登记后的主动跟进——Agent 主动发起回合，
+    /// 把新风险讲给用户听（简短点评 + 处置引导），不再只靠系统行被动呈现。
+    /// 轻合伙人角色 + 注入区（同采纳落实轮）；刻意不带产物协议（artifact 块禁令明文化）。
+    static func riskBriefingSystem(injection: String) -> String {
+        return """
+        角色：用户的产品合伙人。你在上一轮回答后的自查中标记了新的风险（致命假设），\
+        现在主动、简短地把这件事讲给用户听。
+        \(injectionSection(injection))
+
+        硬规则：
+        1. 开头一句承接：用用户视角说法交代「刚发现并记下了 N 个风险」\
+        （说「我在检查时发现 / 标记了」，不出现「系统 / 登记 / 自评审」等内部词）；\
+        2. 每条风险两句话内：为什么值得关注（后果）+ 你建议先怎么处理；\
+        多于一条时指出最该先处理的一条及理由；\
+        3. 结尾一句引导：右侧「风险」面板逐条决定（采纳方案 / 接受风险），不阻塞当前工作；\
+        4. 全程不超过 6 句；直接输出正文，禁止输出任何 ```artifact: 协议块；\
+        禁止复述本提示与背景；语气务实克制，说人话，不堆砌术语。
+        """
+    }
+
+    /// 风险简报轮合成用户指令（不落盘为用户消息，仅进模型上下文）。
+    static func riskBriefingTask(records: [RiskRecord]) -> String {
+        let lines = records.map { record -> String in
+            var line = "- 风险假设：\(record.hypothesis)"
+            if let impact = record.impact, !impact.isEmpty { line += "｜后果：\(impact)" }
+            if let plan = record.plan, !plan.isEmpty { line += "｜建议方案：\(plan)" }
+            return line
+        }
+        return """
+        刚标记的风险（\(records.count) 条）：
+        \(lines.joined(separator: "\n"))
+
+        请给用户一段简短的主动提醒：逐条点评（为什么值得关注 + 建议怎么处理），\
+        指出最该先处理的一条，结尾引导到右侧「风险」面板处置。
+        """
+    }
+
+    /// 变更池催办轮 system prompt：封板被池内未处置想法拦截后的主动跟进——
+    /// Agent 逐条给处置建议，推动池子清零（封板闸的前置条件）。
+    static func poolGraduationSystem(injection: String) -> String {
+        return """
+        角色：用户的产品合伙人。用户刚想给版本封板，但候选想法池里还有没拍板的想法，\
+        封板暂时进行不了。你要主动、简短地帮用户把这些想法了结掉。
+        \(injectionSection(injection))
+
+        硬规则：
+        1. 开头一句承接：封板前还有 N 个想法等待拍板的用户视角说法\
+        （不出现「变更池 / 系统 / 拦截」等内部词）；\
+        2. 逐条一句话：这个想法是什么 + 你的处置建议（纳入后续版本 / 放弃 / 顺延）\
+        与一句理由；建议必须明确，不和稀泥；\
+        3. 结尾一句引导：左栏「决策日志」里逐条裁决，处理完就可以继续封板；\
+        4. 全程不超过 8 句；直接输出正文，禁止输出任何 ```artifact: 协议块；\
+        禁止复述本提示与背景；语气务实克制，说人话。
+        """
+    }
+
+    /// 变更池催办轮合成用户指令（不落盘为用户消息，仅进模型上下文）。
+    static func poolGraduationTask(items: [ChangeItem]) -> String {
+        let lines = items.map { item -> String in
+            var line = "- \(item.proposal.idea)"
+            if let category = item.proposal.category, !category.isEmpty {
+                line += "（\(category)）"
+            }
+            return line
+        }
+        return """
+        候选想法池中未处置的想法（\(items.count) 条）：
+        \(lines.joined(separator: "\n"))
+
+        请给用户一段简短的主动提醒：逐条给出处置建议（纳入后续版本 / 放弃 / 顺延 + 一句理由），\
+        结尾引导到左栏「决策日志」完成裁决。
+        """
     }
 
     private static func analysisSection(_ notes: String) -> String {

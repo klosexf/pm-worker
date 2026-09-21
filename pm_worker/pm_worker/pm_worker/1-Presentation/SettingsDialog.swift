@@ -257,6 +257,15 @@ struct SettingsDialog: View {
                 }
 
                 section(
+                    "Agent 工具调用",
+                    footer: "允许模型在对话中自主调用内置工具：按需加载方法论技能全文（本地）、联网搜索（用下方配置的搜索源）、发起竞品分析（仍需你确认后才执行）。关闭后模型不再携带工具，行为与旧版一致。"
+                ) {
+                    settingsRow("允许模型调用工具", detail: "Function Calling（实验）") {
+                        DSSwitch(isOn: agentToolsBinding)
+                    }
+                }
+
+                section(
                     "元素示例",
                     footer: "当前模式下的基础元素观感——切换上方分段，此处与全应用同步过渡（0.28s 交叉淡化）。"
                 ) {
@@ -907,6 +916,17 @@ struct SettingsDialog: View {
             get: { settings.searchEndpoint },
             set: { newValue in
                 settings.searchEndpoint = newValue
+                persistSoon()
+            }
+        )
+    }
+
+    /// Agent 工具调用总开关（Function Calling v1，LLMSettings 持久化）。
+    private var agentToolsBinding: Binding<Bool> {
+        Binding(
+            get: { settings.agentToolsEnabled },
+            set: { newValue in
+                settings.agentToolsEnabled = newValue
                 persistSoon()
             }
         )

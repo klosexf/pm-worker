@@ -17,6 +17,8 @@ nonisolated struct ThinkData: Codable, Equatable {
         var text: String?
         /// 技能调用行：命中了哪个技能 / 注入了什么 / 耗时。
         var skill: String?
+        /// 工具调用行（Function Calling）：工具名 + 人话结果摘要。
+        var tool: String?
         var detail: String?
         var dur: String?
     }
@@ -42,8 +44,10 @@ nonisolated struct ThinkData: Codable, Equatable {
     /// 以推理尾部收束句开头——那才是最有信息量的部分；原「M 步」计数是行数+
     /// 技能数的虚标，移除）。技能 ≤2 个直接点名（折叠态即可见所应用技能名），
     /// ≥3 收敛为「技能 ×K」防摘要行过长；纯技能无推理时退化为元信息行。
+    /// 工具调用（Function Calling）单列「工具 ×N」计数，不与技能混算。
     var summary: String {
         let skillNames = steps.compactMap(\.skill)
+        let toolNames = steps.compactMap(\.tool)
         var parts: [String] = []
         if let closing = steps.last(where: { $0.text != nil })?.text {
             let headline = closing.count > 48 ? String(closing.prefix(48)) + "…" : closing
@@ -56,16 +60,19 @@ nonisolated struct ThinkData: Codable, Equatable {
         case 3...: parts.append("技能 ×\(skillNames.count)")
         default: break
         }
+        if !toolNames.isEmpty { parts.append("工具 ×\(toolNames.count)") }
         return parts.joined(separator: " · ")
     }
 
     /// 从 reasoning 原文构造（按行拆步骤；截断超长行，保留可解释性不泄露全文；
     /// 全文随 full 字段持久化，展开可回看）。skills：本轮实际注入的技能 id
     /// （Context Builder 命中：语义命中 + 阶段核心确定性注入）——作为技能步骤
-    /// 置于推理步骤之前，摘要行随之点名。
+    /// 置于推理步骤之前，摘要行随之点名。toolSteps：Function Calling 工具调用行，
+    /// 置于最前（执行时序最靠前）。
     /// knowledgeRefs：本轮注入的知识卡命中（id→标题），气泡底部引用条数据源。
     static func from(
         reasoning: String, duration: Int, skills: [String] = [],
+        toolSteps: [Step] = [],
         knowledgeRefs: [String: String]? = nil,
         phaseTrail: [String]? = nil
     ) -> ThinkData? {
@@ -91,7 +98,7 @@ nonisolated struct ThinkData: Codable, Equatable {
         let skillSteps = skills.map { skill in
             Step(text: nil, skill: skill, detail: "已注入本轮提示词上下文", dur: nil)
         }
-        let steps = skillSteps + reasoningSteps
+        let steps = toolSteps + skillSteps + reasoningSteps
         // 无推理无技能但有知识引用时也要构造（引用条是气泡底部的独立信息层）
         guard !steps.isEmpty || knowledgeRefs?.isEmpty == false else { return nil }
         return ThinkData(
@@ -431,6 +438,40 @@ nonisolated struct PhaseStep: Equatable {
     var done: Bool
 }
 
+/// 工具循环常量（Function Calling v1）：单回合工具执行轮上限——超过后不再执行、
+/// 直接以「已达上限」文本作为工具结果回流，并把 tools 从后续请求中摘除，
+/// 强制模型基于已有结果作答（防失控兜底）。
+nonisolated enum ToolLoopPolicy {
+    static let maxToolRounds = 4
+
+    /// 超限后不再执行的兜底结果文本。
+    static func limitExceededResult(maxRounds: Int = maxToolRounds) -> AgentToolResult {
+        .failure("本轮工具调用次数已达上限（\(maxRounds) 轮）。请直接基于以上工具结果与已有信息作答，不要再调用工具。")
+    }
+
+    /// 工具轮消息拼装（纯函数，测试直测）：assistant(tool_calls) + 逐调用 tool 结果。
+    /// 这些消息只存在于本轮 streamReply 的局部 messages——不入盘、不进
+    /// HistoryProjection（对齐「动态材料」先例：discussions.jsonl 是闸门事实源，
+    /// 工具轮是生成过程而非用户裁决事件；可追溯由思考卡工具行承担）。
+    static func followUpMessages(
+        assistantContent: String,
+        calls: [LLMToolCall],
+        results: [AgentToolResult]
+    ) -> [ChatMessage] {
+        var msgs: [ChatMessage] = [
+            ChatMessage(role: .assistant, content: assistantContent, toolCalls: calls)
+        ]
+        for (call, result) in zip(calls, results) {
+            var text = result.forLLM
+            if text.count > agentToolResultBudget {
+                text = String(text.prefix(agentToolResultBudget)) + "\n…（结果过长已截断）"
+            }
+            msgs.append(ChatMessage(role: .tool, content: text, toolCallID: call.id))
+        }
+        return msgs
+    }
+}
+
 /// 单会话流态快照（阶段 1 流态扇出）：per-session 键值的值类型，字段与旧全局
 /// 单流同名位一一对应。跨隔离传递用显式 nonisolated（工程默认 MainActor 隔离）。
 nonisolated struct StreamState: Equatable {
@@ -441,6 +482,9 @@ nonisolated struct StreamState: Equatable {
     var text = ""
     var think = ""
     var skills: [String] = []
+    /// 工具调用轨道（Function Calling）：本轮已执行的工具行（流中实时展示，
+    /// 落盘时并入 ThinkData.steps）。
+    var toolSteps: [ThinkData.Step] = []
     /// 阶段时间线（DSH 左脊时间线轻量版）：原 phase 单行文案升级为多跳轨迹——
     /// 确认链「要点表 → 记忆 → 方法论 → 生成」逐跳入轨，长等待显性化为可见进度。
     var phaseTrail: [PhaseStep] = []
@@ -754,11 +798,13 @@ final class SessionStore: ObservableObject {
         skills: [String],
         knowledgeRefs: [String: String]? = nil,
         phaseTrail: [String]? = nil,
+        toolSteps: [ThinkData.Step] = [],
         sessionId: String
     ) -> (assistant: DiscussionEntry?, note: DiscussionEntry) {
         let thinkData = ThinkData.from(
             reasoning: reasoning, duration: duration,
-            skills: skills, knowledgeRefs: knowledgeRefs,
+            skills: skills, toolSteps: toolSteps,
+            knowledgeRefs: knowledgeRefs,
             phaseTrail: phaseTrail
         )
         let assistant: DiscussionEntry? = partial.isEmpty ? nil : DiscussionEntry(
@@ -1228,6 +1274,7 @@ final class SessionStore: ObservableObject {
     ///     发起时槽位文件的指纹，随发送链下传并经 onAssistant 回调透传给编排层
     ///     落盘段做乐观校验（后写者分槽并立）。仅原型阶段生效——performSend 内
     ///     按 stage 闸死，非原型阶段误传也强制失效。回调第二参数即本值。
+    ///   - tools: Function Calling 工具运行时（nil = 未启用，行为与旧版一致）。
     ///   - onAssistant: 回复完成后的回调（产物解析、轮次推进等由编排层处理）；
     ///     第二参数为本轮生效的原型快照（非原型阶段 / followUp 续发轮为 nil）
     func send(
@@ -1243,6 +1290,7 @@ final class SessionStore: ObservableObject {
         stagedUserEntry: DiscussionEntry? = nil,
         pinnedOrigin: StreamOrigin? = nil,
         prototypeSnapshot: [String: String]? = nil,
+        tools: AgentToolRuntime? = nil,
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)? = nil
     ) async {
         // 打包进可取消句柄（stopGeneration 的取消来源，按发起会话登记）；仍 await
@@ -1255,7 +1303,7 @@ final class SessionStore: ObservableObject {
                 maxTokens: maxTokens, imageFiles: imageFiles, fileRefs: fileRefs,
                 skills: skills, knowledgeRefs: knowledgeRefs,
                 stagedUserEntry: stagedUserEntry, onAssistant: onAssistant, origin: origin,
-                prototypeSnapshot: prototypeSnapshot
+                prototypeSnapshot: prototypeSnapshot, tools: tools
             )
         }
     }
@@ -1273,7 +1321,8 @@ final class SessionStore: ObservableObject {
         stagedUserEntry: DiscussionEntry? = nil,
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?,
         origin: StreamOrigin,
-        prototypeSnapshot: [String: String]? = nil
+        prototypeSnapshot: [String: String]? = nil,
+        tools: AgentToolRuntime? = nil
     ) async {
         // 阶段 4 原型快照：仅原型回合生效（非原型阶段调用方误传也强制失效，防误校验）。
         // followUp 续发轮不带快照（drainFollowUps 不透传，下方调用缺省 nil）——
@@ -1337,6 +1386,7 @@ final class SessionStore: ObservableObject {
             try await streamReply(
                 origin: origin, history: history, stage: stage, settings: settings,
                 maxTokens: maxTokens, skills: skills, knowledgeRefs: knowledgeRefs,
+                tools: tools,
                 onAssistant: onAssistant.map { fn in
                     { entry in fn(entry, effectiveSnapshot) }
                 }
@@ -1737,6 +1787,7 @@ final class SessionStore: ObservableObject {
         maxTokens: Int,
         skills: [String] = [],
         knowledgeRefs: [String: String]? = nil,
+        tools: AgentToolRuntime? = nil,
         onAssistant: ((DiscussionEntry) -> Void)?
     ) async throws {
         // 开流转正：本会话待回复占位无缝切换为真实流式态（归属由 key 承载）
@@ -1786,6 +1837,11 @@ final class SessionStore: ObservableObject {
         var retryEffort: ThinkingEffort? = nil  // nil = 沿用用户档位
         // 用户停止（生成任务被取消）：立即中断接收，已生成部分收尾落盘保留
         var stopped = false
+        // Function Calling 工具循环状态（nil = 未启用，零开销走旧路径）
+        var toolRounds = 0            // 已执行的工具轮数（上限 ToolLoopPolicy.maxToolRounds）
+        var noMoreTools = false       // 超限后摘除 tools，强制模型直答
+        var pendingToolCalls: [LLMToolCall] = []  // 本轮流结束时累积到的工具调用组
+        var toolSteps: [ThinkData.Step] = []      // 思考卡工具行（流中 + 落盘共用）
         // 临时探针（2026-09-18）：App 侧消费/发布节奏（见 StreamProbe 注释）
         var probeConsume: [Double] = []
         var probePubs: [[String: Any]] = []
@@ -1805,7 +1861,8 @@ final class SessionStore: ObservableObject {
                 let stream = try LLMClient.streamChat(
                     stage: stage, settings: settings, messages: messages, maxTokens: retryBudget,
                     reasoningEffort: (retryEffort ?? thinkingEffort).apiValue,
-                    roundId: roundId
+                    roundId: roundId,
+                    tools: (tools != nil && !noMoreTools) ? tools!.registry.definitions() : nil
                 )
                 var truncated = false
                 let roundStart = full.count
@@ -1854,6 +1911,8 @@ final class SessionStore: ObservableObject {
                             mutateStream(origin.sessionId) {
                                 $0.retry = LLMClient.retryStatusText(code: code, attempt: attempt)
                             }
+                        case .toolCalls(let calls):
+                            pendingToolCalls = calls
                         case .truncated:
                             truncated = true
                         }
@@ -1876,6 +1935,48 @@ final class SessionStore: ObservableObject {
                     // 字面空流（服务端抖动）重试（上限 1 次）：同请求重发。
                     emptyRetries += 1
                     probeEvents.append(["t": Date().timeIntervalSince(startedAt), "ev": "empty-stream"])
+                    continue
+                }
+                // Function Calling 工具轮（优先于截断续写判断）：模型发起调用 →
+                // 执行 → 结果回灌 → 继续下一轮生成。工具消息只进局部 messages
+                //（不入盘、不进 HistoryProjection），思考卡工具行全程留痕。
+                if !pendingToolCalls.isEmpty {
+                    let calls = pendingToolCalls
+                    pendingToolCalls = []
+                    let overLimit = toolRounds >= ToolLoopPolicy.maxToolRounds
+                    if overLimit {
+                        noMoreTools = true  // 下一轮起摘除 tools，强制模型直答
+                    } else {
+                        toolRounds += 1
+                    }
+                    var results: [AgentToolResult] = []
+                    for call in calls {
+                        if Task.isCancelled { break }  // 停止语义：执行中取消即刻退出
+                        probeEvents.append([
+                            "t": Date().timeIntervalSince(startedAt),
+                            "ev": "tool-execute", "tool": call.name, "over": overLimit,
+                        ])
+                        let result: AgentToolResult
+                        if let tools, !overLimit {
+                            result = await tools.registry.execute(
+                                name: call.name, argumentsJSON: call.argumentsJSON,
+                                ctx: tools.context
+                            )
+                        } else {
+                            result = ToolLoopPolicy.limitExceededResult()
+                        }
+                        results.append(result)
+                        toolSteps.append(ThinkData.Step(
+                            text: nil, skill: nil, tool: call.name,
+                            detail: result.forHuman, dur: nil
+                        ))
+                    }
+                    mutateStream(origin.sessionId) { $0.toolSteps = toolSteps }
+                    // 本轮 assistant 段文本（工具轮常零正文）随 tool_calls 回灌
+                    let roundText = String(full[full.index(full.startIndex, offsetBy: roundStart)...])
+                    messages.append(contentsOf: ToolLoopPolicy.followUpMessages(
+                        assistantContent: roundText, calls: calls, results: results
+                    ))
                     continue
                 }
                 guard truncated, continueRounds < 2 else { break }
@@ -1926,7 +2027,7 @@ final class SessionStore: ObservableObject {
         let stoppedTurn = Self.makeStoppedTurn(
             partial: full, reasoning: reasoning, duration: duration,
             skills: skills, knowledgeRefs: knowledgeRefs,
-            phaseTrail: chainTrail, sessionId: origin.sessionId
+            phaseTrail: chainTrail, toolSteps: toolSteps, sessionId: origin.sessionId
         )
         if let assistantEntry = stoppedTurn.assistant {
             try appendPinned(assistantEntry, origin: origin)
