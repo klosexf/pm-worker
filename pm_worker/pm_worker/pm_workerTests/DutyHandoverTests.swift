@@ -54,6 +54,16 @@ final class DutyHandoverTests: XCTestCase {
         ]
     }
 
+    /// 2026-09-22 思考链收口后 `ThinkData.steps` 只剩工具/技能行（原始 CoT 不再入内），
+    /// 常规轮常为 0 项。0 的含义是「没有可数的过程行」，不是「走了 0 步」——
+    /// 按本组件既有「缺失项整段省略，不伪造」口径省略，不得显示「0 步」。
+    func testEmptyStructuredStepsYieldNilStepCount() {
+        let entries = backtrackChain(
+            secondSegmentThink: ThinkData(dur: 22, steps: [], full: "一段原始思维链")
+        )
+        XCTAssertNil(MessageBubble.dutyHandover(for: 4, in: entries)?.stepCount)
+    }
+
     // MARK: - 回退链（两段）
 
     func testBacktrackChainTwoSegmentsDerivesIndexDurationAndNodes() {

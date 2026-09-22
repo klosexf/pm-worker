@@ -25,6 +25,10 @@ nonisolated enum ArtifactPath {
     static let prdTruncatedDraft = "04-prd/PRD截断草稿.md"
     /// PRD 模板版本戳（落盘时记录生成所用模板版本；模板升级后据判定存量 PRD 失效）。
     static let prdMeta = "04-prd/prd-meta.json"
+    /// 指标口径卡（append-only jsonl，与 prdMeta 同为 04-prd 侧文件）：只存「这个数
+    /// 怎么算」的口径定义、不存数值——数值的唯一事实源是 PRD 4.2 表。第二圈 C 环
+    /// （结果对账）按 status 准入门筛选可对账指标。
+    static let metricSpecs = "04-prd/metric-specs.jsonl"
     static let competitiveAnalysis = "05-analysis/竞品分析.md"
     static let releaseNotes = "07-reports/发布说明.md"
 

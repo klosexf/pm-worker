@@ -118,3 +118,23 @@ final class StreamBox: ObservableObject {
   2. **收窄版留痕兜底**：`hasStrayPrototypeBlock`（闭合块 / 未闭合围栏任一）+ 一条 ⚠️ 指向「直接出原型」，只在顺收不成立时发。与 `hasStrayPRDBlock` 同处同构。
   3. **两处刻意取舍**：① 顺收**不改判 switch** 而是「结构照常落 + 原型补落」——同一回复完全可能既改结构三件又出原型，改判会让结构更新静默丢失，等于新造一个同类 bug；② 顺收要求 ③ 槽位为空——顺收轮没有冲突快照（快照只在 ③ 阶段发送链采集），直接覆盖会无声吃掉用户已有的原型文件。两处各有测试锚定。
 - **防复发**：`PrototypeCarryInTests` 5 个用例（顺收端到端 / 无结构三件 / ① 阶段 / 覆盖防护 / 谓词四象限）。**纪律升级：新增一种产物块 = 同时补齐三件事——本阶段落盘分支、非本阶段的 stray 兜底留痕、prompt 侧的越界禁令或顺收策略**，只做第一项必然复发（PRD 那次就是只补了 PRD 自己的一条）。排查此类「说了没做」一律按上面五步走磁盘先行，先看 `events.jsonl` 有没有 `artifactGenerated`，能一步区分「解析丢 / 分派丢 / 落盘失败」。UI 侧 `ConversationView.prototypeBlock` 在文件不存在时「不出占位」是有意设计（防双卡），但它把这类后端静默放大成前端完全无痕——新增产物类型时要一并想清楚「块在回复里、文件不在盘上」这个中间态谁负责说话。
+
+### B006：文档明文的展示禁令被后续功能静默打穿——「不泄露原始 CoT」写了半年，代码早就在泄露
+
+- **日期**：2026-09-22（首次记录）
+- **状态**：已解决
+- **复发次数**：1（但属机制性坑，预计复发；同族先例 B004「产生方改了消费方没同步」）
+- **症状**：用户在 ③ 阶段发一句「你好」，AI 气泡的思考区直接渲染出英文原始思维链，内容是「since this is a greeting with zero artifacts, maybe include radar with: fixed/remaining/covered/missing/skipped/fatal」「the tool-calling section says tools available; not needed here —— memory injection already gives me what I need」——把内部协议字段名、工具清单、记忆注入机制全部摊到用户面前，直接违反 AGENTS.md「用户信息展示规范」（禁展示内部实现 / 代码 / 技术术语 / 架构）。**最难查的一点：它不是崩溃、不是报错，界面看起来完全正常**，而且没有任何一条测试是红的。
+- **排查要点**：
+  1. **先读文档再读代码，一步定性质**。`design.md` v0.9.6 变更记录原文写着「推理步骤是**面向用户可读的推理摘要**而非原始思维链（保留可解释性、不泄露原始 CoT）」，§6.4.1 正文同款表述。既然口径早就存在，这就不是「要不要做」的设计题，而是**回归**——排查方向立刻从「找产品决策人」变成「找哪次改动打穿了它」。省掉一整轮讨论。
+  2. **顺着一个字段追它的全部读者**。`ThinkData.full` 只有两个合法读者：DeepSeek `reasoning_content` 历史回放、落盘。Grep `.full` 发现第三个读者 = `ThinkingCard` 展开态 `Text(full)`，即引入点。
+  3. **注意有两条独立出口，只看一条会漏修**。展开态之外，**折叠摘要行**也漏——`summary` 取 `steps.last(where: {$0.text != nil})` 前 48 字，而 `steps[].text` 已被改成存 CoT 行。摘要行是**默认常驻可见**的，比展开态更严重，且它藏在 `ThinkData` 里不在视图文件中，只 grep 视图会漏掉。
+  4. **`Step.text` 的文档注释是骗人的**：写着「面向用户可读的摘要，非原始 CoT」，实际装的是 CoT。注释与实现漂移时以数据流为准（看谁往里写）。
+- **根因**：2026-09-18「思考全文回看」升级（为修 B001 的观感问题）把 `steps[].text` 从摘要改成原始 CoT 行、展开态改成渲染 `full`、摘要行改成取 CoT 尾行当「收束句」，**三处同时打穿一条已记录的展示禁令**，而：① 该禁令没有对应的测试断言（v0.9.6 立约时只测了「有技能行」，从没测过「不得出现 CoT」）；② 改的是同一模块内的相邻函数，review 时看不出越界；③ 泄露内容在英文长文里，中文界面下一眼扫过不显眼。**即「文档写了 ≠ 有约束力，没有测试锚定的口径等于没有口径」。**
+- **解法**（源头 + 渲染层各堵一次，旧存量免迁移）：
+  1. **源头**：`ThinkData.from` 的 `steps` 只装 `toolSteps + skillSteps`，不再把 CoT 拆成 `text` 步骤；`summary` 删掉「收束句」段，回到「思考了 Ns · 技能 · 工具 ×N」。纯空白 reasoning 显式判 `nil`（旧实现靠按行拆分顺带滤掉了它，不拆行后不显式判会凭空冒出「思考了 1s」空卡——本次改完就踩了这个）。
+  2. **渲染层**：`ThinkingCard` 删 `reasoning` 属性与 `liveReasoning` 实时尾随路径、展开态不再渲染 `full`；`stepsAttributedString` 的 `includeReasoningSteps` 参数**整个删除**而不是传 `false`——留一个能打开原始 CoT 的开关等于给下次复发留门。删掉 `text` 步骤的渲染分支，于是 09-18~09-22 之间落盘的旧行（`steps[].text` 里就是 CoT）也一并挡掉，**无需数据迁移**。
+  3. **`full` 字段必须保留**：它是 DeepSeek `reasoning_content` 回放的唯一来源（`testHistoryProjectionCarriesReasoning` 钉着），删字段会改生成行为。本轮只动展示归属，不动存储归属。
+  4. **回看出口**：按 v0.9.1「工程细节退入开发者模式」先例落 ⌘D `DeveloperInspector` 新增「原始思考全文（本轮）」区，读最后一条 assistant 行的 `think.full`，零新增状态、不新造用户侧开关。
+  5. **两处连带副作用**（改 `steps` 语义必须盘下游）：`StreamPublishTail.liveThinkChars` 随渲染路径下线删除；值班单交接条的「N 步」在常规轮会变成「0 步」→ `MessageBubble.dutyHandover` 改判空给 `nil`，交该组件既有「缺失项整段省略，不伪造」口径处理。
+- **防复发**：三条测试把口径变成机器约束——`testRawChainOfThoughtReachesNeitherSummaryNorSteps`（15 行 CoT 逐行断言 summary 不含任何一行）、`testLegacyRawReasoningStepsAreNotRendered`（手工构造带 CoT 的旧存量 `steps`，断言渲染文本不含它）、`testThinkDataFromReasoning`（`steps` 必须为空、`full` 必须仍等于原文）。**纪律升级：凡文档里写成「不得 / 不泄露 / 禁止」的用户可见内容口径，落码时必须同批补一条断言型测试，否则该口径视为不存在。** 与 B004 同族的排查动作：改展示层前先在 `design.md` / `PRD.md` 里搜该字段的现行口径（`Grep "不得|禁止|不泄露" + 字段名`），有口径就是回归、没口径才是新决策——两者的处理流程完全不同。另：`Step.text` 这类「注释说装摘要、实际装原文」的字段，排查时别信注释，直接看写入方。

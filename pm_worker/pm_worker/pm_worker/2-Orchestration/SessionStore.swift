@@ -40,20 +40,16 @@ nonisolated struct ThinkData: Codable, Equatable {
     /// 无打勾行，完成态展开恒可见。普通聊天轮无链 → nil。
     var phaseTrail: [String]? = nil
 
-    /// 摘要行：「「收束句」 · 思考了 Ns · <技能>」（2026-09-18 内容化改版：折叠行
-    /// 以推理尾部收束句开头——那才是最有信息量的部分；原「M 步」计数是行数+
-    /// 技能数的虚标，移除）。技能 ≤2 个直接点名（折叠态即可见所应用技能名），
-    /// ≥3 收敛为「技能 ×K」防摘要行过长；纯技能无推理时退化为元信息行。
+    /// 摘要行：「思考了 Ns · <技能> · 工具 ×N」（2026-09-22 收口：去掉「收束句」段）。
+    /// 原「以推理尾部收束句开头」的改版把原始 CoT 直接印在了每条气泡的折叠行上
+    /// ——不打开展开区也照漏，实测那句「你好」漏出的是
+    /// 「the tool-calling section says tools available; not needed here」。
+    /// 技能 ≤2 个直接点名（折叠态即可见所应用技能名），≥3 收敛为「技能 ×K」防过长；
     /// 工具调用（Function Calling）单列「工具 ×N」计数，不与技能混算。
     var summary: String {
         let skillNames = steps.compactMap(\.skill)
         let toolNames = steps.compactMap(\.tool)
-        var parts: [String] = []
-        if let closing = steps.last(where: { $0.text != nil })?.text {
-            let headline = closing.count > 48 ? String(closing.prefix(48)) + "…" : closing
-            parts.append("「\(headline)」")
-        }
-        parts.append("思考了 \(dur)s")
+        var parts: [String] = ["思考了 \(dur)s"]
         switch skillNames.count {
         case 1: parts.append(skillNames[0])
         case 2: parts.append(skillNames.joined(separator: "、"))
@@ -64,46 +60,38 @@ nonisolated struct ThinkData: Codable, Equatable {
         return parts.joined(separator: " · ")
     }
 
-    /// 从 reasoning 原文构造（按行拆步骤；截断超长行，保留可解释性不泄露全文；
-    /// 全文随 full 字段持久化，展开可回看）。skills：本轮实际注入的技能 id
-    /// （Context Builder 命中：语义命中 + 阶段核心确定性注入）——作为技能步骤
-    /// 置于推理步骤之前，摘要行随之点名。toolSteps：Function Calling 工具调用行，
-    /// 置于最前（执行时序最靠前）。
-    /// knowledgeRefs：本轮注入的知识卡命中（id→标题），气泡底部引用条数据源。
+    /// 从 reasoning 原文构造。
+    /// **steps 只装产品自己生成的结构化行**（工具调用行 + 技能注入行）——模型原始
+    /// 思维链不进这里，它既含内部字段名也含实现细节，违反 AGENTS.md「用户信息展示
+    /// 规范」，且 design.md §6.4.1 v0.9.6 本就写明「推理步骤是面向用户可读的摘要
+    /// 而非原始思维链」。原文只进 `full` 落盘（DeepSeek reasoning_content 回放依赖），
+    /// 用户侧回看入口在开发者模式（⌘D）。
+    /// skills：本轮实际注入的技能 id（Context Builder 命中：语义命中 + 阶段核心
+    /// 确定性注入）。toolSteps：Function Calling 工具调用行，置于最前（执行时序
+    /// 最靠前）。knowledgeRefs：本轮注入的知识卡命中（id→标题），气泡底部引用条数据源。
     static func from(
         reasoning: String, duration: Int, skills: [String] = [],
         toolSteps: [Step] = [],
         knowledgeRefs: [String: String]? = nil,
         phaseTrail: [String]? = nil
     ) -> ThinkData? {
-        let lines = reasoning
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        // 折叠摘要：上限 12 条、单条截 200 字——结论级信任，全文走 full 字段。
-        // 2026-09-18 尾部优先：reasoning 头部通常是复述任务、尾部才是收束决策，
-        // 超限时保留首 2 条（任务锚定）+ 省略提示行 + 末 10 条（收束）。
-        let step: (String) -> Step = { line in
-            Step(text: String(line.prefix(200)), skill: nil, detail: nil, dur: nil)
-        }
-        let reasoningLines: [String]
-        if lines.count > 12 {
-            reasoningLines = Array(lines.prefix(2))
-                + ["（中间省略 \(lines.count - 12) 条，展开可看全文）"]
-                + Array(lines.suffix(10))
-        } else {
-            reasoningLines = lines
-        }
-        let reasoningSteps = reasoningLines.map(step)
         let skillSteps = skills.map { skill in
             Step(text: nil, skill: skill, detail: "已注入本轮提示词上下文", dur: nil)
         }
-        let steps = toolSteps + skillSteps + reasoningSteps
-        // 无推理无技能但有知识引用时也要构造（引用条是气泡底部的独立信息层）
-        guard !steps.isEmpty || knowledgeRefs?.isEmpty == false else { return nil }
+        let steps = toolSteps + skillSteps
+        // 纯空白 reasoning 视同「本轮没思考」：旧实现按行拆分 + 滤空顺带把它归零了，
+        // 现在不拆行，必须显式判空——否则一句空思考也会凭空冒出「思考了 Ns」摘要行。
+        let fullText = reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? nil : reasoning
+        // 无任何可展示内容（结构化行 / 思考耗时 / 知识引用）时不出卡。
+        // 有 reasoning 但无结构化行时仍出卡——摘要行的「思考了 Ns」是长等待的唯一
+        // 进度凭据，不能因为没技能没工具就把整卡收掉。
+        guard !steps.isEmpty || fullText != nil || knowledgeRefs?.isEmpty == false else {
+            return nil
+        }
         return ThinkData(
             dur: duration, steps: steps, knowledgeRefs: knowledgeRefs,
-            full: reasoning.isEmpty ? nil : reasoning,
+            full: fullText,
             phaseTrail: (phaseTrail?.isEmpty == false) ? phaseTrail : nil
         )
     }
@@ -518,11 +506,10 @@ enum StreamPublishTail {
     /// 正文尾窗：保底可视上下文（流式气泡自动吸底，视野集中在尾部）。
     static let textChars = 12000
     /// 思考尾窗：思考卡本就是流式预览（全文随完成卡落盘）。
+    /// 注：2026-09-22 起原始 CoT 不再进思考卡视图，本值只服务「本轮是否在思考」
+    /// 的判据与落盘链路；曾配套过一个 `liveThinkChars = 900`（展开态实时尾随的
+    /// 渲染尾窗），随该渲染路径一并删除。
     static let thinkChars = 4000
-    /// 实时思考流尾窗（展开态 liveReasoning 渲染量）：280pt 限高 ≈ 十几行可视量。
-    /// 2026-09-18 复测钉死：正文阶段满速 4186 delta/s、思考阶段仅 17.8/s——
-    /// 时间全耗在展开态每次发布重排 4000 字符 + 底部锚定滚动（~200ms × 1268 次）。
-    static let liveThinkChars = 900
 
     static func clip(_ source: String, limit: Int) -> String {
         guard source.count > limit else { return source }
@@ -845,16 +832,16 @@ final class SessionStore: ObservableObject {
 
     // MARK: - 会话投影（左栏第三级数据源）
 
-    /// 某 project/version 下全部会话（固定按创建顺序，2026-09-13 用户决策）。
+    /// 某 project/version 下全部会话（固定按创建时间倒序，2026-09-22 用户决策）。
     nonisolated static func sessions(in project: String, version: String) -> [SessionSummary] {
         let url = PMAgentStore.jsonlURL(project: project, version: version, file: "discussions.jsonl")
         let all = PMAgentStore.readLines(DiscussionEntry.self, from: url)
         var bySession: [String: [DiscussionEntry]] = [:]
         for entry in all { bySession[entry.sessionId, default: []].append(entry) }
 
-        // 固定按创建顺序（首条 entry 时间升序）——不随最近活跃跳位；
-        // discussions.jsonl append-only，entries 即追加序，首条即最早。
-        // createdAt 为 ISO8601 字符串，字典序 == 时间序（与 lastActiveAt 同约定）。
+        // 固定按创建时间倒序（首条 entry 时间降序，新的在前，与项目排序同口径）
+        // ——不随最近活跃跳位；discussions.jsonl append-only，entries 即追加序，
+        // 首条即最早。createdAt 为 ISO8601 字符串，字典序 == 时间序（与 lastActiveAt 同约定）。
         let titles = sessionTitles(project: project, version: version)
         return bySession
             .map { sid, entries -> (SessionSummary, String) in
@@ -868,7 +855,7 @@ final class SessionStore: ObservableObject {
                     messageCount: entries.count
                 ), entries.first?.createdAt ?? "")
             }
-            .sorted { $0.1 < $1.1 }
+            .sorted { $0.1 > $1.1 }
             .map(\.0)
     }
 
@@ -1291,6 +1278,7 @@ final class SessionStore: ObservableObject {
         pinnedOrigin: StreamOrigin? = nil,
         prototypeSnapshot: [String: String]? = nil,
         tools: AgentToolRuntime? = nil,
+        thinkingEffortOverride: ThinkingEffort? = nil,
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)? = nil
     ) async {
         // 打包进可取消句柄（stopGeneration 的取消来源，按发起会话登记）；仍 await
@@ -1303,7 +1291,8 @@ final class SessionStore: ObservableObject {
                 maxTokens: maxTokens, imageFiles: imageFiles, fileRefs: fileRefs,
                 skills: skills, knowledgeRefs: knowledgeRefs,
                 stagedUserEntry: stagedUserEntry, onAssistant: onAssistant, origin: origin,
-                prototypeSnapshot: prototypeSnapshot, tools: tools
+                prototypeSnapshot: prototypeSnapshot, tools: tools,
+                thinkingEffortOverride: thinkingEffortOverride
             )
         }
     }
@@ -1322,7 +1311,8 @@ final class SessionStore: ObservableObject {
         onAssistant: ((DiscussionEntry, [String: String]?) -> Void)?,
         origin: StreamOrigin,
         prototypeSnapshot: [String: String]? = nil,
-        tools: AgentToolRuntime? = nil
+        tools: AgentToolRuntime? = nil,
+        thinkingEffortOverride: ThinkingEffort? = nil
     ) async {
         // 阶段 4 原型快照：仅原型回合生效（非原型阶段调用方误传也强制失效，防误校验）。
         // followUp 续发轮不带快照（drainFollowUps 不透传，下方调用缺省 nil）——
@@ -1386,7 +1376,7 @@ final class SessionStore: ObservableObject {
             try await streamReply(
                 origin: origin, history: history, stage: stage, settings: settings,
                 maxTokens: maxTokens, skills: skills, knowledgeRefs: knowledgeRefs,
-                tools: tools,
+                tools: tools, thinkingEffortOverride: thinkingEffortOverride,
                 onAssistant: onAssistant.map { fn in
                     { entry in fn(entry, effectiveSnapshot) }
                 }
@@ -1781,6 +1771,16 @@ final class SessionStore: ObservableObject {
         try? appendPinned(entry, origin: origin)
     }
 
+    /// 流式请求的思考强度取值优先级（纯函数，测试直测）：空流重试位 > 本轮覆盖位
+    /// （寒暄轻量轮压 low）> 用户在 Composer 选的档位（默认 high = 不发参走服务端默认）。
+    /// 覆盖位须排在用户位**之前**——轻量轮要压 low，不能被界面上仍显示 High 的档位
+    /// 顶回去；但空流重试的强制 low 仍须压过一切。
+    nonisolated static func resolvedStreamEffort(
+        retry: ThinkingEffort?, override: ThinkingEffort?, userDefault: ThinkingEffort
+    ) -> ThinkingEffort {
+        retry ?? override ?? userDefault
+    }
+
     private func streamReply(
         origin: StreamOrigin,
         history: [ChatMessage],
@@ -1790,6 +1790,7 @@ final class SessionStore: ObservableObject {
         skills: [String] = [],
         knowledgeRefs: [String: String]? = nil,
         tools: AgentToolRuntime? = nil,
+        thinkingEffortOverride: ThinkingEffort? = nil,
         onAssistant: ((DiscussionEntry) -> Void)?
     ) async throws {
         // 开流转正：本会话待回复占位无缝切换为真实流式态（归属由 key 承载）
@@ -1862,7 +1863,10 @@ final class SessionStore: ObservableObject {
                 }
                 let stream = try LLMClient.streamChat(
                     stage: stage, settings: settings, messages: messages, maxTokens: retryBudget,
-                    reasoningEffort: (retryEffort ?? thinkingEffort).apiValue,
+                    reasoningEffort: Self.resolvedStreamEffort(
+                        retry: retryEffort, override: thinkingEffortOverride,
+                        userDefault: thinkingEffort
+                    ).apiValue,
                     roundId: roundId,
                     tools: (tools != nil && !noMoreTools) ? tools!.registry.definitions() : nil
                 )

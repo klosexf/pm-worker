@@ -6,11 +6,17 @@
 //  去掉胶囊底/步骤区底框，对齐 Trae 对话「思考过程 ›」样式）：
 //  - 思考中：品牌色 pulse 圆点 + 「正在思考…」think-sweep 流光扫字（2.4s 循环，
 //    原型 .think-live/.run-dot，长静默期防假死感；减弱动态时降级纯文本）；
-//    reasoning 原文开始流入后头行可点击展开，实时尾随模型思考内容（bottom 锚定）；
 //    确认链多跳阶段时间线（2026-09-18，DSH 左脊时间线轻量版）——已完成跳打勾、
 //    当前跳流光，长等待显性化为可见进度
-//  - 已完成：默认折叠摘要行「「收束句」 · 思考了 Ns · <技能>」，点击展开——
-//    新数据（full 已随 think 落盘）渲染全文滚动区 + 技能行，旧存量回退截断步骤
+//  - 已完成：折叠摘要行「思考了 Ns · <技能> · 工具 ×N」，有结构化行时可点展开
+//
+//  **本视图不渲染模型原始思维链**（2026-09-22 收口，恢复 design.md v0.9.6 口径：
+//  推理步骤是面向用户可读的摘要，不是 CoT 本身）。曾经的 09-18 改版把 reasoning
+//  原文接进了流式展开区、完成态全文区和折叠摘要行的「收束句」，实测漏出的是
+//  「memory injection already gives me what I need」这类内部机制自述——违反
+//  AGENTS.md「用户信息展示规范」。原文只落盘（DeepSeek reasoning_content 回放依赖），
+//  回看入口在开发者模式 ⌘D（DeveloperInspector）。这里刻意**不留**任何
+//  「显示原始 CoT」的开关：留一个能打开的参数等于给下次复发留门。
 //
 
 import SwiftUI
@@ -18,9 +24,6 @@ import SwiftUI
 struct ThinkingCard: View {
     /// nil → 思考中态；有值 → 完成态。
     let data: ThinkData?
-    /// 思考中态的模型 reasoning 原文（流式增量累积，SessionStore 节流发布）；
-    /// 非空时头行可展开，实时看到模型在想什么。完成态忽略此参数。
-    var reasoning: String = ""
     /// 思考中态展示的引用技能 id（本轮 Context Builder 注入的技能；
     /// 完成态由 data.steps 的技能步骤承载，此参数忽略）。
     var skills: [String] = []
@@ -78,18 +81,9 @@ struct ThinkingCard: View {
             ForEach(Array(donePhases.enumerated()), id: \.offset) { _, label in
                 phaseDoneRow(label)
             }
-            // reasoning 已开始流入 → 头行可点击展开实时思考内容（chevron 与完成态同款）
-            if reasoning.isEmpty {
-                streamingHeader
-            } else {
-                Button {
-                    withAnimation(DS.Motion.springFast) { expanded.toggle() }
-                } label: {
-                    streamingHeader
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
+            // 头行不可展开：流式期能见的过程只有阶段时间线 / 技能行 / 工具行这三类
+            // 产品自己生成的文案（原始 CoT 曾在此实时尾随，2026-09-22 收口移除）
+            streamingHeader
             if !skills.isEmpty {
                 // 引用技能行：技能在组装期已确定注入，思考中即时可见（与完成态技能行同款图标）；
                 // 置于过程内容上方（与完成态「技能行在全文前」同序）
@@ -123,67 +117,45 @@ struct ThinkingCard: View {
                     }
                 }
             }
-            if expanded && !reasoning.isEmpty {
-                liveReasoning
-            }
         }
     }
 
-    /// 头行：pulse 圆点 + 流光扫字当前跳（reasoning 非空时带尾部 chevron，
-    /// 折叠右指 / 展开转下）
+    /// 头行：pulse 圆点 + 流光扫字当前跳（无 chevron——流式态已无可展开内容）
     private var streamingHeader: some View {
         HStack(spacing: DS.Spacing.s4) {
             HStack(spacing: DS.Spacing.s8) {
                 DSPulseDot()
                 ThinkSweepText(currentPhaseLabel)
             }
-            if !reasoning.isEmpty {
-                DSIcon(.down, size: 11)
-                    .foregroundStyle(Color.ink300)
-                    .rotationEffect(.degrees(expanded ? 0 : -90))
-            }
         }
     }
 
-    /// 展开态：reasoning 原文实时流出。限高滚动 + bottom 锚定贴底跟随新 delta，
-    /// 用户上滚阅读时不被拽回；限高避免长思考把对话流顶走。
-    /// 渲染量做尾窗化（StreamPublishTail.liveThinkChars）：只重排可视量尾部，
-    /// 全量原文仍在 SessionStore（完成卡全文回看 + 落盘不变）——修复前每次发布
-    /// 重排 4000 字符尾窗 + 滚动 ≈ 200ms，1268 次发布耗 254s（探针实证）。
-    private var liveReasoning: some View {
-        DSScroll {
-            Text(StreamPublishTail.clip(reasoning, limit: StreamPublishTail.liveThinkChars))
-                .dsCaptionType(size: 13)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .defaultScrollAnchor(.bottom)
-        .frame(maxHeight: 280)
-        .padding(.top, DS.Spacing.s4)
-        .transition(.opacity)
-    }
+    // MARK: - 已完成（折叠一行摘要；只有结构化行才可展开）
 
-    // MARK: - 已完成（默认折叠一行摘要，纯文字 + 尾部箭头，参考图「思考过程 ›」式）
+    /// 可展开 = 有工具/技能行，或有阶段时间线。原始 CoT 全文（`data.full`）不再是
+    /// 展开内容，所以「想过但没有任何结构化行」的轮次不出 Button、不出 chevron——
+    /// 也不新造一句「无内容可看」的提示文案占位。
+    private func isExpandable(_ data: ThinkData) -> Bool {
+        data.steps.contains { $0.skill != nil || $0.tool != nil }
+            || data.phaseTrail?.isEmpty == false
+    }
 
     private func completedCard(_ data: ThinkData) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(DS.Motion.springFast) { expanded.toggle() }
-            } label: {
-                // 文字在前 + 尾部 chevron（折叠右指 / 展开转下），无底无框
-                HStack(spacing: DS.Spacing.s4) {
-                    Text(data.summary)
-                        .font(DS.Font.bodySM)
-                        .foregroundStyle(Color.ink500)
-                    DSIcon(.down, size: 11)
-                        .foregroundStyle(Color.ink300)
-                        .rotationEffect(.degrees(expanded ? 0 : -90))
+        let expandable = isExpandable(data)
+        return VStack(alignment: .leading, spacing: 0) {
+            if expandable {
+                Button {
+                    withAnimation(DS.Motion.springFast) { expanded.toggle() }
+                } label: {
+                    summaryLine(data, chevron: true)
+                        .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+            } else {
+                summaryLine(data, chevron: false)
             }
-            .buttonStyle(.plain)
 
-            if expanded {
+            if expandable && expanded {
                 // 确认链跳转历史（2026-09-18 持久化）：链式回合全程打勾回顾——
                 // 流式期时间线随流收起，这里恒可见（单跳/双跳链流式期无打勾行的兜底）
                 if let trail = data.phaseTrail, !trail.isEmpty {
@@ -194,53 +166,43 @@ struct ThinkingCard: View {
                     }
                     .padding(.top, DS.Spacing.s8)
                 }
-                if let full = data.full, !full.isEmpty {
-                    // 2026-09-18 全文回看：reasoning 原文已随 think 落盘，展开即全文
-                    // （顶部锚定从开头读，与流式态的底部尾随语义相反）；工具/技能行铺顶，
-                    // 截断步骤行被全文取代。单 Text 保跨行拖选，限高防长文顶走对话流。
-                    let hasSkills = data.steps.contains { $0.skill != nil || $0.tool != nil }
-                    if hasSkills {
-                        Text(Self.stepsAttributedString(data, includeReasoningSteps: false))
-                            .dsCaptionType(size: 13)
-                            .padding(.top, DS.Spacing.s8)
-                    }
-                    DSScroll {
-                        Text(full)
-                            .dsCaptionType(size: 13)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(maxHeight: 280)
-                    .padding(.top, (hasSkills || trailVisible(data)) ? 0 : DS.Spacing.s8)
+                // 工具行 + 技能行是唯一可展示的过程内容，直接铺在页面上（无背景框），
+                // 与正文左缘对齐。必须合并为单个 Text：SwiftUI textSelection 只在单个
+                // Text 内生效，逐条独立 Text 时 macOS 拖选跨行即断（只能一行一行选）。
+                Text(Self.stepsAttributedString(data))
+                    .dsCaptionType(size: 13)
+                    .textSelection(.enabled)
+                    .padding(.top, trailVisible(data) ? 0 : DS.Spacing.s8)
                     .transition(.opacity)
-                } else {
-                    // 旧存量（无 full 字段）：截断步骤行回退渲染。
-                    // 步骤直接铺在页面上（无背景框），与正文左缘对齐。
-                    // 必须合并为单个 Text：SwiftUI textSelection 只在单个 Text 内生效，
-                    // 逐条独立 Text 时 macOS 拖选跨行即断（只能一行一行选）。
-                    Text(Self.stepsAttributedString(data))
-                        .dsCaptionType(size: 13)
-                        .textSelection(.enabled)
-                        .padding(.top, trailVisible(data) ? 0 : DS.Spacing.s8)
-                        .transition(.opacity)
-                }
+            }
+        }
+    }
+
+    /// 摘要行：文字在前 + 可选尾部 chevron（折叠右指 / 展开转下），无底无框。
+    private func summaryLine(_ data: ThinkData, chevron: Bool) -> some View {
+        HStack(spacing: DS.Spacing.s4) {
+            Text(data.summary)
+                .font(DS.Font.bodySM)
+                .foregroundStyle(Color.ink500)
+            if chevron {
+                DSIcon(.down, size: 11)
+                    .foregroundStyle(Color.ink300)
+                    .rotationEffect(.degrees(expanded ? 0 : -90))
             }
         }
     }
 
     // MARK: - 步骤合并文本（跨行连续选取的关键）
 
-    /// 步骤合并为单段 AttributedString：工具行（⚙ + 工具名 + 结果摘要）、
-    /// 技能行（✦ + 名称 + 注入说明）与推理行（· + 要点）分 run 控制字号/颜色，
-    /// 视觉对齐原逐条渲染。
-    /// includeReasoningSteps = false 时只渲染工具/技能行（全文回看态用，推理行被全文取代）。
-    private static func stepsAttributedString(
-        _ data: ThinkData, includeReasoningSteps: Bool = true
-    ) -> AttributedString {
+    /// 步骤合并为单段 AttributedString：工具行（⚙ + 工具名 + 结果摘要）与技能行
+    /// （✦ + 名称 + 注入说明）分 run 控制字号/颜色，视觉对齐原逐条渲染。
+    /// 内部测试可见：「旧存量行不得被渲染上屏」这条不变量需要一个纯函数断言点。
+    static func stepsAttributedString(_ data: ThinkData) -> AttributedString {
         var result = AttributedString()
-        let visibleSteps = includeReasoningSteps
-            ? data.steps
-            : data.steps.filter { $0.skill != nil || $0.tool != nil }
+        // 只渲染工具/技能行。`step.text` 分支刻意整个删掉（不是留个开关传 false）：
+        // 2026-09-18~09-22 之间落盘的旧存量行里存的就是模型原始思维链，
+        // 保留该分支等于让历史消息继续漏 CoT，且没有任何路径能关掉它。
+        let visibleSteps = data.steps.filter { $0.skill != nil || $0.tool != nil }
         for (index, step) in visibleSteps.enumerated() {
             if let tool = step.tool {
                 // 工具调用行（Function Calling）：工具名 + 人话结果摘要
@@ -290,16 +252,6 @@ struct ThinkingCard: View {
                     d.foregroundColor = Color.ink500
                     result += d
                 }
-            } else if let text = step.text {
-                var dot = AttributedString("· ")
-                dot.font = DS.Font.bodySM
-                dot.foregroundColor = Color.ink300
-                result += dot
-
-                var body = AttributedString(text)
-                body.font = DS.Font.bodySM
-                body.foregroundColor = Color.ink500
-                result += body
             }
             if index < visibleSteps.count - 1 {
                 var br = AttributedString("\n")

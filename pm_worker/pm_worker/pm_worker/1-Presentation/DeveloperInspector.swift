@@ -26,6 +26,7 @@ struct DeveloperInspector: View {
                 calibrationSection
                 riskSection
                 skillBodySection
+                reasoningSection
             }
             .padding(DS.Spacing.s20)
         }
@@ -259,6 +260,35 @@ struct DeveloperInspector: View {
                     .foregroundStyle(Color.ink300)
             } else {
                 emptyRow("本次组装未注入技能正文")
+            }
+        }
+    }
+
+    // MARK: - h. 原始思考全文（本轮）
+
+    /// 2026-09-22 思考链收口的落点：模型原始思维链从对话气泡撤下后，「AI 这次到底
+    /// 怎么想的」的排查出口移到这里——沿用 v0.9.1「工程细节退入开发者模式」先例，
+    /// 而不是新开一个面向用户的开关。
+    /// 不新增任何状态：`think.full` 本就随 assistant 行落 discussions.jsonl
+    /// （DeepSeek 的 reasoning_content 回放也吃这份数据），这里只是把它显示出来。
+    private var reasoningSection: some View {
+        section("原始思考全文（本轮）") {
+            let full = model.sessionStore.entries
+                .last(where: { $0.role == .assistant })?.think?.full
+            if let full, !full.isEmpty {
+                DSScroll {
+                    Text(full)
+                        .font(DS.Font.monoSM)
+                        .foregroundStyle(Color.ink700)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+                Text("对话气泡只渲染工具行 / 技能行 / 阶段时间线，原文不跨出本窗口。")
+                    .font(DS.Font.bodyXS)
+                    .foregroundStyle(Color.ink300)
+            } else {
+                emptyRow("当前会话最后一条回复没有思考原文")
             }
         }
     }

@@ -1055,9 +1055,12 @@ final class PipelineM2Tests: XCTestCase {
         排除社交方向
         """
         let data = ThinkData.from(reasoning: reasoning, duration: 3)
-        XCTAssertEqual(data?.steps.count, 3)
+        // 原始 CoT 不再拆成用户可见步骤（design.md §6.4.1 v0.9.6 口径：
+        // 推理步骤是面向用户可读的摘要，不是思维链本身）
+        XCTAssertEqual(data?.steps.isEmpty, true)
         XCTAssertTrue(data?.summary.contains("思考了 3s") == true)
-        // 全文随 full 落盘（展开可回看，不再只有截断步骤）
+        // 全文仍随 full 落盘——DeepSeek 的 reasoning_content 回放依赖它（见
+        // testHistoryProjectionCarriesReasoning），只是不再上屏
         XCTAssertEqual(data?.full, reasoning)
 
         // 空推理 → 无思考卡
@@ -1072,12 +1075,12 @@ final class PipelineM2Tests: XCTestCase {
             duration: 5,
             skills: ["S18 hi-fi-prototype", "S13 poc-probe-selection"]
         )
-        // 技能步骤置于推理步骤之前
-        XCTAssertEqual(data?.steps.count, 4)
-        XCTAssertEqual(data?.steps.prefix(2).compactMap(\.skill), [
+        // 技能步骤即全部可展示步骤（推理行不再入 steps）
+        XCTAssertEqual(data?.steps.count, 2)
+        XCTAssertEqual(data?.steps.compactMap(\.skill), [
             "S18 hi-fi-prototype", "S13 poc-probe-selection",
         ])
-        XCTAssertTrue(data?.steps.prefix(2).allSatisfy { $0.text == nil } == true)
+        XCTAssertTrue(data?.steps.allSatisfy { $0.text == nil } == true)
         // 摘要行：技能 ≤2 个直接点名（折叠态即可见所应用技能名）
         XCTAssertTrue(data?.summary.contains("S18 hi-fi-prototype、S13 poc-probe-selection") == true)
         XCTAssertFalse(data?.summary.contains("技能 ×") == true)
@@ -1099,28 +1102,47 @@ final class PipelineM2Tests: XCTestCase {
         XCTAssertNil(noSkills)
     }
 
-    // MARK: 思考卡尾部优先摘要 + 全文持久化（2026-09-18 思考展示升级）
+    // MARK: 原始思维链不得进入任何用户可见出口（2026-09-22 收口）
 
-    func testThinkDataTailFirstAndFull() {
-        // 15 行超限：reasoning 头部是复述、尾部才是收束——首 2 + 省略提示 + 末 10
+    /// 折叠摘要行与展开态步骤是两条独立出口，两条都得堵：摘要行取的是「尾部收束句」，
+    /// 那正是最像人话、也最容易带出内部字段名的一段（实测那句「你好」的收束句是
+    /// 「the tool-calling section says tools available; not needed here」）。
+    func testRawChainOfThoughtReachesNeitherSummaryNorSteps() {
         let reasoning = (1...15).map { "推理要点第\($0)行" }.joined(separator: "\n")
         let data = ThinkData.from(reasoning: reasoning, duration: 8)
-        XCTAssertEqual(data?.steps.count, 13)
-        XCTAssertEqual(data?.steps.first?.text, "推理要点第1行")
-        XCTAssertEqual(data?.steps[1].text, "推理要点第2行")
-        XCTAssertEqual(data?.steps[2].text, "（中间省略 3 条，展开可看全文）")
-        XCTAssertEqual(data?.steps.last?.text, "推理要点第15行")
-        // 全文随 full 落盘，完成态展开可回看
-        XCTAssertEqual(data?.full, reasoning)
-        // 摘要行内容化：尾部收束句开头；「N 步」虚标移除
-        XCTAssertTrue(data?.summary.contains("「推理要点第15行」") == true)
-        XCTAssertTrue(data?.summary.contains("思考了 8s") == true)
-        XCTAssertFalse(data?.summary.contains("13 步") == true)
+        XCTAssertEqual(data?.steps.isEmpty, true)
+        XCTAssertEqual(data?.full, reasoning, "全文照旧落盘（DeepSeek 回放依赖），只是不上屏")
+        XCTAssertEqual(data?.summary, "思考了 8s")
+        for line in 1...15 {
+            XCTAssertFalse(
+                data?.summary.contains("推理要点第\(line)行") == true,
+                "摘要行泄漏了原始 CoT 第 \(line) 行"
+            )
+        }
+    }
 
-        // ≤12 行不折叠、摘要行不加省略提示
-        let short = ThinkData.from(reasoning: "第一行\n第二行", duration: 1)
-        XCTAssertEqual(short?.steps.count, 2)
-        XCTAssertFalse(short?.summary.contains("省略") == true)
+    /// 旧存量行（09-18~09-22 之间落盘，steps[].text 里就是原始 CoT）在渲染层也要挡掉
+    /// ——不迁移数据，靠渲染侧收口。刻意**不留**「包含推理行」的开关：留一个能打开
+    /// 原始 CoT 的参数等于给下次复发留门（这个口径已经被打穿过一次）。
+    func testLegacyRawReasoningStepsAreNotRendered() {
+        let legacy = ThinkData(
+            dur: 6,
+            steps: [
+                ThinkData.Step(
+                    text: "memory injection already gives me what I need",
+                    skill: nil, detail: nil, dur: nil
+                ),
+                ThinkData.Step(text: nil, skill: "S18 hi-fi-prototype", detail: nil, dur: nil),
+                ThinkData.Step(text: nil, tool: "web_search", detail: "已检索", dur: nil),
+            ]
+        )
+        let rendered = String(ThinkingCard.stepsAttributedString(legacy).characters)
+        XCTAssertFalse(
+            rendered.contains("memory injection"),
+            "旧存量的原始 CoT 行仍被渲染上屏"
+        )
+        XCTAssertTrue(rendered.contains("S18 hi-fi-prototype"), "技能行须照常可见")
+        XCTAssertTrue(rendered.contains("web_search"), "工具行须照常可见")
     }
 
     func testThinkDataDecodeLegacyWithoutFull() throws {
@@ -2688,8 +2710,10 @@ final class PRDTemplateContractTests: XCTestCase {
     }
 
     func testTemplateVersionStampedInAllTiers() {
+        // 代次戳按字面钉死：模板内容一改就得同步这里——漏改正是「代码已变、
+        // 存量 PRD 逃过失效检查」的入口（v1.3.7 加指标口径步时由 2 升 3）。
         for tier in ["lean", "standard", "full"] {
-            XCTAssertEqual(AgentPrompts.prdTemplateVersion(tier: tier), "2", "\(tier) 档缺版本行")
+            XCTAssertEqual(AgentPrompts.prdTemplateVersion(tier: tier), "3", "\(tier) 档版本行缺失或落后代次")
         }
     }
 
@@ -2701,7 +2725,8 @@ final class PRDTemplateContractTests: XCTestCase {
         let meta = try JSONDecoder().decode(
             [String: String].self, from: Data(contentsOf: url)
         )
-        XCTAssertEqual(meta["templateVersion"], "2")
+        // 契约是「戳 == 当前模板版本」，取实际当前值比对（代次由上一条测试钉住）
+        XCTAssertEqual(meta["templateVersion"], AgentPrompts.prdTemplateVersion(tier: "full"))
         XCTAssertEqual(meta["tier"], "full")
     }
 
@@ -2718,7 +2743,9 @@ final class PRDTemplateContractTests: XCTestCase {
         let ctx = try makeWorkspace(name: "新版不标", withPRD: true)
         AppModel.writePRDMeta(project: ctx.project, version: ctx.version, tier: "standard")
         let engine = PipelineEngine(project: ctx.project, version: ctx.version, database: nil)
-        engine.markPRDStaleForTemplateUpgradeIfNeeded(currentVersion: "2")
+        engine.markPRDStaleForTemplateUpgradeIfNeeded(
+            currentVersion: AgentPrompts.prdTemplateVersion(tier: "standard")
+        )
         XCTAssertFalse(engine.prdStale, "当前版本戳的 PRD 不标")
         XCTAssertNil(staleReason(project: ctx.project, version: ctx.version))
     }

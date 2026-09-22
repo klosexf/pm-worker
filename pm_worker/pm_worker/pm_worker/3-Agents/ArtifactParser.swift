@@ -783,6 +783,95 @@ nonisolated enum ArtifactParser {
             .map(\.entry)
     }
 
+    // MARK: - 指标口径卡（artifact:metric-specs → 04-prd/metric-specs.jsonl）
+
+    /// 口径块名。
+    nonisolated static let metricSpecBlock = "metric-specs"
+
+    /// 从回复块解析指标口径数组（无块 / JSON 不合法 / 空数组 → nil）。
+    /// nil 是合法缺省：PRD 可以没有量化指标，不可当成失败去拦落盘。
+    static func parseMetricSpecs(blocks: [ArtifactBlock]) -> [MetricSpec]? {
+        guard let content = blocks.first(where: { $0.name == metricSpecBlock })?.content,
+              let specs: [MetricSpec] = LenientJSON.decode([MetricSpec].self, from: content)
+        else { return nil }
+        let normalized = normalizeMetricSpecs(specs)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    /// 归一化：模型常把 status 写成中文或漏写、把同名指标列两遍，也可能把 pending
+    /// 与「口径已齐」自相矛盾地同时给出。口径齐但状态漏写按 assumed 收（起草态），
+    /// 绝不自动升 confirmed——confirmed 只能由用户在默认项卡上确认得到。
+    static func normalizeMetricSpecs(_ specs: [MetricSpec]) -> [MetricSpec] {
+        var seen: [String: Int] = [:]
+        var result: [MetricSpec] = []
+        for spec in specs {
+            let key = spec.matchKey
+            guard !key.isEmpty else { continue }
+            var item = spec
+            if !item.hasCoreSpec { item.status = .pending }
+            if let index = seen[key] {
+                result[index] = item      // 同名后写覆盖先写
+                continue
+            }
+            seen[key] = result.count
+            result.append(item)
+        }
+        return result
+    }
+
+    /// 口径卡落盘（append-only，与 PRD 同轮触发；无块即 no-op）。
+    /// 三处 PRD 落盘点共用：① 主线分派、② 草稿预演（**不调用**，见 AppModel 注释）、
+    /// ③ MCP 无头 generate_prd。
+    @discardableResult
+    static func writeMetricSpecs(
+        blocks: [ArtifactBlock], project: String, version: String
+    ) -> [MetricSpec]? {
+        guard let specs = parseMetricSpecs(blocks: blocks) else { return nil }
+        let url = PMAgentStore.versionURL(project: project, version: version)
+            .appendingPathComponent(ArtifactPath.metricSpecs)
+        MemoryStore.ensureJSONLFile(at: url)
+        for spec in specs {
+            // 直接 appendLine(结构体)：传预编码字符串会被二次编码（self-review.jsonl
+            // 旧坑，见本文件 writeSelfReview 注释）。
+            try? PMAgentStore.appendLine(spec, to: url)
+        }
+        return specs
+    }
+
+    /// 当前口径集：jsonl 按 name last-wins 折叠（行序即时间序，修订轮自然覆盖旧口径）。
+    static func readMetricSpecs(project: String, version: String) -> [MetricSpec] {
+        let url = PMAgentStore.versionURL(project: project, version: version)
+            .appendingPathComponent(ArtifactPath.metricSpecs)
+        let lines = PMAgentStore.readLines(MetricSpec.self, from: url)
+        var ordered: [String] = []
+        var latest: [String: MetricSpec] = [:]
+        for spec in lines {
+            let key = spec.matchKey
+            if latest[key] == nil { ordered.append(key) }
+            latest[key] = spec
+        }
+        return ordered.compactMap { latest[$0] }
+    }
+
+    /// 独立评审输入渲染：当前口径集压成逐行清单（无记录 → nil，评审材料不带该段）。
+    /// 只给名称 / 状态 / 缺项，口径正文留给 PRD 4.2 表——评审要比的是「表与记录是否
+    /// 同一批指标」，不是重新读一遍口径全文。
+    static func renderMetricSpecsForJudge(project: String, version: String) -> String? {
+        let specs = readMetricSpecs(project: project, version: version)
+        guard !specs.isEmpty else { return nil }
+        return specs.map { spec in
+            let core = spec.hasCoreSpec ? "分子/分母/时间窗齐" : "缺\(spec.missingFields.joined(separator: "、"))"
+            return "- \(spec.name)｜\(spec.status.label)｜\(core)"
+        }.joined(separator: "\n")
+    }
+
+    /// 非 ④ 阶段的 stray 口径块检测（与 hasStrayPRDBlock 同一纪律：本阶段分派没有
+    /// 消费者，不落盘也不许静默——用户会以为口径已记上、对账时可查）。
+    static func hasStrayMetricSpecsBlock(blocks: [ArtifactBlock], text: String) -> Bool {
+        if blocks.contains(where: { $0.name == metricSpecBlock }) { return true }
+        return parseIncompleteArtifact(in: text)?.name == metricSpecBlock
+    }
+
     // MARK: - 声明归一化与跨轮 diff（B3 事件驱动：对话流只报新增）
 
     /// 匹配口径：大小写折叠 + 全部空白移除（中文场景空白插入是重播微差的
@@ -902,6 +991,76 @@ nonisolated enum ArtifactParser {
         )
     }
 
+    // MARK: - PRD 口径引用槽拼接（事实源在记录侧：metric-specs.jsonl）
+
+    struct SpecStitch: Equatable {
+        var text: String
+        var resolvedCount: Int
+        var unresolvedSlots: [String]
+    }
+
+    /// 一条口径渲染成**单行**文字（要能落进表格单元格，故不含换行）。
+    /// 只渲染五个口径字段——assumptionNote 不进正文（那里头会引用用户给的目标值，
+    /// 一进正文就等于把数值抄成了第二份事实源）；起草态改为追加一个不含数字的标记。
+    static func renderSpecLine(_ spec: MetricSpec) -> String {
+        var parts: [String] = []
+        if let value = spec.numerator { parts.append("分子 = \(value)") }
+        if let value = spec.denominator { parts.append("分母 = \(value)") }
+        if let value = spec.window { parts.append("时间窗 = \(value)") }
+        if let value = spec.dataSource { parts.append("数据来源 = \(value)") }
+        if let value = spec.exclusions { parts.append("排除条件 = \(value)") }
+        guard !parts.isEmpty else { return "口径待补（用户未给、Agent 亦未起草）" }
+        switch spec.status {
+        case .confirmed: break
+        case .assumed: parts.append("此口径为 Agent 起草，待你确认")
+        case .pending: parts.append("口径不全，待补")
+        }
+        return parts.joined(separator: "；")
+    }
+
+    /// 把正文中的 `[[SPEC:指标名]]` 替换为记录里的口径（纯函数，测试直测）。
+    /// 与 `[[MERMAID:]]` 同属「模型只写引用、不抄内容」，但事实源方向相反：图表的
+    /// 事实源在上游产物、口径的事实源在**记录侧**，文档是衍生品。理由是一次 live
+    /// 实测：同一指标模型在正文写分母「该日打卡活跃用户」、在口径块写「该日活跃设备」，
+    /// 两套定义让同一个目标值对应两笔不同的账——缝合让这类分叉在物理上不可能发生。
+    /// 未解析槽降级为行内警示（可见、不静默、不虚构），与 mermaid 槽同一处理。
+    static func stitchSpecSlots(in body: String, specs: [MetricSpec]) -> SpecStitch {
+        guard body.contains("[[SPEC:") else {
+            return SpecStitch(text: body, resolvedCount: 0, unresolvedSlots: [])
+        }
+        var lookup: [String: MetricSpec] = [:]
+        for spec in specs { lookup[spec.matchKey] = spec }
+        guard let regex = try? NSRegularExpression(pattern: "\\[\\[SPEC:([^\\]\\n]*)\\]\\]") else {
+            return SpecStitch(text: body, resolvedCount: 0, unresolvedSlots: [])
+        }
+        let ns = body as NSString
+        var result = ""
+        var cursor = 0
+        var resolved = 0
+        var unresolved: [String] = []
+        let matches = regex.matches(in: body, range: NSRange(location: 0, length: ns.length))
+        for match in matches {
+            result += ns.substring(
+                with: NSRange(location: cursor, length: match.range.location - cursor)
+            )
+            cursor = match.range.location + match.range.length
+            let slot = ns.substring(with: match.range)
+            let name = match.numberOfRanges >= 2
+                ? ns.substring(with: match.range(at: 1))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            guard let spec = lookup[MetricSpec.normalizedKey(name)] else {
+                unresolved.append(slot)
+                result += "⚠️ 口径未登记：\(name.isEmpty ? slot : name)（本回复与盘上记录均无该指标）"
+                continue
+            }
+            resolved += 1
+            result += renderSpecLine(spec)
+        }
+        result += ns.substring(from: cursor)
+        return SpecStitch(text: result, resolvedCount: resolved, unresolvedSlots: unresolved)
+    }
+
     /// PRD 正文落盘：04-prd/PRD文档.md（write-then-verify，附变更摘要）。
     @discardableResult
     static func writePRDArtifact(
@@ -921,12 +1080,17 @@ nonisolated enum ArtifactParser {
             "核心流程图": source(ArtifactPath.coreFlows),
             "业务流程图": source(ArtifactPath.businessFlows),
         ])
+        // 口径引用槽缝合：本轮回复带的口径块优先，缺块（修订轮只重出 PRD）退到盘上
+        // 现有记录——两条路都保证「正文口径」与「机读口径」同源。
+        let specs = parseMetricSpecs(blocks: blocks)
+            ?? readMetricSpecs(project: project, version: version)
+        let specStitch = stitchSpecSlots(in: stitch.text, specs: specs)
         // 草稿预演（B1）：落提案目录镜像，不碰主线
         let url = PMAgentStore.artifactRoot(
             project: project, version: version, proposalSessionId: proposalSessionId
         ).appendingPathComponent(ArtifactPath.prd)
         let change = try writeMeasured(
-            stitch.text, to: url, relativePath: ArtifactPath.prd
+            specStitch.text, to: url, relativePath: ArtifactPath.prd
         )
         return (url: url, changes: [change])
     }

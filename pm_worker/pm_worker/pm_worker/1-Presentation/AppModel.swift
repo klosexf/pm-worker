@@ -918,6 +918,33 @@ final class AppModel: ObservableObject {
         return text.range(of: pattern, options: .regularExpression) != nil
     }
 
+    /// 寒暄/致谢词表（预闸判据）。只收**明确问候与明确致谢**：「好的」「嗯」「ok」
+    /// 这类纯推进语刻意排除——它们在 ① 澄清语境里可能承载确认语义，短路成客套回答
+    /// 会吞掉真意图。判不准的代价是不短路（维持全量流水线，慢但正确），
+    /// 误判的代价是吞需求，所以词表宁窄勿宽。
+    nonisolated static let smallTalkUtterances: Set<String> = [
+        "你好", "您好", "你好呀", "你好啊", "哈喽", "嗨", "hi", "hello", "hey",
+        "在吗", "在不在", "早上好", "上午好", "中午好", "下午好", "晚上好",
+        "午安", "晚安", "早",
+        "谢谢", "多谢", "感谢", "辛苦了", "再见", "拜拜", "回头见",
+    ]
+
+    /// 寒暄预闸（2026-09-22）：这条消息是不是纯寒暄/致谢——命中即绕开整条阶段流水线
+    /// 走轻量轮。实测一句「你好」在 ③ 阶段付了 22,463 token 输入 × 2 次串行调用
+    /// = 127 秒，全花在被 prompt 强制的 radar/plan 自评审上。
+    /// 判据是「整句归一化后逐字命中词表」，不是包含：尾巴上带任何实义内容
+    /// （「你好，帮我看下原型」「你好吗」）都不再命中，故无需另设诉求词检查。
+    /// 附件/引用单独拦：「你好」+ 一张截图是带诉求的开场，不是寒暄。
+    nonisolated static func isSmallTalk(
+        _ text: String, imageFiles: [String] = [], fileRefs: [String] = []
+    ) -> Bool {
+        guard imageFiles.isEmpty, fileRefs.isEmpty else { return false }
+        let normalized = String(text.unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0)
+        }).lowercased()
+        return !normalized.isEmpty && smallTalkUtterances.contains(normalized)
+    }
+
     /// 点选答案是否为收尾确认问的肯定项（一次确认，design.md §6.1 一次确认口径）：
     /// 答案与某选项全文一致，且该选项以「确认」开头（收尾确认问协议，AgentPrompts.clarify 约束 15）。
     /// 自由输入不触发——带补充说明的答案需 AI 判读，走常规 sendMessage。
@@ -1229,6 +1256,35 @@ final class AppModel: ObservableObject {
                 reloadTree()
                 return
             }
+        }
+
+        // 寒暄预闸（2026-09-22）：纯问候/致谢不背阶段协议。实测一句「你好」在 ③ 阶段
+        // 付了 22,463 token 输入 × 2 次串行调用 = 127 秒，全花在 prompt 强制的每轮
+        // 自评审上（原始思考链在给 radar 六字段填空）。位置刻意放在所有既有语义分支
+        // 之后（封板只读 / 插话入队 / 竞品关键词 / 草稿预演），不抢任何一条现有链路。
+        // 关键是**跳过 assembleSystemPrompt**：向量检索、技能判定、阶段骨架、
+        // 记忆/技能/检索尾条一个都不付——寒暄不需要项目背景。
+        // onAssistant 传 nil 即够：回复落盘与流态收尾在 streamReply 内无条件完成，
+        // 回调只承载产物解析/轮次推进/闸口评估这些编排副作用，本回合一律不该有。
+        // stage 记 .clarify 而非真实阶段：所有对话档共用同一份模型配置（写透），
+        // 阶段键只影响用量归属——寒暄轮归到对话档，不该记成原型轮的成本。
+        if Self.isSmallTalk(text, imageFiles: imageFiles, fileRefs: fileRefs) {
+            let stagedGreeting = sessionStore.stageOutgoingUser(text)
+            let origin = ReplyOrigin(
+                project: project, version: version,
+                sessionId: sessionStore.sessionId, stage: pipeline.stage
+            )
+            sessionStore.beginPreparingReply(
+                sessionID: sessionStore.sessionId, origin: origin.storeOrigin
+            )
+            await sessionStore.send(
+                text, settings: settings, stage: .clarify,
+                systemPrompt: AgentPrompts.smallTalkReply,
+                maxTokens: 2048, imageFiles: imageFiles, fileRefs: fileRefs,
+                stagedUserEntry: stagedGreeting, pinnedOrigin: origin.storeOrigin,
+                thinkingEffortOverride: .low
+            )
+            return
         }
 
         // 乐观上屏：用户消息立即入列显示，提示词组装（向量检索/技能判定的
@@ -1642,6 +1698,14 @@ final class AppModel: ObservableObject {
                 "⚠️ 本轮回复携带 PRD 内容块，但 PRD 只能在 ④ 阶段或快速通道生成——本次未落盘。可回复「直接出 PRD」走快速通道。",
                 origin: origin
             )
+        } else if origin.stage != .prd,
+                  ArtifactParser.hasStrayMetricSpecsBlock(blocks: blocks, text: reply.content) {
+            // 口径块单独越界（没带 PRD 块）时也要留痕——否则用户以为口径已记上，
+            // 到第二圈对账时才发现查无此据（B005 同类：分派丢失比解析丢失更难查）。
+            appendOriginSystem(
+                "⚠️ 本轮回复携带指标口径，但口径随 PRD 一起记录——本次未落盘。可在 ④ 阶段出 PRD 后一并登记。",
+                origin: origin
+            )
         }
         guard !blocks.isEmpty else { return }
         let project = origin.project
@@ -1737,6 +1801,12 @@ final class AppModel: ObservableObject {
                     blocks: blocks, tier: tier,
                     project: project, version: version
                 ) {
+                    // 指标口径卡随 PRD 同轮落盘（04-prd/metric-specs.jsonl）。
+                    // 不追加系统行：口径的用户可见面是 PRD 4.2 表 + 默认项卡上的
+                    // 口径题，聊天里再多一行是噪声（📦 回执文案有测试锚定，勿改）。
+                    ArtifactParser.writeMetricSpecs(
+                        blocks: blocks, project: project, version: version
+                    )
                     // 版本戳先于清过期：落盘即记录生成所用模板版本，重启检查才不会误标
                     Self.writePRDMeta(project: project, version: version, tier: tier)
                     if sameContext {
@@ -2296,6 +2366,11 @@ final class AppModel: ObservableObject {
             guard let prd, !prd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return (nil, "PRD 不在盘（Tier 2 评审无输入）")
             }
+            // 口径记录一并给评审：4.2 表与 metric-specs 是否同一批指标、有没有把
+            // 起草的口径写成用户既定事实，只有两边同时在场才判得了。
+            let specSection = ArtifactParser.renderMetricSpecsForJudge(
+                project: project, version: version
+            ).map { "\n\n### 已登记的指标口径记录（与 4.2 表对照）\n\($0)" } ?? ""
             artifacts = """
                 ### 澄清要点表（上游锚点）
                 \(String(clarification.prefix(4000)))
@@ -2304,7 +2379,7 @@ final class AppModel: ObservableObject {
                 \(String(map.prefix(3000)))
 
                 ### 待审 PRD 全文
-                \(String(prd.prefix(12000)))
+                \(String(prd.prefix(12000)))\(specSection)
                 """
         default:
             return (nil, "阶段 \(stage.rawValue) 未配置 Tier 2 评审")

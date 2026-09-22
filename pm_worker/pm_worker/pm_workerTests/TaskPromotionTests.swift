@@ -150,10 +150,18 @@ final class TaskPromotionTests: XCTestCase {
             to: "已有项目", targetVersion: "unversioned"
         )
 
+        // 落盘：迁移行仍追加在目标存量之后（append-only，不覆盖）
+        let targetLines = try String(
+            contentsOf: targetURL("已有项目"), encoding: .utf8
+        ).split(separator: "\n", omittingEmptySubsequences: true)
+        XCTAssertEqual(targetLines.count, 2)
+        XCTAssertTrue(targetLines[0].contains(#""sessionId":"existing""#))
+        XCTAssertTrue(targetLines[1].contains(#""sessionId":"task-a""#), "迁移行追加在后")
+
+        // 投影：展示序按创建时间倒序，task-a（10:00）在 existing（09:00）之前
         XCTAssertEqual(
             SessionStore.sessions(in: "已有项目", version: "unversioned").map(\.id),
-            ["existing", "task-a"],
-            "目标存量在前、迁移行追加在后"
+            ["task-a", "existing"]
         )
     }
 

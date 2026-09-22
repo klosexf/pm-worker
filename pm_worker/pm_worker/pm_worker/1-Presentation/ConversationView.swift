@@ -775,8 +775,10 @@ struct ConversationView: View {
                             .foregroundStyle(Color.ink500)
                     }
                 } else if (stream.think.isEmpty && stream.text.isEmpty) || !stream.think.isEmpty {
+                    // stream.think 只当「本轮是否在思考」的判据用，内容本身不进思考卡
+                    // （原始 CoT 不渲染，2026-09-22 收口；回看入口在 ⌘D）
                     ThinkingCard(
-                        data: nil, reasoning: stream.think, skills: stream.skills,
+                        data: nil, skills: stream.skills,
                         phases: stream.phaseTrail, toolSteps: stream.toolSteps
                     )
                 }
@@ -2761,7 +2763,10 @@ struct MessageBubble: View {
         return DutyHandover(
             segmentIndex: target,
             durationSeconds: think?.dur,
-            stepCount: think.map { $0.steps.count },
+            // 收口后 steps 只剩工具/技能行，常规轮常为 0 项。0 的含义是「没有可数的
+            // 过程行」而非「走了 0 步」→ 给 nil，交 DutyHandover 按「缺失项整段省略，
+            // 不伪造」口径处理（否则交接条会冒出「0 步」）。
+            stepCount: think.flatMap { $0.steps.isEmpty ? nil : $0.steps.count },
             stageLabel: self.chainStageLabel(
                 headIndex: headIndex, lastIndex: lastIndex, entries: entries
             ),

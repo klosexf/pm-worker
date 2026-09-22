@@ -692,10 +692,19 @@ nonisolated struct MCPToolHandlers {
                 "模型回复未包含合法的 artifact:prd 块（正文需 > 200 字符）"
             )
         }
+        // 指标口径卡与 App 侧同轮落盘（无块即 no-op，PRD 可无量化指标）
+        ArtifactParser.writeMetricSpecs(blocks: blocks, project: project, version: version)
         await upsertPipelineRun(
             project: project, version: version, stage: "prd", status: "done"
         )
-        return [ArtifactPath.prd]
+        var result = [ArtifactPath.prd]
+        if FileManager.default.fileExists(
+            atPath: PMAgentStore.versionURL(project: project, version: version)
+                .appendingPathComponent(ArtifactPath.metricSpecs).path
+        ) {
+            result.append(ArtifactPath.metricSpecs)
+        }
+        return result
     }
 
     // MARK: - get_task / 状态更新 / failover
